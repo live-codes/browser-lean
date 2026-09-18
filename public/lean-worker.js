@@ -43,6 +43,18 @@ function logDebug(text) {
   console.log('[lean]', text);
 }
 
+// Long stretches of the boot — the Init import especially — emit only filtered
+// debug lines, so the page would otherwise see total silence and could not tell
+// "still computing" from "wedged". A throttled heartbeat gives the page something
+// to reset its watchdog on.
+let lastActivityPost = 0;
+function noteActivity() {
+  const now = Date.now();
+  if (now - lastActivityPost < 1000) return;
+  lastActivityPost = now;
+  post({ type: 'activity' });
+}
+
 function mkdirp(FS, path) {
   let current = '';
   for (const part of path.split('/').filter((p) => p)) {
@@ -182,10 +194,12 @@ function startLeanModule() {
     // runtime spawns can load lean.js (this file is the worker's own script).
     mainScriptUrlOrBlob: `${assetBase}/lean.js${assetQ}`,
     print: (text) => {
+      noteActivity();
       if (isDebugLine(text)) return logDebug(text);
       post({ type: 'stdout', data: text });
     },
     printErr: (text) => {
+      noteActivity();
       if (isDebugLine(text)) return logDebug(text);
       post({ type: 'stderr', data: text });
     },

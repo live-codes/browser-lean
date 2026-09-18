@@ -6,8 +6,8 @@ below was **run**, in headless Chrome, and the numbers are quoted as observed.
 
 The short version: Lean 4 in the browser is now *fast*. A proof is accepted in **~0.3 s** and the
 whole runtime is ready in **~2.2 s**, against **~8 minutes** and **~2 minutes per run** for the first
-approach this spike tried. One measured blocker remains for LiveCodes, and it is the same one as
-before — §2 — plus one real gap in the runtime itself — §6.
+approach this spike tried. What is left is a deployment constraint rather than a wall — §2 — and one
+real gap in the runtime itself — §6.
 
 ## 0. Corrections to the first pass (both were my errors)
 
@@ -77,11 +77,27 @@ for it. `serve.js` therefore sets COOP/COEP by default, with `--no-isolation` ke
 stays reproducible: served without headers, the page reports `crossOriginIsolated === false`, shows a
 banner, and a Run fails with an actionable message before downloading anything.
 
-**This is the blocker for embedding Lean in LiveCodes**, and it is not ours to fix from a page: a
-result page runs in a sandboxed iframe inside someone else's document, and cross-origin isolation is
-inherited from the top-level page. If the embedder did not send COOP/COEP, no frame inside it can
-construct the memory. The only real fix is a single-threaded Lean wasm build — a build-and-release
-task.
+**For LiveCodes this is a deployment constraint, not a dead end — but a fragile one.** A result page
+runs in a sandboxed iframe inside someone else's document, and cross-origin isolation is inherited from
+the top-level document, so a page cannot give itself COOP/COEP (which is exactly why `browser-elixir`
+could not be embedded cleanly). Chrome offers two escape hatches that skip the headers:
+
+- the **reverse origin trial for `SharedArrayBuffer` on desktop**, which lets a page use
+  `SharedArrayBuffer` *without* being cross-origin isolated. This is the same mechanism Chrome has used
+  to give sites more time since the Chrome 92 restriction; it has already been extended more than once
+  and sits on a deprecation path.
+- **`Document-Isolation-Policy`**, which lets a document turn on `crossOriginIsolated` for itself,
+  without deploying COOP or COEP, regardless of the isolation status of the page around it.
+
+So Lean *could* ship in LiveCodes today behind one of these. Both are Chrome-only and both are trials
+or flags that can be withdrawn, so the honest default is to treat isolation as unavailable and prefer a
+**single-threaded Lean wasm build**, which needs none of this and works in every browser.
+
+The page therefore keys off `SharedArrayBuffer` itself, not off `crossOriginIsolated` — otherwise it
+would refuse to start in exactly the configuration a trial provides. Verified by shadowing the global
+in a non-isolated document: the pill reads "SharedArrayBuffer, not isolated", no banner appears, and
+the boot proceeds instead of being blocked. (That shim is not a real `SharedArrayBuffer`, so the boot
+then wedges and the watchdog below reports it; under an actual trial the buffer is real.)
 
 One sizing detail that bites: the memory's declared maximum must not be exceeded. Passing
 `maximum: 65536` to the older build fails at instantiation with
@@ -176,7 +192,16 @@ Two traps worth recording:
   failures before they reach the message channel. For a playground this is a real gap: a typo gets no
   feedback. It is worth reporting upstream; until then the page cannot distinguish "your proof is
   fine" from "your file did not parse".
-- **Cross-origin isolation is mandatory** (§2), with no shim and no fallback.
+- **Cross-origin isolation is mandatory** (§2), with no shim and no fallback. A *stub* `SharedArrayBuffer`
+  is not enough here, unlike the situation `browser-cobol` documented: this runtime really does construct
+  one for its pthread pool, so a fake satisfies the type check and then wedges the boot. That is why the
+  page watches for a real buffer and why it needs the next point.
+- **A wedged boot is now reported instead of hanging.** The module can instantiate and then never finish
+  starting — observed by supplying a stub `SharedArrayBuffer`, where `new WebAssembly.Memory({shared: true})`
+  succeeded, the library was written, and `onRuntimeInitialized` never fired. The worker emits a throttled
+  activity heartbeat and the page fails after 60 s of silence with an explanation, rather than sitting on
+  "loading" forever. Worth having for an embedded context, where a missing capability and a blocked worker
+  look identical from the outside.
 - **No interrupt.** A non-terminating elaboration cannot be stopped; recovery is a page reload, which
   now costs ~2 s rather than ~8 minutes, so this is much less severe than in the first pass.
 - **~127 MiB of assets** (≈47 MB over the wire) are mirrored locally; they are not committed.
@@ -195,10 +220,18 @@ environment), the payload is ~47 MB over the wire instead of 310 MB, library `#e
 whole thing is ~127 MiB of static files that can be hosted anywhere. The shape is a clean fit for
 LiveCodes' `*-wasm` languages: one Worker per result page, initialised once, driven repeatedly.
 
-**What still blocks it.** §2. A LiveCodes result page cannot guarantee cross-origin isolation, because
-that is inherited from the top-level document, and this runtime needs a shared memory. Nothing at the
-page level changes that; a single-threaded build does. Until then, Lean is in the same category as the
-AtomVM runtime behind `browser-elixir`.
+**What still stands in the way.** §2 — and it is now a deployment trade-off rather than a wall.
+LiveCodes cannot give an embedded result page COOP/COEP, so on any browser other than Chrome this
+runtime has no `SharedArrayBuffer` and cannot start. Chrome-only escape hatches exist (the reverse
+origin trial for `SharedArrayBuffer`, or `Document-Isolation-Policy`), which makes shipping acceptable
+if it must happen; both can be withdrawn, and neither helps Firefox or Safari. Two ways forward,
+in preference order:
+
+1. **A single-threaded Lean wasm build.** No isolation, no trial, works everywhere, and removes the
+   whole question. This is a build-and-release task against cauli's build or the Lean FRO's wasm work.
+2. **Ship Chrome-only behind the origin trial**, with the same feature detection the page already has:
+   where `SharedArrayBuffer` is missing, the language should report that plainly rather than fail
+   obscurely. Acceptable, and worth avoiding if it can be.
 
 **If a single-threaded build appears**, the integration would be:
 

@@ -57,6 +57,12 @@ flags `3` — `has-max | shared` — min 1024 pages, max 65536 pages (4 GiB). A 
 be constructed with a `SharedArrayBuffer`, which browsers expose only to a cross-origin isolated
 document. There is no shim and no fallback.
 
+**Chrome has two escape hatches that skip the headers entirely**: a reverse origin trial for
+`SharedArrayBuffer` that has already been extended more than once and sits on a deprecation path, and
+`Document-Isolation-Policy`, which lets a document isolate itself regardless of the page around it.
+Both are Chrome-only and can be withdrawn — so Lean *could* ship in LiveCodes behind one of them, but
+the durable answer is a single-threaded build. See [FINDINGS.md](FINDINGS.md) §2.
+
 To see the failure for yourself:
 
 ```bash
@@ -93,6 +99,14 @@ Each row was run through the page in headless Chrome and the panes read back.
 Runtime ready in **2.2 s**. Compiles are milliseconds to a few hundred milliseconds, and get faster
 as the imported environment is reused.
 
+Capability handling was checked in all three configurations a host can present:
+
+| served as | `SharedArrayBuffer` | behaviour |
+| --- | --- | --- |
+| with COOP/COEP (`npm start`) | present, isolated | boots; the runs above |
+| without headers (`npm run start:no-isolation`) | absent | refuses with a clear message, downloads nothing |
+| simulated origin trial (global present, document not isolated) | present, not isolated | attempts to boot, and reports a stalled boot rather than hanging |
+
 ## Assets
 
 | asset | bytes |
@@ -116,19 +130,31 @@ explains why the version must be pinned (`?v=`) and how a mismatch shows up.
   all — empty stdout, empty stderr — and the page says "accepted". Elaboration and kernel errors *are*
   reported normally. This is a gap in the fork's compile entry, not in the page; it is worth
   reporting upstream. See [FINDINGS.md](FINDINGS.md) §6.
-- **Cross-origin isolation is mandatory**, with no fallback.
+- **Cross-origin isolation is mandatory**, with no fallback. A stub `SharedArrayBuffer` does not help
+  here (unlike the trick `browser-cobol` documented): this runtime really constructs one for its pthread
+  pool, so a fake passes the type check and then wedges the boot.
+- **A stalled boot is reported, not hung on.** If the module instantiates but never finishes starting,
+  the page fails after 60 s of silence with an explanation instead of sitting on "loading" forever.
 - **No way to interrupt** a non-terminating elaboration; recovery is a page reload (~2 s).
 - **~127 MiB of mirrored assets** (≈47 MB over the wire), fetched once.
 - **Chrome only, as tested.** Safari, Firefox and mobile were not exercised.
 
 ## Not yet a LiveCodes language
 
-Much better positioned than earlier attempts, but still not shippable, for one reason:
+Much better positioned than earlier attempts, but not shippable as-is, for one reason — and it is a
+trade-off rather than a wall.
 
 A LiveCodes result page runs in a sandboxed iframe inside *someone else's* document, and cross-origin
-isolation is inherited from the top-level page. If the embedder did not send COOP/COEP, no frame
-inside it can construct the shared memory this runtime needs. Nothing at the page level fixes that —
-a **single-threaded Lean wasm build** does. This is the same wall `browser-elixir` hit.
+isolation is inherited from the top-level document, so it cannot give itself COOP/COEP. On any browser
+other than Chrome this runtime therefore has no `SharedArrayBuffer` and cannot start. Chrome-only
+escape hatches exist (the reverse origin trial for `SharedArrayBuffer`, or `Document-Isolation-Policy`),
+so Lean *could* ship behind one of them — acceptable, but they can be withdrawn and they help nobody
+else. Two ways forward, in preference order:
+
+1. **A single-threaded Lean wasm build.** No isolation, no trial, works everywhere, and removes the
+   question entirely. This is a build-and-release task.
+2. **Ship Chrome-only behind the origin trial**, keeping the feature detection the page already has:
+   where `SharedArrayBuffer` is missing, the language should say so plainly rather than fail obscurely.
 
 Everything else is now in place: a single long-lived Worker per page, ~0.3 s compiles, `#eval` of
 library functions working, and static assets that can be hosted anywhere. [FINDINGS.md](FINDINGS.md)

@@ -84,6 +84,6 @@ server.listen(PORT, () => {
   if (noIsolation) {
     console.log('note: Lean cannot boot without COOP/COEP — this mode is only for showing the failure');
   }
-  console.log('the Lean runtime comes from the CDN in public/index.html; ~310 MB on first run');
+  console.log('the Lean artifacts are mirrored locally — run `npm run assets` first (~127 MB)');
   console.log('press Ctrl+C to stop');
 });

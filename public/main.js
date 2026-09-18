@@ -254,12 +254,40 @@ function ensureLean() {
     worker = new Worker(`./lean-worker.js?assetBase=${encodeURIComponent(assetBase)}`);
     setState({ stage: 'loading' });
 
+    // The boot can wedge — most obviously when a shared memory is granted but the
+    // pthread workers cannot start — and without this the page would sit at
+    // "loading" forever with no explanation. Every message resets the clock,
+    // including the worker's throttled heartbeat, so a slow but live import is
+    // never mistaken for a dead one.
+    let lastActivity = Date.now();
+    const IDLE_LIMIT_MS = 60000;
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastActivity > IDLE_LIMIT_MS) {
+        clearInterval(watchdog);
+        reject(
+          new Error(
+            `The Lean runtime stopped responding while loading (no progress for ${IDLE_LIMIT_MS / 1000}s). ` +
+              'Shared memory was granted but the runtime did not finish starting — the pthread workers ' +
+              'may have been blocked.',
+          ),
+        );
+      }
+    }, 5000);
+
+    const finish = (fn) => (value) => {
+      clearInterval(watchdog);
+      fn(value);
+    };
+    const resolveOnce = finish(resolve);
+    const rejectOnce = finish(reject);
+
     worker.onerror = (event) => {
-      reject(new Error(event.message || 'Lean worker error'));
+      rejectOnce(new Error(event.message || 'Lean worker error'));
     };
 
     worker.onmessage = (event) => {
       const msg = event.data || {};
+      lastActivity = Date.now();
 
       if (msg.type === 'library') {
         if (msg.stage === 'manifest') {
@@ -288,12 +316,12 @@ function ensureLean() {
         setState({ initMs: Math.round(performance.now() - t0) });
         appendLog(`Lean ready in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
         setStatus('Lean loaded. Ready.', 'ok');
-        resolve();
+        resolveOnce();
         return;
       }
 
       if (msg.type === 'error') {
-        reject(new Error(msg.data));
+        rejectOnce(new Error(msg.data));
         return;
       }
 
@@ -429,19 +457,30 @@ function init() {
     }
   });
 
-  // Report the two things that decide whether this page can work at all.
+  // The runtime needs SharedArrayBuffer, which normally means cross-origin
+  // isolation — but not necessarily: Chrome's reverse origin trial grants SAB to a
+  // page that is *not* isolated. So test the capability the runtime actually
+  // needs, not the header, or the page would refuse to start in exactly the
+  // configuration LiveCodes would have to use.
+  const hasSAB = typeof SharedArrayBuffer !== 'undefined';
   const isolated = self.crossOriginIsolated === true;
-  els.isolation.textContent = isolated ? 'cross-origin isolated' : 'NOT isolated';
-  els.isolation.className = `pill ${isolated ? 'good' : 'bad'}`;
+
+  els.isolation.textContent = isolated
+    ? 'cross-origin isolated'
+    : hasSAB
+      ? 'SharedArrayBuffer, not isolated'
+      : 'no SharedArrayBuffer';
+  els.isolation.className = `pill ${hasSAB ? 'good' : 'bad'}`;
   els.payload.textContent = '~127 MB of assets';
 
-  if (!isolated) {
+  if (!hasSAB) {
     els.banner.className = 'show';
     els.banner.textContent =
-      'This document is not cross-origin isolated, so SharedArrayBuffer is unavailable and the ' +
-      'Lean runtime cannot boot. Serve the page with COOP/COEP (npm start) — Lean is a pthread ' +
-      'build, so this is a hard requirement, not a header we can work around.';
-    setStatus('Cross-origin isolation required.', 'err');
+      'SharedArrayBuffer is unavailable, so the Lean runtime cannot boot. Serve the page with ' +
+      'COOP/COEP (npm start) — Lean needs a shared WebAssembly memory. An embedded page that cannot ' +
+      'set those headers has only Chrome\'s reverse origin trial for SharedArrayBuffer, and that ' +
+      'does not exist in Firefox or Safari.';
+    setStatus('SharedArrayBuffer required.', 'err');
   }
 
   setState({
@@ -449,6 +488,7 @@ function init() {
     stage: 'idle',
     runs: 0,
     isolated,
+    sharedArrayBuffer: hasSAB,
     leanVersion: 'cauli/lean4 wasm build (reinstate-wasm fork)',
   });
 }
