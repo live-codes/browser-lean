@@ -1,0 +1,179 @@
+# Browser Lean
+
+Run **Lean 4 entirely in the browser** — no server, no upload, no install. The real Lean elaborator
+and kernel are compiled to WebAssembly, so a proof typed into the page is checked in that tab, on
+your machine.
+
+This is a proof of concept for adding a `lean` language to [LiveCodes](https://livecodes.io), in the
+same shape as [`browser-cobol`](https://github.com/live-codes/browser-cobol),
+[`browser-haskell`](https://github.com/live-codes/browser-haskell) and
+[`browser-elixir`](https://github.com/live-codes/browser-elixir) were for their languages.
+
+![Lean running in the browser](lean-run.png)
+
+It is fast enough to use: the runtime is ready **~2.2 s** after the first Run, and a proof is checked
+in **~0.3 s**.
+
+```
+Lean 4 source
+  → real Lean 4 (cauli/lean4 `reinstate-wasm` fork, wasm32)   elaborate + kernel-check
+  → JSON messages, one per line, on stdout                    severity: information | error
+  → the page splits them by severity                          output / diagnostics
+```
+
+The runtime lives in a **persistent Web Worker** that imports Init once and then compiles repeatedly
+through the fork's `lean_wasm_compile` export, reusing the environment it has already imported. The
+library ships as **5 packed gzip files** (629 modules, 1,887 `.olean`/`.ir` files) rather than ~1,900
+individual requests.
+
+The Lean WASM artifacts are built by [cauli/lean4-wasm-in-browser](https://github.com/cauli/lean4-wasm-in-browser)
+(Apache-2.0) — the reference implementation for this, and the source of the worker's structure and
+the boot sequence. Credit for making Lean run well in a browser belongs there.
+
+## Demo
+
+```bash
+npm run assets     # mirror ~127 MB of Lean artifacts into public/lean-wasm/ (once)
+npm start          # → http://localhost:8129/
+```
+
+Pick an example (or type your own), press **Run** — or `Ctrl`/`Cmd` + `Enter` in the editor. Nothing
+is downloaded until the first Run.
+
+## Cross-origin isolation is required
+
+**This page must be served with `Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp`.** `npm start` does that. Served without them, Run
+reports
+
+```
+SharedArrayBuffer is unavailable, so the Lean runtime cannot start.
+```
+
+and downloads nothing.
+
+That requirement is real, not a misdiagnosis. `lean.wasm` imports a WebAssembly memory with limits
+flags `3` — `has-max | shared` — min 1024 pages, max 65536 pages (4 GiB). A `shared` memory can only
+be constructed with a `SharedArrayBuffer`, which browsers expose only to a cross-origin isolated
+document. There is no shim and no fallback.
+
+To see the failure for yourself:
+
+```bash
+npm run start:no-isolation   # same page, no COOP/COEP
+```
+
+## What you get
+
+- **Client-side checking.** Nothing is uploaded; the verdict on your proof comes from a wasm module in
+  the tab.
+- **Real diagnostics, with positions** — `error: Tactic \`rfl\` failed: The left-hand side 1 is not
+  definitionally equal to the right-hand side 2` / `⊢ 1 = 2  (line 1, col 32)`.
+- **`#eval`, `#check`, `#print`**, user-defined recursion, and **`#eval` of library functions** —
+  `#eval (List.range 5).map (fun n => n * n)` prints `[0, 1, 4, 9, 16]`.
+- **Core tactic proofs** (`induction`, `rw`, `simp`).
+- **A clean split** between program output and diagnostics, even though the runtime puts both on
+  stdout ([FINDINGS.md](FINDINGS.md) §3).
+- **Lazy loading**: the page is three small files; the 127 MB of artifacts wait for the first Run.
+
+## Verified
+
+Each row was run through the page in headless Chrome and the panes read back.
+
+| snippet | output | exit | run |
+| --- | --- | --- | --- |
+| `#eval "Hello from Lean!"` | `"Hello from Lean!"` | 0 | — |
+| `#eval 2 + 2`, `#eval 2 ^ 10`, `#check Nat.add_comm` | `4`, `1024`, `Nat.add_comm (n m : Nat) : n + m = m + n` | 0 | — |
+| `def fib` + `#eval fib 10` / `#eval fib 20` | `55`, `6765` | 0 | 0.28 s |
+| `theorem add_comm … := by induction b with …` | accepted, no diagnostics | 0 | 0.28–0.67 s |
+| `#eval (List.range 5).map (fun n => n * n)` | `[0, 1, 4, 9, 16]` | 0 | 0.08 s |
+| `#check this_is_not_defined` | `error: Unknown identifier \`this_is_not_defined\` (line 1, col 6)` | 1 | 0.01 s |
+| `theorem t : (1 : Nat) = 2 := by rfl` | `error: Tactic \`rfl\` failed: … (line 1, col 32)` | 1 | 0.03 s |
+
+Runtime ready in **2.2 s**. Compiles are milliseconds to a few hundred milliseconds, and get faster
+as the imported environment is reused.
+
+## Assets
+
+| asset | bytes |
+| --- | --- |
+| `lean.wasm` | 100,838,905 (96.17 MiB) |
+| core layer, 5 packs (629 modules, 1,887 files) | 32,184,975 (30.69 MiB) |
+| `core-layer.json` | 313,732 |
+| `lean.js` | 148,402 |
+| **on disk** | **~127 MiB** |
+
+Over the wire it is far less: the wasm is brotli-compressed in transit (96.17 MiB → **16.1 MB**), and
+the packs are already gzip, so a first load transfers roughly **47 MB**.
+
+`npm run assets` mirrors the pinned build. The artifacts are **not committed**; they are fetched from
+a third-party deploy because they cannot be hotlinked — see [FINDINGS.md](FINDINGS.md) §5, which also
+explains why the version must be pinned (`?v=`) and how a mismatch shows up.
+
+## Limitations
+
+- **Syntax errors are silently accepted.** `def broken : Nat :=` and `#eval (1 +` report nothing at
+  all — empty stdout, empty stderr — and the page says "accepted". Elaboration and kernel errors *are*
+  reported normally. This is a gap in the fork's compile entry, not in the page; it is worth
+  reporting upstream. See [FINDINGS.md](FINDINGS.md) §6.
+- **Cross-origin isolation is mandatory**, with no fallback.
+- **No way to interrupt** a non-terminating elaboration; recovery is a page reload (~2 s).
+- **~127 MiB of mirrored assets** (≈47 MB over the wire), fetched once.
+- **Chrome only, as tested.** Safari, Firefox and mobile were not exercised.
+
+## Not yet a LiveCodes language
+
+Much better positioned than earlier attempts, but still not shippable, for one reason:
+
+A LiveCodes result page runs in a sandboxed iframe inside *someone else's* document, and cross-origin
+isolation is inherited from the top-level page. If the embedder did not send COOP/COEP, no frame
+inside it can construct the shared memory this runtime needs. Nothing at the page level fixes that —
+a **single-threaded Lean wasm build** does. This is the same wall `browser-elixir` hit.
+
+Everything else is now in place: a single long-lived Worker per page, ~0.3 s compiles, `#eval` of
+library functions working, and static assets that can be hosted anywhere. [FINDINGS.md](FINDINGS.md)
+§7 has the `lang-lean` shape that would follow, and notes which parts of `public/main.js` carry over
+almost unchanged.
+
+## Layout
+
+```
+public/index.html      the page: examples, editor, output, diagnostics, log
+public/main.js         the driver: worker protocol, progress, message classification, dataset state
+public/lean-worker.js  the Lean runtime host (persistent Worker; adapted from upstream, Apache-2.0)
+scripts/fetch-assets.mjs  mirrors the pinned artifacts into public/lean-wasm/
+serve.js               static server: COOP/COEP on by default, --no-isolation to compare
+FINDINGS.md            the spike log: what was measured, what breaks, what it means
+lean-run.png           screenshot of a verified run
+```
+
+There is no bundler and no `node_modules`.
+
+## Verifying
+
+| what | command |
+| --- | --- |
+| mirror the artifacts | `npm run assets` |
+| serve the page | `npm start` → http://localhost:8129/ |
+| see the isolation failure | `npm run start:no-isolation` |
+| syntax-check | `npm run check` |
+
+The page exposes `document.documentElement.dataset` (`status`, `stage`, `runs`, `isolated`,
+`exitCode`, `initMs`, `runMs`) and its element ids as globals, so a headless probe can drive it
+without string literals. `window.__raw` holds the last run's unclassified stdout/stderr.
+
+## Status
+
+Spike complete. The page runs Lean 4 client-side, verified end to end in headless Chrome for
+accepted proofs, rejected proofs and library `#eval`, with the isolation failure reproduced and the
+silent-parse-failure gap characterised. Not yet suitable as a LiveCodes language, for the one
+measured reason above.
+
+Next: a single-threaded build, and mirroring the artifacts somewhere we control.
+
+## License
+
+MIT © Hatem Hosny. The Lean compiler and its libraries are Apache-2.0 (Lean project); the WASM
+artifacts and the worker's structure come from
+[cauli/lean4-wasm-in-browser](https://github.com/cauli/lean4-wasm-in-browser) (Apache-2.0). See
+[LICENSE](LICENSE).

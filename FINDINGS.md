@@ -1,0 +1,241 @@
+# Spike findings — Lean 4 in the browser
+
+**Status: spike complete.** The page runs Lean 4 typed into it, in the tab, with no server-side
+compilation: the kernel's verdict on a proof comes back from WebAssembly on your machine. Everything
+below was **run**, in headless Chrome, and the numbers are quoted as observed.
+
+The short version: Lean 4 in the browser is now *fast*. A proof is accepted in **~0.3 s** and the
+whole runtime is ready in **~2.2 s**, against **~8 minutes** and **~2 minutes per run** for the first
+approach this spike tried. One measured blocker remains for LiveCodes, and it is the same one as
+before — §2 — plus one real gap in the runtime itself — §6.
+
+## 0. Corrections to the first pass (both were my errors)
+
+1. **I dismissed the reference implementation without measuring it.** The first version of this
+   document called `cauli/lean4-wasm-in-browser` "a full app, not a library, and its assets are served
+   behind that app's own Cloudflare Functions", and moved on to a wrapper that was convenient to
+   import. That was a bad call: the app *is* the reference for how to run Lean in a browser well, its
+   artifacts are fetchable, and the convenient wrapper is ~100× slower per run. Everything in §1–§5
+   is the measurement I should have taken first.
+2. **I mirrored the wrong binaries.** `/lean-wasm/lean.js` and `/lean-wasm/lean.wasm` without a query
+   string are an *older* build (lean.js 85.34 MiB, lean.wasm 131.08 MiB) whose `.olean` files are
+   incompatible with the packed core layer. The app requests them with `?v=<build>`, which is a
+   different and much better build (lean.js **148 KB**, lean.wasm 96.17 MiB). Mixing them fails at
+   runtime with `failed to read file '/lib/lean/Init.olean', incompatible header` — see §5.
+
+## 1. The runtime, and the two decisions that matter
+
+```
+Lean 4 source
+  → real Lean 4 (cauli/lean4 `reinstate-wasm` fork, wasm32)   elaborate + kernel-check
+  → JSON messages, one per line, on stdout                    severity: information | error
+  → the page splits them by severity                          output / diagnostics
+```
+
+The artifacts are built by [`cauli/lean4-wasm-in-browser`](https://github.com/cauli/lean4-wasm-in-browser)
+and deployed to `lean.cau.li`. Two architectural choices in that project account for essentially all
+of the difference in performance, and both are visible in its
+[`lean-worker-persistent.worker.js`](https://lean.cau.li/lean-worker-persistent.worker.js):
+
+- **A real Web Worker, running the runtime once, reused across compiles.** The persistent worker
+  "initializes the runtime ONCE (without running `main()`, which would tear down via `EXIT_RUNTIME=1`)
+  and serves repeated compiles through the fork's `lean_wasm_compile` export. The first compile
+  imports Init and caches the environment inside Lean; subsequent compiles reuse it."
+  The alternative — driving an Emscripten module per run — rebuilds the whole environment every time.
+  The worker's own comment says why an iframe is the wrong container: *"a same-origin iframe shares
+  the main thread, which froze the whole tab"*.
+- **A packed core layer.** 629 Init modules / 1,887 files (`.olean` + `.ir` + `.ir.sig`) are shipped
+  as **5 gzip packs** with a manifest of per-entry offsets, so startup is 5 requests instead of
+  ~1,900. 76.07 MiB raw / 30.69 MiB compressed.
+
+And one choice that fixes a functional gap rather than a performance one: **shipping `.ir` files**.
+They carry the compiled bodies the interpreter needs, which is what makes `#eval` of *library*
+functions work at all (§4).
+
+## 2. Cross-origin isolation is required — measured twice, from both ends
+
+`lean.wasm` does not define a memory; it **imports** one. Parsing the import section of the pinned
+build:
+
+```
+imported memories: [{"flags":3,"shared":true,"min":1024,"max":65536,"maxPages":65536}]
+VERDICT: shared memory = true
+```
+
+`flags: 3` is `has-max | shared`. A `shared` memory can only be constructed with a
+`SharedArrayBuffer`, which browsers expose only to a cross-origin isolated document. The upstream
+worker confirms the same requirement from the other side — it constructs the memory itself:
+
+```js
+new WebAssembly.Memory({ initial: ..., maximum: ..., shared: true })
+```
+
+So this is not a misdiagnosis to be worked around. It is worth stating plainly because
+`browser-cobol` found its own isolation requirement *was* phantom — a stray `instanceof` on
+artifacts whose memories were all `shared: false`. Lean's is in the artifact, and no shim substitutes
+for it. `serve.js` therefore sets COOP/COEP by default, with `--no-isolation` kept so the failure
+stays reproducible: served without headers, the page reports `crossOriginIsolated === false`, shows a
+banner, and a Run fails with an actionable message before downloading anything.
+
+**This is the blocker for embedding Lean in LiveCodes**, and it is not ours to fix from a page: a
+result page runs in a sandboxed iframe inside someone else's document, and cross-origin isolation is
+inherited from the top-level page. If the embedder did not send COOP/COEP, no frame inside it can
+construct the memory. The only real fix is a single-threaded Lean wasm build — a build-and-release
+task.
+
+One sizing detail that bites: the memory's declared maximum must not be exceeded. Passing
+`maximum: 65536` to the older build fails at instantiation with
+
+```
+LinkError: Import #461 "env" "memory": memory import has a larger maximum size 65536
+than the module's declared maximum 32768
+```
+
+The old build declares max 32768, the pinned one 65536. It is readable off the module, and worth
+re-reading whenever the pinned version moves.
+
+## 3. Message handling: severity, not streams
+
+With the fork's compile entry, messages arrive as **one JSON object per line on stdout** — `#eval`
+results, `#check` output and errors all together. stderr is empty in every run observed. So the
+stream a message arrived on tells you nothing:
+
+```json
+{"severity":"information","data":"2","pos":{"line":1,"column":0},"kind":"[anonymous]"}
+{"severity":"error","data":"Unknown identifier `this_is_not_defined`","pos":{"line":1,"column":6}}
+```
+
+The page classifies by `severity` where the line is a JSON message, and otherwise falls back to the
+stream — which is what a plain-text runtime would need. There is also toolchain tracing to drop
+(`[DEBUG:*]`, `[PROFILE]`, `[PWORKER]`, …), matched narrowly by hand so an unrecognised line is
+always shown rather than swallowed; the count of filtered lines is reported in the log. Upstream
+filters the same class of lines with a slightly broader regex, which is corroboration that this is
+inherent to the build rather than something the page introduced.
+
+## 4. Verified
+
+Each row was run through the page and the panes read back.
+
+| snippet | output | exit | run |
+| --- | --- | --- | --- |
+| `#eval "Hello from Lean!"` | `"Hello from Lean!"` | 0 | — |
+| `#eval 2 + 2`, `#eval 2 ^ 10`, `#check Nat.add_comm` | `4`, `1024`, `Nat.add_comm (n m : Nat) : n + m = m + n` | 0 | — |
+| `def fib` + `#eval fib 10` / `#eval fib 20` | `55`, `6765` | 0 | 0.28 s |
+| `theorem add_comm … := by induction b with …` | accepted, no diagnostics | 0 | 0.28–0.67 s |
+| **`#eval (List.range 5).map (fun n => n * n)`** | **`[0, 1, 4, 9, 16]`** | 0 | 0.08 s |
+| `#eval [1,2,3].foldl (· + ·) 0`, `String.join` | `6`, `"abc"` | 0 | — |
+| `#check this_is_not_defined` | `error: Unknown identifier \`this_is_not_defined\` (line 1, col 6)` | 1 | 0.01 s |
+| `theorem t : (1 : Nat) = 2 := by rfl` | `error: Tactic \`rfl\` failed: … ⊢ 1 = 2 (line 1, col 32)` | 1 | 0.03 s |
+
+The library-`#eval` row is the one that would have been impossible with the first approach: `lean4.js`
+answered that same line with `error: Unknown constant \`List.reverse._redArg\``, because its trimmed
+library ships `.olean` files without the `.ir` bodies the interpreter needs. Type-checking worked
+there; *evaluating* library code did not. This build evaluates it.
+
+Runtime startup: **2.2 s** to `ready` (5.5 s on a cold first attempt), of which the 5-pack fetch and
+unpack is a small part and the Init import is the rest. Note the page is deliberately lazy — nothing
+is fetched until the first Run.
+
+## 5. Cost
+
+Pinned build, on disk:
+
+| asset | bytes | notes |
+| --- | --- | --- |
+| `lean.wasm` | 100,838,905 (96.17 MiB) | |
+| `core-lib/artifacts-00{0..4}.pack` | 32,184,975 (30.69 MiB) | gzip; 629 modules, 1,887 entries, 76.07 MiB raw |
+| `core-layer.json` | 313,732 (0.30 MiB) | per-entry offsets |
+| `lean.js` | 148,402 (0.14 MiB) | |
+| **total** | **~127 MiB** | |
+
+Over the wire it is much less: the binaries are served brotli-compressed, and the packs are already
+gzip. `Content-Encoding: br` on `lean.wasm` takes **96.17 MiB down to 16,107,800 B (15.4 MiB)** —
+this wasm compresses ~6×, presumably because a large part of its 84 MB data section is sparse. So a
+first load transfers roughly **47 MB**, not 127 MB. (The "~105 MB" figure that prompted this pass
+matches neither my wire nor my on-disk total; the closest match is the *slim* variant's README row
+(3.4 + 70 + 30.7), and slim is not deployed — `/lean-wasm/slim/lean.js` 404s. Either way the
+direction of the correction was right, and the real numbers are better still.)
+
+Two traps worth recording:
+
+- **The unversioned URLs are a different, older build.** `/lean-wasm/lean.wasm` is 131.08 MiB and
+  `/lean-wasm/lean.js` is 85.34 MiB, and their `.olean` files are incompatible with the current
+  packed layer. `scripts/fetch-assets.mjs` pins `?v=` and refuses to mix builds, and reports the
+  mismatch as `incompatible header` at runtime if you get it wrong. Upstream's own build script
+  enforces the same pairing and aborts on a mismatch.
+- **The glue got ~580× smaller and that is not a typo.** The explicit export list replaces
+  Emscripten's export-everything mode, which cost ~105 MB of JS glue for a ~231k-entry export table.
+  148 KB versus 85.34 MiB.
+
+## 6. Limitations
+
+- **Syntax errors are silently accepted.** This is the most surprising finding, and it is measured,
+  not inferred. `def broken : Nat :=`, `#eval (1 +`, and `def x : Nat := 5` followed by `@@@` all
+  produce **empty stdout, empty stderr, `success: true`** — the page reports "accepted". Elaboration
+  and kernel errors *are* reported, with positions. So the fork's compile entry appears to drop parse
+  failures before they reach the message channel. For a playground this is a real gap: a typo gets no
+  feedback. It is worth reporting upstream; until then the page cannot distinguish "your proof is
+  fine" from "your file did not parse".
+- **Cross-origin isolation is mandatory** (§2), with no shim and no fallback.
+- **No interrupt.** A non-terminating elaboration cannot be stopped; recovery is a page reload, which
+  now costs ~2 s rather than ~8 minutes, so this is much less severe than in the first pass.
+- **~127 MiB of assets** (≈47 MB over the wire) are mirrored locally; they are not committed.
+- **The mirror depends on a third-party deploy.** `lean.cau.li`'s binaries cannot be hotlinked
+  (`Cross-Origin-Resource-Policy: same-origin`, no `Access-Control-Allow-Origin`), which is why they
+  are mirrored. The packs and manifest *do* send `Access-Control-Allow-Origin: *`, but one version
+  story is simpler than two.
+- **Chrome only, as tested.** Safari, Firefox and mobile were not exercised.
+
+## 7. Recommendation for LiveCodes
+
+Much better positioned than the first pass, and still not shippable — for one reason, not two.
+
+**What is now solved.** The per-run boot is gone (~0.3 s per compile, and it reuses the imported
+environment), the payload is ~47 MB over the wire instead of 310 MB, library `#eval` works, and the
+whole thing is ~127 MiB of static files that can be hosted anywhere. The shape is a clean fit for
+LiveCodes' `*-wasm` languages: one Worker per result page, initialised once, driven repeatedly.
+
+**What still blocks it.** §2. A LiveCodes result page cannot guarantee cross-origin isolation, because
+that is inherited from the top-level document, and this runtime needs a shared memory. Nothing at the
+page level changes that; a single-threaded build does. Until then, Lean is in the same category as the
+AtomVM runtime behind `browser-elixir`.
+
+**If a single-threaded build appears**, the integration would be:
+
+```
+src/livecodes/languages/lean/lang-lean.ts           compiler.factory is identity;
+                                                    scripts: [baseUrl + '{{hash:lang-lean-script.js}}'];
+                                                    scriptType: 'text/lean'; largeDownload: true
+src/livecodes/languages/lean/lang-lean-script.ts    creates the Worker, wires the protocol, exposes
+                                                    livecodes.lean.{run,input,loaded,output,error,exitCode}
+```
+
+with `public/lean-worker.js` and the severity classifier from `public/main.js` carrying over almost
+unchanged, and the `{output, error, exitCode}` contract filled from the severity split in §3 —
+`information` messages become `output`, everything else becomes `error`. `exitCode` must be derived
+from the diagnostics rather than from the runtime's own `success` flag, which is `true` for a file
+that elaborates with errors (§3).
+
+**Assets** belong in `browser-compilers` or a mirror we control, referenced from `vendors.ts` and
+pinned by hash, with the `?v=`/layer pairing asserted at build time as §5 describes.
+
+**Worth reporting upstream:** the silent parse failures (§6), and the fact that the unversioned asset
+URLs serve a build whose library is incompatible with the current layer.
+
+## 8. Reproducing
+
+```bash
+npm run assets             # mirror ~127 MB into public/lean-wasm/ (once)
+npm start                  # → http://localhost:8129/  (COOP/COEP ON — required)
+npm run start:no-isolation # same page with no headers, to see the failure (§2)
+npm run check              # syntax-check all four JS files
+```
+
+The page exposes `document.documentElement.dataset` (`status`, `stage`, `runs`, `isolated`,
+`exitCode`, `initMs`, `runMs`) and its element ids as globals, so a headless probe can drive it
+without string literals — set `editor.value`, click `#run`, poll `dataset.status`. `window.__raw`
+holds the unclassified `stdout`/`stderr` of the last run, which is how the silent-parse-failure
+finding in §6 was established.
+
+Artifact inspection used a ~60-line wasm section parser over the module's import section, plus
+`curl -I`/`-w` with and without `Accept-Encoding: br` for the size and compression columns.

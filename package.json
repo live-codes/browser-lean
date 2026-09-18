@@ -1,0 +1,14 @@
+{
+  "name": "@live-codes/browser-lean",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Client-side Lean 4 playground: runs the real Lean 4 kernel in the browser via WebAssembly.",
+  "license": "MIT",
+  "scripts": {
+    "assets": "node scripts/fetch-assets.mjs",
+    "start": "node serve.js",
+    "start:no-isolation": "node serve.js 8129 public --no-isolation",
+    "check": "node --check serve.js && node --check public/main.js && node --check public/lean-worker.js && node --check scripts/fetch-assets.mjs"
+  }
+}

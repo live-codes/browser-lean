@@ -1,0 +1,3 @@
+# Mirror of the Lean WASM artifacts (run `npm run assets`). ~105 MB, fetched
+# from a third-party deploy, and not ours to redistribute in git.
+public/lean-wasm/
