@@ -1,10 +1,10 @@
-# Mirror of the Lean WASM artifacts (run `npm run assets`). ~127 MB, fetched
-# from a third-party deploy, and not ours to redistribute in git.
-public/lean-wasm/
+# # Mirror of the Lean WASM artifacts (run `npm run assets`). ~127 MB, fetched
+# # from a third-party deploy, and not ours to redistribute in git.
+# public/lean-wasm/
 
-# Mirror of the optional per-file libraries (run `npm run assets:libs`).
-# ~377 MB for Std + Lean + Batteries, including the lean-lib-files.json index.
-public/lean-lib/
+# # Mirror of the optional per-file libraries (run `npm run assets:libs`).
+# # ~377 MB for Std + Lean + Batteries, including the lean-lib-files.json index.
+# public/lean-lib/
 
-# Mirror of the Mathlib layer (run `npm run assets:mathlib`). ~316 MB compressed.
-public/lean-mathlib/
+# # Mirror of the Mathlib layer (run `npm run assets:mathlib`). ~316 MB compressed.
+# public/lean-mathlib/
