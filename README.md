@@ -33,8 +33,9 @@ the boot sequence. Credit for making Lean run well in a browser belongs there.
 ## Demo
 
 ```bash
-npm run assets     # mirror ~127 MB of Lean artifacts into public/lean-wasm/ (once)
-npm start          # → http://localhost:8129/
+npm run assets       # mirror ~127 MB of Lean artifacts into public/lean-wasm/ (once)
+npm run assets:libs  # optional: mirror Std/Lean/Batteries for lazy imports (~377 MB)
+npm start            # → http://localhost:8129/
 ```
 
 Pick an example (or type your own), press **Run** — or `Ctrl`/`Cmd` + `Enter` in the editor. Nothing
@@ -95,6 +96,9 @@ Each row was run through the page in headless Chrome and the panes read back.
 | `#eval (List.range 5).map (fun n => n * n)` | `[0, 1, 4, 9, 16]` | 0 | 0.08 s |
 | `#check this_is_not_defined` | `error: Unknown identifier \`this_is_not_defined\` (line 1, col 6)` | 1 | 0.01 s |
 | `theorem t : (1 : Nat) = 2 := by rfl` | `error: Tactic \`rfl\` failed: … (line 1, col 32)` | 1 | 0.03 s |
+| `import Std.Data.HashMap` + `#eval` a `HashMap` fold | `[(1, 1), (2, 2), (3, 3)]` | 0 | 0.20 s |
+| `import Lean` + `#eval (Name.mkSimple "hello").toString` | `"hello"`, `Lean.Expr : Type` | 0 | 0.02 s |
+| `import Batteries` | accepted | 0 | 5.5 s first time, then 0.1 s |
 
 Runtime ready in **2.2 s**. Compiles are milliseconds to a few hundred milliseconds, and get faster
 as the imported environment is reused.
@@ -124,12 +128,58 @@ the packs are already gzip, so a first load transfers roughly **47 MB**.
 a third-party deploy because they cannot be hotlinked — see [FINDINGS.md](FINDINGS.md) §5, which also
 explains why the version must be pinned (`?v=`) and how a mismatch shows up.
 
+`npm run assets:libs` separately mirrors the optional libraries used by lazy imports: **5,598 files,
+~377 MiB**, being `.olean` + `.ir` + `.ir.sig` for each of 1,866 modules (Std, Lean, Batteries).
+
+## Libraries
+
+`Init` is always available. **`Std`, `Lean` (metaprogramming) and `Batteries` are loaded on demand** —
+write the import and it works:
+
+```lean
+import Std.Data.HashMap
+
+def counts (xs : List Nat) : Std.HashMap Nat Nat :=
+  xs.foldl (fun m x => m.insert x ((m.getD x 0) + 1)) {}
+
+#eval (counts [1, 2, 2, 3, 3, 3]).toList   -- [(1, 1), (2, 2), (3, 3)]
+```
+
+When Lean reports a missing module the page fetches that library, installs it into the virtual
+filesystem mid-session and recompiles — so the **first** use of a library costs a fetch and every run
+after it is milliseconds. Nothing is loaded unless you import it.
+
+The closure is discovered by asking the compiler rather than by parsing `.olean` dependency headers:
+Lean's `unknown module prefix 'X'` names exactly what is absent, so the page loads `X` and tries
+again. `import Batteries` therefore pulls in whatever Batteries itself needs.
+
+Imports are read from your program, so **the number of imports does not multiply the work**: eight
+imports from Std cost one load and one compile, not eight. Only transitive dependencies need extra
+rounds, and there are only three libraries to discover, so a program is never more than a few rounds
+from working. Measured: 8 imports across the three libraries → 1 compile; `import Batteries` alone on a
+cold page → 3 compiles (Batteries → Lean → Std).
+
+Upstream ships these as individual files, not packs — `lean-lib-files.json` indexes 2,658 modules and
+there is no `std-layer.json`, because packing is a startup optimisation for the Init closure only.
+`npm run assets:libs` mirrors that tree for the three libraries (5,598 files, ~377 MiB, gitignored).
+
+**`Mathlib` is not included.** Upstream serves it as a separate ~331 MB packed layer for its own
+games, not as a general-purpose library, so there is nothing to fetch lazily here. `import Mathlib`
+says so explicitly.
+
+Requires the library mirror: without it the imports fail with a note telling you to run
+`npm run assets:libs`. See [FINDINGS.md](FINDINGS.md) §5.
+
 ## Limitations
 
 - **Syntax errors are silently accepted.** `def broken : Nat :=` and `#eval (1 +` report nothing at
   all — empty stdout, empty stderr — and the page says "accepted". Elaboration and kernel errors *are*
   reported normally. This is a gap in the fork's compile entry, not in the page; it is worth
   reporting upstream. See [FINDINGS.md](FINDINGS.md) §6.
+- **`Mathlib` is not available.** `Std`, `Lean` and `Batteries` work and are loaded on demand, but
+  Mathlib is only published upstream as a game-specific packed layer — see [Libraries](#libraries).
+- **The optional libraries need their own mirror.** Without `npm run assets:libs`, `import Std` and
+  friends fail with a note saying so.
 - **Cross-origin isolation is mandatory**, with no fallback. A stub `SharedArrayBuffer` does not help
   here (unlike the trick `browser-cobol` documented): this runtime really constructs one for its pthread
   pool, so a fake passes the type check and then wedges the boot.

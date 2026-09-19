@@ -43,6 +43,61 @@ window.params = params;
 
 const CODE_PATH = '/workspace/input.lean';
 
+/**
+ * Libraries that are not shipped on demand, with the reason. Importing one
+ * produces Lean's own "unknown module prefix" error, which reads like a typo
+ * rather than a documented limit of the playground — so say which it is. (Same
+ * idea as browser-haskell's module rules.) See FINDINGS.md §5.
+ */
+const UNAVAILABLE_LIBRARIES = {
+  Lake: 'Lake is a build tool, and there is no build step here.',
+  Mathlib: 'Mathlib is not mirrored here. Upstream serves it as a separate ~331 MB packed layer for its games.',
+};
+
+/** Roots the worker can fetch on demand (mirrored by `npm run assets:libs`). */
+const OPTIONAL_LIBRARIES = ['Std', 'Lean', 'Batteries'];
+
+/** Strip comments so a commented-out import does not trigger a note. */
+function stripComments(code) {
+  return code.replace(/\/-[\s\S]*?-\//g, '').replace(/--[^\n]*/g, '');
+}
+
+function importedRoots(code) {
+  const roots = [];
+  for (const line of stripComments(code).split('\n')) {
+    const match = /^\s*import\s+([A-Za-z0-9_'.]+)/.exec(line);
+    if (!match) continue;
+    const root = match[1].replace(/^'/, '').split('.')[0];
+    if (root && !roots.includes(root)) roots.push(root);
+  }
+  return roots;
+}
+
+function unavailableImportNotes(code, notMirrored = []) {
+  const notes = [];
+  const add = (note) => {
+    if (!notes.includes(note)) notes.push(note);
+  };
+  for (const root of importedRoots(code)) {
+    if (notMirrored.includes(root)) {
+      add(`${root} is not mirrored. Run \`npm run assets:libs\` to fetch the optional libraries.`);
+    } else if (UNAVAILABLE_LIBRARIES[root]) {
+      add(UNAVAILABLE_LIBRARIES[root]);
+    }
+  }
+  return notes;
+}
+
+/** Roots named by Lean's "unknown module prefix 'X'" diagnostics. */
+function missingRoots(problems) {
+  const roots = [];
+  for (const problem of problems) {
+    const match = /unknown module prefix '([^']+)'/.exec(problem.text);
+    if (match && !roots.includes(match[1])) roots.push(match[1]);
+  }
+  return roots;
+}
+
 const EXAMPLES = [
   {
     name: 'Hello — eval, arithmetic, #check',
@@ -86,6 +141,26 @@ const EXAMPLES = [
     code: `#eval (List.range 5).map (fun n => n * n)
 #eval [1, 2, 3].foldl (· + ·) 0
 #eval (String.join ["a", "b", "c"])
+`,
+  },
+  {
+    name: 'Std (loaded on demand)',
+    code: `import Std.Data.HashMap
+
+def counts (xs : List Nat) : Std.HashMap Nat Nat :=
+  xs.foldl (fun m x => m.insert x ((m.getD x 0) + 1)) {}
+
+#eval (counts [1, 2, 2, 3, 3, 3]).toList
+`,
+  },
+  {
+    name: 'Lean metaprogramming (loaded on demand)',
+    code: `import Lean
+
+open Lean
+
+#eval (Name.mkSimple "hello").toString
+#check Expr
 `,
   },
 ];
@@ -247,11 +322,14 @@ function ensureLean() {
     }
 
     const assetBase = params.get('baseUrl') || '/lean-wasm';
+    const libBase = params.get('libBase') || '/lean-lib';
     const t0 = performance.now();
     appendLog(`Starting the Lean runtime from ${assetBase}`);
     appendLog('Loading the packed core layer (Init: 629 modules, ~31 MB in 5 packs)');
 
-    worker = new Worker(`./lean-worker.js?assetBase=${encodeURIComponent(assetBase)}`);
+    worker = new Worker(
+      `./lean-worker.js?assetBase=${encodeURIComponent(assetBase)}&libBase=${encodeURIComponent(libBase)}`,
+    );
     setState({ stage: 'loading' });
 
     // The boot can wedge — most obviously when a shared memory is granted but the
@@ -354,10 +432,42 @@ function ensureLean() {
 function compile(code) {
   return new Promise((resolve) => {
     const id = nextRunId++;
+    window.__compiles = (window.__compiles || 0) + 1;
     stdout = '';
     stderr = '';
     pending = (msg) => resolve({ ...msg, stdout, stderr });
     worker.postMessage({ type: 'compile', id, code, path: CODE_PATH });
+  });
+}
+
+/** Record the outcome of one library fetch, and remember what we could not get. */
+function logLoadResult(entry, notMirrored) {
+  if (entry.files > 0) {
+    appendLog(`Loaded ${entry.root}: ${entry.files} files (${(entry.bytes / 1048576).toFixed(1)} MiB)`);
+    return;
+  }
+  // Already installed by an earlier run in this page — not a missing library.
+  if (entry.alreadyLoaded) return;
+  if (!notMirrored.includes(entry.root)) notMirrored.push(entry.root);
+  appendLog(`No files for ${entry.root}${entry.error ? `: ${entry.error}` : ' (not mirrored)'}`);
+}
+
+/** Ask the worker to fetch and install a library root, resolving when it is done. */
+function loadModules(roots) {
+  return new Promise((resolve) => {
+    const onMessage = (event) => {
+      const msg = event.data || {};
+      if (msg.type === 'modules' && msg.stage === 'progress') {
+        setStatus(`Loading ${msg.root}: ${msg.files}/${msg.total} files…`, 'busy');
+        return;
+      }
+      if (msg.type === 'modules_loaded') {
+        worker.removeEventListener('message', onMessage);
+        resolve(msg.results || []);
+      }
+    };
+    worker.addEventListener('message', onMessage);
+    worker.postMessage({ type: 'load_modules', roots });
   });
 }
 
@@ -378,7 +488,54 @@ async function run() {
     appendLog(`Run #${runs}: ${code.split('\n').length} line(s)`);
 
     const t0 = performance.now();
-    const result = await compile(code);
+    const notMirrored = [];
+    const compilesBefore = window.__compiles || 0;
+
+    // Load the libraries the program names up front, all in one go. Lean reports
+    // only the first missing prefix per compile (it aborts with an uncaught
+    // exception), so discovering roots one compile at a time would make the number
+    // of compile rounds depend on how many libraries a program imports. Reading
+    // the imports removes that: a program with ten imports from three libraries
+    // costs one load phase, not ten.
+    const named = importedRoots(code).filter((root) => OPTIONAL_LIBRARIES.includes(root));
+    if (named.length > 0) {
+      setStatus(`Loading ${named.join(', ')}…`, 'busy');
+      for (const entry of await loadModules(named)) logLoadResult(entry, notMirrored);
+    }
+
+    let result = await compile(code);
+    const attempted = new Set(named);
+
+    // Anything still missing is a transitive dependency, so keep asking the
+    // compiler and loading what it names. Bounded by progress, not by a count: the
+    // cap is only a backstop against a mirror that never satisfies an import.
+    const MAX_ROUNDS = 8;
+    let rounds = 0;
+    for (; rounds < MAX_ROUNDS; rounds++) {
+      const { problems } = collect(result.stdout, result.stderr);
+      const missing = missingRoots(problems).filter(
+        (root) => OPTIONAL_LIBRARIES.includes(root) && !attempted.has(root),
+      );
+      if (missing.length === 0) break;
+      missing.forEach((root) => attempted.add(root));
+
+      setStatus(`Loading ${missing.join(', ')}…`, 'busy');
+      const results = await loadModules(missing);
+      for (const entry of results) logLoadResult(entry, notMirrored);
+      // Only a round that actually installed something earns a recompile; a root
+      // that was already present changes nothing, so stop rather than spin.
+      if (!results.some((entry) => entry.files > 0)) break;
+
+      setStatus('Recompiling with the newly loaded library…', 'busy');
+      result = await compile(code);
+    }
+
+    // If a loadable library is still absent after everything we tried, say so
+    // rather than leaving a bare "unknown module prefix" to be puzzled over.
+    const unresolved = missingRoots(collect(result.stdout, result.stderr).problems).filter(
+      (root) => OPTIONAL_LIBRARIES.includes(root) && attempted.has(root),
+    );
+
     const runMs = Math.round(performance.now() - t0);
 
     const { info, problems, noise } = collect(result.stdout, result.stderr);
@@ -393,17 +550,32 @@ async function run() {
     // something was filtered.
     window.__raw = { stdout: result.stdout, stderr: result.stderr, success: result.success, elapsed: result.elapsed };
 
+    // Lean's own "unknown module prefix" is accurate but reads like a typo; add
+    // the reason when the failure involves a library we cannot supply.
+    const notes = hasErrors
+      ? [
+          ...unavailableImportNotes(code, notMirrored),
+          ...unresolved.map(
+            (root) => `Loaded ${root}, but the compiler still cannot find it — the mirror looks incomplete.`,
+          ),
+        ]
+      : [];
+    const diagnostics = [formatProblems(problems), ...notes.map((n) => `note: ${n}`)]
+      .filter(Boolean)
+      .join('\n');
+
     setPane(els.output, info.map((m) => m.text).join('\n'), 'No output.');
     setPane(
       els.diagnostics,
-      formatProblems(problems),
+      diagnostics,
       'No diagnostics — the kernel accepted everything in this file.',
     );
 
     setState({ status: 'done', exitCode, runMs });
     appendLog(
-      `Done in ${(runMs / 1000).toFixed(2)}s (exit code ${exitCode})` +
-        (noise ? ` — filtered ${noise} toolchain trace line(s)` : ''),
+      `Done in ${(runMs / 1000).toFixed(2)}s (exit code ${exitCode}) — ` +
+        `${(window.__compiles || 0) - compilesBefore} compile(s)` +
+        (noise ? `, filtered ${noise} trace line(s)` : ''),
     );
     scrollToResults();
     setStatus(

@@ -183,6 +183,79 @@ Two traps worth recording:
   Emscripten's export-everything mode, which cost ~105 MB of JS glue for a ~231k-entry export table.
   148 KB versus 85.34 MiB.
 
+### Optional libraries: lazy, per-file, loaded on demand
+
+`Init` arrives packed in the core layer. Everything else upstream offers — `Std`, `Lean`
+(metaprogramming), `Batteries` — ships as **individual files** and is fetched on demand. The page now
+supports them. Before that work, every import failed the same way:
+
+```
+import Std        → error: unknown module prefix 'Std'
+                    error: No directory 'Std' or file 'Std.olean' in the search path entries:
+                    error: /lib/lean
+import Lean       → same, 'Lean'          (0.49 s)
+import Batteries  → same, 'Batteries'     (0.26 s)
+import Mathlib    → same, 'Mathlib'       (0.23 s)
+```
+
+i.e. the page behaved like upstream's **slim** variant ("Init only"), never like its full one.
+
+They are **lazy and per-file**, not a second packed layer:
+
+| | how it ships upstream | size |
+| --- | --- | --- |
+| Init (core) | 5 gzip packs, fetched at boot | 76.07 MiB raw / 30.69 MiB compressed, 629 modules |
+| Std / Lean / Batteries | **individual files** from the static `lean-lib/` tree, fetched on first import | 88.8 / 261.2 / ~26.8 MiB (measured) |
+| Mathlib | its own packed layer, for the Real Analysis game | 4,303 modules / 52 packs / **331.7 MB compressed** |
+
+`lean-lib-files.json` indexes **2,658 module files** — Lean 1,195, Init 629, Std 482, Batteries 186,
+Lake 159, plus single `LeanChecker`/`LeanIR`/`Leanc`/`LakeMain` entries — and each one serves its
+`.olean` (and `.ir`/`.ir.sig`) individually; `Std.olean`, `Std.ir`, `Batteries.olean` and `Lean.olean`
+all return 200 with the `olea` magic. There is **no** `std-layer.json` or `batteries-layer.json` (those
+URLs return the SPA shell), because packing is a startup optimisation for the Init closure only, not a
+packaging scheme for the optional libraries. The per-library sizes above are the bytes the page
+actually fetched — Std in 1,449 files and Lean in 3,588 files, i.e. every published file for both —
+replacing an earlier sampled estimate; the whole mirror is 5,598 files / 376.8 MiB on disk.
+
+#### What was implemented
+
+- `scripts/fetch-libs.mjs` (`npm run assets:libs`) mirrors the tree for Std / Lean / Batteries into
+  `public/lean-lib/`, index included: **5,598 files, ~377 MiB** — `.olean` + `.ir` + `.ir.sig` for each
+  of 1,866 modules.
+- The worker gained `load_modules`: it reads `lean-lib-files.json`, fetches every file under a root,
+  and writes them into `/lib/lean` mid-session. Writing after boot is enough because module resolution
+  happens at compile time — the same property `browser-haskell` documented for adding packages to a
+  live session.
+- The page compiles, and on Lean's `unknown module prefix 'X'` it loads `X` and recompiles.
+  **The dependency closure is discovered by asking the compiler**, not by parsing `.olean`
+  dependency headers, so `import Batteries` pulls in whatever Batteries itself needs without any graph
+  logic on our side.
+- **The retry loop is bounded by progress, not by import count.** The page reads the program's `import`
+  lines and loads those roots in one phase up front; the loop then only runs for *transitive*
+  dependencies. Measured: **8 imports across the three libraries cost one compile** (2.09 s, already
+  installed); `import Batteries` alone on a cold page cost three compiles (10.05 s), because it
+  discovers Batteries → Lean → Std one compile at a time. That is inherent: Lean reports only the
+  first missing prefix per compile, since the frontend aborts with an uncaught exception, so the number
+  of *rounds* is bounded by the number of distinct libraries, never by the number of imports. The
+  8-round cap is a backstop against a mirror that never satisfies an import, and if it is ever reached
+  the page says so instead of leaving a bare "unknown module prefix".
+
+Verified end to end, the fetch being paid once on first use:
+
+| snippet | output | exit | run |
+| --- | --- | --- | --- |
+| `import Std.Data.HashMap` + a `HashMap` fold, `#eval`d | `[(1, 1), (2, 2), (3, 3)]` | 0 | 0.20 s |
+| `import Lean` + `#eval (Name.mkSimple "hello").toString` | `"hello"`, `Lean.Expr : Type` | 0 | 0.02 s |
+| `import Batteries` | accepted | 0 | 5.5 s first, then 0.1 s |
+| all three imported together | accepted | 0 | 1.1 s |
+
+That the `#eval`s work at all is the point of shipping `.ir` next to `.olean` — the same gap that made
+`lean4.js` answer `Unknown constant List.reverse._redArg` in §0.
+
+Mathlib is **not** supported: upstream publishes it only as a game-specific packed layer
+(`real-analysis-layer.json`, 331.7 MB compressed), so there is no per-file tree to load from. The page
+says so explicitly instead of failing obscurely.
+
 ## 6. Limitations
 
 - **Syntax errors are silently accepted.** This is the most surprising finding, and it is measured,

@@ -29,6 +29,8 @@ let compileBusy = false;
 
 const assetBase = (new URLSearchParams(location.search).get('assetBase') || '/lean-wasm').replace(/\/$/, '');
 const assetQ = '';
+// Where the optional per-file libraries (Std, Lean, Batteries) are mirrored.
+const libBase = (new URLSearchParams(location.search).get('libBase') || '/lean-lib').replace(/\/$/, '');
 
 const post = (msg) => self.postMessage(msg);
 
@@ -142,6 +144,87 @@ async function loadLibrary() {
 
   post({ type: 'library', stage: 'done', files: files.length });
   return files;
+}
+
+// ---- Optional libraries -------------------------------------------------
+//
+// The core layer only carries the Init closure. Std / Lean / Batteries live as
+// individual files (`.olean` + `.ir` + `.ir.sig`) in a per-file tree indexed by
+// `lean-lib-files.json`, exactly as upstream ships them. They are fetched on
+// demand and written into the filesystem mid-session, which is enough because
+// module resolution happens at compile time.
+
+let libraryIndex = null;
+const loadedRoots = new Set();
+
+async function getLibraryIndex() {
+  if (libraryIndex) return libraryIndex;
+  const response = await fetch(`${libBase}/lean-lib-files.json`);
+  if (!response.ok) throw new Error(`library index: HTTP ${response.status}`);
+  libraryIndex = await response.json();
+  return libraryIndex;
+}
+
+async function fetchIfPresent(url) {
+  const response = await fetch(url);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
+}
+
+/**
+ * Fetch every published file for one library root.
+ *
+ * No dependency graph is computed here: the page retries the compile after each
+ * load, and Lean's own "unknown module prefix" error names the next root that is
+ * missing, so the closure is discovered by asking the compiler.
+ */
+async function loadRoot(root) {
+  if (loadedRoots.has(root)) return { root, files: 0, bytes: 0, alreadyLoaded: true };
+
+  const index = await getLibraryIndex();
+  const modules = index.filter((p) => p === `${root}.olean` || p.startsWith(`${root}/`));
+  if (modules.length === 0) return { root, files: 0, bytes: 0, unavailable: true };
+
+  // A module's `.ir` is only used when its `.ir.sig` is present, so all three
+  // travel together.
+  const targets = [];
+  for (const module of modules) {
+    targets.push(module, module.replace(/\.olean$/, '.ir'), module.replace(/\.olean$/, '.ir.sig'));
+  }
+
+  let files = 0;
+  let bytes = 0;
+  let next = 0;
+  const CONCURRENCY = 8;
+
+  async function worker() {
+    for (;;) {
+      const i = next++;
+      if (i >= targets.length) return;
+      const rel = targets[i];
+      let data;
+      try {
+        data = await fetchIfPresent(`${libBase}/${rel}`);
+      } catch {
+        continue; // one missing sibling is not fatal
+      }
+      if (!data) continue;
+      try {
+        writeLibEntry(Module.FS, rel, data);
+        files += 1;
+        bytes += data.length;
+      } catch {
+        /* ignore an individual write failure */
+      }
+      if (files % 400 === 0) post({ type: 'modules', stage: 'progress', root, files, total: targets.length });
+    }
+  }
+
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
+  loadedRoots.add(root);
+  post({ type: 'modules', stage: 'loaded', root, files, bytes });
+  return { root, files, bytes };
 }
 
 function mkLeanString(str) {
@@ -281,5 +364,15 @@ self.onmessage = async (event) => {
     }
   } else if (msg.type === 'compile') {
     post({ type: 'result', id: msg.id, ...compileCode(msg.code, msg.path) });
+  } else if (msg.type === 'load_modules') {
+    const results = [];
+    for (const root of msg.roots || []) {
+      try {
+        results.push(await loadRoot(root));
+      } catch (err) {
+        results.push({ root, files: 0, bytes: 0, error: (err && err.message) || String(err) });
+      }
+    }
+    post({ type: 'modules_loaded', roots: msg.roots || [], results });
   }
 };
