@@ -252,9 +252,47 @@ Verified end to end, the fetch being paid once on first use:
 That the `#eval`s work at all is the point of shipping `.ir` next to `.olean` — the same gap that made
 `lean4.js` answer `Unknown constant List.reverse._redArg` in §0.
 
-Mathlib is **not** supported: upstream publishes it only as a game-specific packed layer
-(`real-analysis-layer.json`, 331.7 MB compressed), so there is no per-file tree to load from. The page
-says so explicitly instead of failing obscurely.
+### Mathlib works — as a packed layer, and as a closure
+
+Mathlib is the one library upstream does *not* publish per-file, and the one it does not publish in
+full. It ships as `real-analysis-layer.json`: the **4,303-module closure** its Real Analysis course
+needs, compiled against the same Lean commit as our pinned binaries (`62b6a229…`), as **52 gzip packs,
+316.3 MiB compressed / 809.8 MiB raw**. Upstream is explicit that full Mathlib was tried and rejected —
+"a full Mathlib environment snapshot was tested but deliberately not shipped: compaction exceeded the
+practical WASM heap".
+
+So Mathlib needed a second *transport*, not a second library tree, and the worker now has both:
+
+- `load_modules` — per-file, for Std / Lean / Batteries.
+- `load_layer` — manifest + gzip packs with per-entry offsets, for Mathlib. Packs are installed one at a
+  time and released, so peak memory stays near a single pack rather than the whole 800 MiB layer.
+
+The layer also answers for the roots it carries — Aesop, Qq, Plausible, ProofWidgets, ImportGraph,
+LeanSearchClient, Game — so an import of any of those resolves too. `npm run assets:mathlib` mirrors it.
+
+Verified:
+
+| snippet | output | exit | run |
+| --- | --- | --- | --- |
+| `import Mathlib.Data.Real.Basic` + `Mathlib.Tactic.Ring`; `example (x : ℝ) : x + 0 = x := by ring` | accepted; `#check Real` → `Real : Type` | 0 | 10.4 s cold, 2.6 s warm |
+| `Mathlib.Tactic.NormNum` and `Linarith` proofs on `ℚ` and `ℝ` | accepted | 0 | 2.6 s |
+| `import Mathlib.Analysis.SpecialFunctions.Sqrt` (outside the closure) | `object file '…/Sqrt.olean' of module … does not exist` | 1 | 0.2 s |
+
+Two things worth recording:
+
+- **`import Mathlib` on its own is not a module.** There is no `Mathlib.olean` umbrella in the layer — nor
+  in Mathlib generally — so it fails with `unknown module prefix 'Mathlib'` even with the layer
+  installed. Importing specific modules is the only way, as in any Lean project.
+- **A module outside the closure fails differently**, and the first version of the note logic missed it:
+  the prefix *resolves*, so Lean reports `object file '…' of module X does not exist` rather than an
+  unknown prefix. The page now recognises that shape and says this is the published closure, not a
+  mistake.
+
+One implementation note: the first attempt failed with `Could not load the Mathlib layer: Unexpected
+token 'N', "Not found:"` — a key-name mismatch, where the page sent `manifest` and the worker read
+`manifestUrl`, so it fetched `undefined` and parsed this server's 404 body as JSON. Worth knowing
+because the failure mode of a bad manifest URL is "the compiler cannot find a library we think we
+loaded", which the page now also reports separately (see the `unresolved` note below).
 
 ## 6. Limitations
 

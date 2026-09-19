@@ -43,19 +43,49 @@ window.params = params;
 
 const CODE_PATH = '/workspace/input.lean';
 
+/** Roots the worker can fetch per-file (mirrored by `npm run assets:libs`). */
+const OPTIONAL_LIBRARIES = ['Std', 'Lean', 'Batteries'];
+
 /**
- * Libraries that are not shipped on demand, with the reason. Importing one
- * produces Lean's own "unknown module prefix" error, which reads like a typo
- * rather than a documented limit of the playground — so say which it is. (Same
- * idea as browser-haskell's module rules.) See FINDINGS.md §5.
+ * Mathlib is not published per-file, so it arrives as a **packed layer**: the
+ * 4,303-module closure upstream builds for its Real Analysis game, which brings
+ * its tactic dependencies (Aesop, Qq, Plausible, ProofWidgets) with it. One layer
+ * answers for all of those roots. Mirror it with `npm run assets:mathlib`.
+ */
+const OPTIONAL_LAYERS = [
+  {
+    label: 'Mathlib',
+    manifestUrl: '/lean-mathlib/real-analysis-layer.json',
+    packBase: '/lean-mathlib',
+    roots: [
+      'Mathlib',
+      'Aesop',
+      'Qq',
+      'Plausible',
+      'ProofWidgets',
+      'ImportGraph',
+      'LeanSearchClient',
+      'Game',
+    ],
+  },
+];
+
+/** Which asset command supplies a root, for the "not mirrored" note. */
+function assetCommandFor(root) {
+  if (OPTIONAL_LIBRARIES.includes(root)) return 'npm run assets:libs';
+  if (OPTIONAL_LAYERS.some((layer) => layer.roots.includes(root))) return 'npm run assets:mathlib';
+  return null;
+}
+
+/**
+ * Roots that cannot be supplied at all, with the reason. Importing one produces
+ * Lean's own "unknown module prefix" error, which reads like a typo rather than a
+ * documented limit of the playground — so say which it is. (Same idea as
+ * browser-haskell's module rules.) See FINDINGS.md §5.
  */
 const UNAVAILABLE_LIBRARIES = {
   Lake: 'Lake is a build tool, and there is no build step here.',
-  Mathlib: 'Mathlib is not mirrored here. Upstream serves it as a separate ~331 MB packed layer for its games.',
 };
-
-/** Roots the worker can fetch on demand (mirrored by `npm run assets:libs`). */
-const OPTIONAL_LIBRARIES = ['Std', 'Lean', 'Batteries'];
 
 /** Strip comments so a commented-out import does not trigger a note. */
 function stripComments(code) {
@@ -80,7 +110,12 @@ function unavailableImportNotes(code, notMirrored = []) {
   };
   for (const root of importedRoots(code)) {
     if (notMirrored.includes(root)) {
-      add(`${root} is not mirrored. Run \`npm run assets:libs\` to fetch the optional libraries.`);
+      const command = assetCommandFor(root);
+      add(
+        command
+          ? `${root} is not mirrored. Run \`${command}\` to fetch it.`
+          : `${root} is not available in this playground.`,
+      );
     } else if (UNAVAILABLE_LIBRARIES[root]) {
       add(UNAVAILABLE_LIBRARIES[root]);
     }
@@ -96,6 +131,23 @@ function missingRoots(problems) {
     if (match && !roots.includes(match[1])) roots.push(match[1]);
   }
   return roots;
+}
+
+/**
+ * Mathlib modules outside the published closure fail a different way: the prefix
+ * resolves, but the object file is absent, so the compiler says so by path rather
+ * than by prefix. Worth explaining, because "Mathlib" being available here does not
+ * mean all of Mathlib is.
+ */
+function outsideClosureNotes(problems) {
+  const notes = [];
+  for (const problem of problems) {
+    const match = /object file '[^']*' of module (\S+)/.exec(problem.text);
+    if (!match) continue;
+    const note = `${match[1]} is not in the published Mathlib closure. Upstream ships only the 4,303 modules its Real Analysis course needs, so some of Mathlib is available here and some is not.`;
+    if (!notes.includes(note)) notes.push(note);
+  }
+  return notes;
 }
 
 const EXAMPLES = [
@@ -161,6 +213,16 @@ open Lean
 
 #eval (Name.mkSimple "hello").toString
 #check Expr
+`,
+  },
+  {
+    name: 'Mathlib (loaded on demand)',
+    code: `import Mathlib.Data.Real.Basic
+import Mathlib.Tactic.Ring
+
+theorem mine (x : ℝ) : x + 0 = x := by ring
+
+#check mine
 `,
   },
 ];
@@ -471,6 +533,74 @@ function loadModules(roots) {
   });
 }
 
+/** Ask the worker to install a packed layer, resolving when it finishes. */
+function loadLayer(layer) {
+  return new Promise((resolve) => {
+    const onMessage = (event) => {
+      const msg = event.data || {};
+      if (msg.type === 'layer' && msg.stage === 'progress') {
+        setStatus(
+          `Loading ${msg.label}: pack ${msg.pack}/${msg.packs} (${(msg.bytes / 1048576).toFixed(0)} MiB)…`,
+          'busy',
+        );
+        return;
+      }
+      if (msg.type === 'layer_loaded' && msg.label === layer.label) {
+        worker.removeEventListener('message', onMessage);
+        resolve(msg);
+      }
+    };
+    worker.addEventListener('message', onMessage);
+    worker.postMessage({ type: 'load_layer', ...layer });
+  });
+}
+
+/**
+ * Make `roots` resolvable, by whatever transport each one needs: a packed layer or
+ * the per-file library tree, or both. Returns whether anything was actually
+ * installed — which is what decides whether a recompile is worth doing.
+ */
+async function ensureRoots(roots, state) {
+  const wanted = roots.filter((root) => !state.attempted.has(root));
+  if (wanted.length === 0) return false;
+  wanted.forEach((root) => state.attempted.add(root));
+
+  let progress = false;
+
+  for (const layer of OPTIONAL_LAYERS) {
+    if (!wanted.some((root) => layer.roots.includes(root))) continue;
+    if (state.layers.has(layer.label)) continue;
+    state.layers.add(layer.label);
+
+    setStatus(`Loading ${layer.label}…`, 'busy');
+    const result = await loadLayer(layer);
+    if (result.ok) {
+      if (result.alreadyLoaded) {
+        appendLog(`${layer.label} layer already loaded`);
+      } else {
+        appendLog(
+          `Loaded the ${layer.label} layer: ${result.files} files (${(result.bytes / 1048576).toFixed(1)} MiB)`,
+        );
+        progress = true;
+      }
+    } else {
+      appendLog(`Could not load the ${layer.label} layer: ${result.error}`);
+      if (!state.notMirrored.includes(layer.label)) state.notMirrored.push(layer.label);
+    }
+  }
+
+  const perFile = wanted.filter((root) => OPTIONAL_LIBRARIES.includes(root));
+  if (perFile.length > 0) {
+    setStatus(`Loading ${perFile.join(', ')}…`, 'busy');
+    for (const entry of await loadModules(perFile)) {
+      logLoadResult(entry, state.notMirrored);
+      if (entry.files > 0) progress = true;
+    }
+  }
+
+  return progress;
+}
+
 async function run() {
   if (busy) return;
   setBusy(true);
@@ -488,52 +618,36 @@ async function run() {
     appendLog(`Run #${runs}: ${code.split('\n').length} line(s)`);
 
     const t0 = performance.now();
-    const notMirrored = [];
     const compilesBefore = window.__compiles || 0;
+    const state = { attempted: new Set(), layers: new Set(), notMirrored: [] };
 
-    // Load the libraries the program names up front, all in one go. Lean reports
-    // only the first missing prefix per compile (it aborts with an uncaught
-    // exception), so discovering roots one compile at a time would make the number
-    // of compile rounds depend on how many libraries a program imports. Reading
-    // the imports removes that: a program with ten imports from three libraries
-    // costs one load phase, not ten.
-    const named = importedRoots(code).filter((root) => OPTIONAL_LIBRARIES.includes(root));
-    if (named.length > 0) {
-      setStatus(`Loading ${named.join(', ')}…`, 'busy');
-      for (const entry of await loadModules(named)) logLoadResult(entry, notMirrored);
-    }
+    // Read the program's imports first. Lean reports only the first missing prefix
+    // per compile (the frontend aborts with an uncaught exception), so discovering
+    // roots one compile at a time would make the number of compile rounds depend on
+    // how many libraries a program imports. Reading the imports removes that: eight
+    // imports from three libraries cost one load phase, not eight.
+    await ensureRoots(importedRoots(code), state);
 
     let result = await compile(code);
-    const attempted = new Set(named);
 
     // Anything still missing is a transitive dependency, so keep asking the
     // compiler and loading what it names. Bounded by progress, not by a count: the
     // cap is only a backstop against a mirror that never satisfies an import.
     const MAX_ROUNDS = 8;
-    let rounds = 0;
-    for (; rounds < MAX_ROUNDS; rounds++) {
+    for (let round = 0; round < MAX_ROUNDS; round++) {
       const { problems } = collect(result.stdout, result.stderr);
-      const missing = missingRoots(problems).filter(
-        (root) => OPTIONAL_LIBRARIES.includes(root) && !attempted.has(root),
-      );
-      if (missing.length === 0) break;
-      missing.forEach((root) => attempted.add(root));
-
-      setStatus(`Loading ${missing.join(', ')}…`, 'busy');
-      const results = await loadModules(missing);
-      for (const entry of results) logLoadResult(entry, notMirrored);
+      const progressed = await ensureRoots(missingRoots(problems), state);
       // Only a round that actually installed something earns a recompile; a root
       // that was already present changes nothing, so stop rather than spin.
-      if (!results.some((entry) => entry.files > 0)) break;
-
+      if (!progressed) break;
       setStatus('Recompiling with the newly loaded library…', 'busy');
       result = await compile(code);
     }
 
-    // If a loadable library is still absent after everything we tried, say so
-    // rather than leaving a bare "unknown module prefix" to be puzzled over.
-    const unresolved = missingRoots(collect(result.stdout, result.stderr).problems).filter(
-      (root) => OPTIONAL_LIBRARIES.includes(root) && attempted.has(root),
+    // If a root is still absent after everything we tried, say so rather than
+    // leaving a bare "unknown module prefix" to be puzzled over.
+    const unresolved = missingRoots(collect(result.stdout, result.stderr).problems).filter((root) =>
+      state.attempted.has(root),
     );
 
     const runMs = Math.round(performance.now() - t0);
@@ -554,7 +668,8 @@ async function run() {
     // the reason when the failure involves a library we cannot supply.
     const notes = hasErrors
       ? [
-          ...unavailableImportNotes(code, notMirrored),
+          ...unavailableImportNotes(code, state.notMirrored),
+          ...outsideClosureNotes(problems),
           ...unresolved.map(
             (root) => `Loaded ${root}, but the compiler still cannot find it — the mirror looks incomplete.`,
           ),

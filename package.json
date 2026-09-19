@@ -8,8 +8,9 @@
   "scripts": {
     "assets": "node scripts/fetch-assets.mjs",
     "assets:libs": "node scripts/fetch-libs.mjs",
+    "assets:mathlib": "node scripts/fetch-mathlib.mjs",
     "start": "node serve.js",
     "start:no-isolation": "node serve.js 8129 public --no-isolation",
-    "check": "node --check serve.js && node --check public/main.js && node --check public/lean-worker.js && node --check scripts/fetch-assets.mjs && node --check scripts/fetch-libs.mjs"
+    "check": "node --check serve.js && node --check public/main.js && node --check public/lean-worker.js && node --check scripts/fetch-assets.mjs && node --check scripts/fetch-libs.mjs && node --check scripts/fetch-mathlib.mjs"
   }
 }

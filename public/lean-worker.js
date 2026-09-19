@@ -227,6 +227,51 @@ async function loadRoot(root) {
   return { root, files, bytes };
 }
 
+// ---- Packed layers -----------------------------------------------------
+//
+// Mathlib is not published per-file: upstream ships it as a packed layer (a
+// manifest plus gzip'd containers carrying offset/length for every entry), the
+// same scheme the core Init layer uses. Packs are installed one at a time and
+// released, so peak memory stays around a single pack rather than the whole
+// 800 MiB layer.
+
+const loadedLayers = new Set();
+
+async function loadPackedLayer({ manifestUrl, packBase, label }) {
+  if (loadedLayers.has(label)) return { files: 0, bytes: 0, alreadyLoaded: true };
+
+  const manifest = await (await fetch(manifestUrl)).json();
+  if (!manifest.packs || !Array.isArray(manifest.packs)) {
+    throw new Error(`${label}: manifest has no packs`);
+  }
+
+  let files = 0;
+  let bytes = 0;
+  for (const [index, pack] of manifest.packs.entries()) {
+    const response = await fetch(`${packBase}/${pack.file}`);
+    if (!response.ok) throw new Error(`${pack.file}: HTTP ${response.status}`);
+
+    let raw = new Uint8Array(await response.arrayBuffer());
+    if (raw[0] === 0x1f && raw[1] === 0x8b) raw = await gunzip(raw);
+    if (raw.length !== pack.bytes) {
+      throw new Error(`${pack.file}: got ${raw.length} bytes, manifest says ${pack.bytes}`);
+    }
+
+    for (const entry of pack.entries) {
+      writeLibEntry(Module.FS, entry.path, raw.subarray(entry.offset, entry.offset + entry.bytes));
+    }
+    files += pack.entries.length;
+    bytes += raw.length;
+    raw = null; // release this pack before the next one
+
+    post({ type: 'layer', stage: 'progress', label, pack: index + 1, packs: manifest.packs.length, files, bytes });
+  }
+
+  loadedLayers.add(label);
+  post({ type: 'layer', stage: 'loaded', label, files, bytes });
+  return { files, bytes };
+}
+
 function mkLeanString(str) {
   const ptr = Module.stringToNewUTF8(str);
   const obj = Module._lean_mk_string(ptr);
@@ -374,5 +419,12 @@ self.onmessage = async (event) => {
       }
     }
     post({ type: 'modules_loaded', roots: msg.roots || [], results });
+  } else if (msg.type === 'load_layer') {
+    try {
+      const result = await loadPackedLayer(msg);
+      post({ type: 'layer_loaded', label: msg.label, ok: true, ...result });
+    } catch (err) {
+      post({ type: 'layer_loaded', label: msg.label, ok: false, error: (err && err.message) || String(err) });
+    }
   }
 };

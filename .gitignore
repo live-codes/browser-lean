@@ -5,3 +5,6 @@ public/lean-wasm/
 # Mirror of the optional per-file libraries (run `npm run assets:libs`).
 # ~377 MB for Std + Lean + Batteries, including the lean-lib-files.json index.
 public/lean-lib/
+
+# Mirror of the Mathlib layer (run `npm run assets:mathlib`). ~316 MB compressed.
+public/lean-mathlib/

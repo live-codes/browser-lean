@@ -33,9 +33,10 @@ the boot sequence. Credit for making Lean run well in a browser belongs there.
 ## Demo
 
 ```bash
-npm run assets       # mirror ~127 MB of Lean artifacts into public/lean-wasm/ (once)
-npm run assets:libs  # optional: mirror Std/Lean/Batteries for lazy imports (~377 MB)
-npm start            # → http://localhost:8129/
+npm run assets          # mirror ~127 MB of Lean artifacts into public/lean-wasm/ (once)
+npm run assets:libs     # optional: Std/Lean/Batteries for lazy imports (~377 MB)
+npm run assets:mathlib  # optional: the Mathlib layer (~316 MB compressed)
+npm start               # → http://localhost:8129/
 ```
 
 Pick an example (or type your own), press **Run** — or `Ctrl`/`Cmd` + `Enter` in the editor. Nothing
@@ -99,6 +100,9 @@ Each row was run through the page in headless Chrome and the panes read back.
 | `import Std.Data.HashMap` + `#eval` a `HashMap` fold | `[(1, 1), (2, 2), (3, 3)]` | 0 | 0.20 s |
 | `import Lean` + `#eval (Name.mkSimple "hello").toString` | `"hello"`, `Lean.Expr : Type` | 0 | 0.02 s |
 | `import Batteries` | accepted | 0 | 5.5 s first time, then 0.1 s |
+| `import Mathlib.Data.Real.Basic` + `Mathlib.Tactic.Ring`, `example (x : ℝ) : x + 0 = x := by ring` | accepted, `#check Real` → `Real : Type` | 0 | 10.4 s first time, then 2.6 s |
+| `Mathlib.Tactic.NormNum` + `Linarith` proofs on `ℚ` and `ℝ` | accepted | 0 | 2.6 s (warm) |
+| `import Mathlib.Analysis.SpecialFunctions.Sqrt` (outside the closure) | `object file '…/Sqrt.olean' … does not exist` + a note | 1 | 0.2 s |
 
 Runtime ready in **2.2 s**. Compiles are milliseconds to a few hundred milliseconds, and get faster
 as the imported environment is reused.
@@ -130,6 +134,9 @@ explains why the version must be pinned (`?v=`) and how a mismatch shows up.
 
 `npm run assets:libs` separately mirrors the optional libraries used by lazy imports: **5,598 files,
 ~377 MiB**, being `.olean` + `.ir` + `.ir.sig` for each of 1,866 modules (Std, Lean, Batteries).
+
+`npm run assets:mathlib` mirrors the Mathlib layer: `real-analysis-layer.json` plus **52 packs,
+316.3 MiB compressed** (809.8 MiB once installed — 12,909 files, 4,303 modules).
 
 ## Libraries
 
@@ -163,12 +170,29 @@ Upstream ships these as individual files, not packs — `lean-lib-files.json` in
 there is no `std-layer.json`, because packing is a startup optimisation for the Init closure only.
 `npm run assets:libs` mirrors that tree for the three libraries (5,598 files, ~377 MiB, gitignored).
 
-**`Mathlib` is not included.** Upstream serves it as a separate ~331 MB packed layer for its own
-games, not as a general-purpose library, so there is nothing to fetch lazily here. `import Mathlib`
-says so explicitly.
+**Mathlib works — as a 4,303-module closure.** Upstream publishes Mathlib only as a *packed layer*, the
+closure its Real Analysis game needs, so `npm run assets:mathlib` mirrors it (~316 MiB compressed,
+809.8 MiB installed) and this works:
 
-Requires the library mirror: without it the imports fail with a note telling you to run
-`npm run assets:libs`. See [FINDINGS.md](FINDINGS.md) §5.
+```lean
+import Mathlib.Data.Real.Basic
+import Mathlib.Tactic.Ring
+
+example (x : ℝ) : x + 0 = x := by ring
+```
+
+`norm_num` and `linarith` work too. Two things to know:
+
+- **There is no umbrella `Mathlib` module.** `import Mathlib` alone is not a Lean module and never was
+  — import specific ones, as you would in a Lean project.
+- **It is a closure, not all of Mathlib.** `Mathlib.Analysis.SpecialFunctions.Sqrt`, for example, is not
+  in it. A module outside the closure fails with `object file '…' of module … does not exist`, and the
+  page notes that this is the published closure rather than a mistake. Upstream deliberately does not
+  ship full Mathlib: a complete environment snapshot was tested and rejected because compaction
+  exceeded the practical wasm heap.
+
+Without the mirrors these imports fail with a note naming the command to run — `npm run assets:libs`
+for Std/Lean/Batteries, `npm run assets:mathlib` for Mathlib. See [FINDINGS.md](FINDINGS.md) §5.
 
 ## Limitations
 
@@ -176,10 +200,12 @@ Requires the library mirror: without it the imports fail with a note telling you
   all — empty stdout, empty stderr — and the page says "accepted". Elaboration and kernel errors *are*
   reported normally. This is a gap in the fork's compile entry, not in the page; it is worth
   reporting upstream. See [FINDINGS.md](FINDINGS.md) §6.
-- **`Mathlib` is not available.** `Std`, `Lean` and `Batteries` work and are loaded on demand, but
-  Mathlib is only published upstream as a game-specific packed layer — see [Libraries](#libraries).
-- **The optional libraries need their own mirror.** Without `npm run assets:libs`, `import Std` and
-  friends fail with a note saying so.
+- **Mathlib here is a 4,303-module closure, not Mathlib.** Some modules (`Mathlib.Analysis.SpecialFunctions.Sqrt`)
+  are absent; the page says so when you hit one. There is no umbrella `Mathlib` module either.
+- **The Mathlib layer is heavy**: ~316 MB to mirror and 809.8 MiB installed once loaded, on top of the
+  other libraries. It is fetched only when something imports it.
+- **The optional libraries need their own mirror.** Without `npm run assets:libs` or
+  `npm run assets:mathlib`, the corresponding imports fail with a note naming the command to run.
 - **Cross-origin isolation is mandatory**, with no fallback. A stub `SharedArrayBuffer` does not help
   here (unlike the trick `browser-cobol` documented): this runtime really constructs one for its pthread
   pool, so a fake passes the type check and then wedges the boot.
