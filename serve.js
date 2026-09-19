@@ -63,9 +63,19 @@ const server = createServer(async (req, res) => {
   const headers = {
     'Content-Type': TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
     'Content-Length': body.length,
-    // The page itself is small and changes; the ~310 MB of Lean assets are
-    // fetched from the CDN and cached by the browser, not here.
+    // The page itself is small and changes; the ~800 MB of Lean assets are
+    // fetched once and cached by the browser, not here.
     'Cache-Control': 'no-store',
+    // A CDN hosting the three asset directories needs both of these, and they are
+    // not interchangeable:
+    //   Access-Control-Allow-Origin  — for the fetch()ed binaries and layer packs
+    //   Cross-Origin-Resource-Policy — for lean.js, which the worker pulls in with
+    //                                  importScripts(), a no-cors request that
+    //                                  COEP checks against CORP, not against CORS
+    // Without the second, the boot fails with "Failed to execute 'importScripts'
+    // ... failed to load" even though every other asset arrived fine.
+    'Access-Control-Allow-Origin': '*',
+    'Cross-Origin-Resource-Policy': 'cross-origin',
   };
 
   if (!noIsolation) {

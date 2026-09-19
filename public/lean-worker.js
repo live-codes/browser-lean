@@ -26,6 +26,9 @@ const DEBUG_LINE = /^\s*\[(WASM DEBUG|DEBUG|IFRAME|PROFILE|PWORKER|COMPILE|SNAPS
 let libraryFiles = [];
 let moduleReady = false;
 let compileBusy = false;
+// Blob URL the runtime was bootstrapped from; pthread sub-workers load it too, so
+// it must outlive the boot.
+let mainScriptBlob = null;
 
 const assetBase = (new URLSearchParams(location.search).get('assetBase') || '/lean-wasm').replace(/\/$/, '');
 const assetQ = '';
@@ -307,13 +310,12 @@ function compileCode(code, fileName) {
   }
 }
 
-function startLeanModule() {
+async function startLeanModule() {
   const picked = pickMemory();
   if (!picked) {
     post({ type: 'error', data: 'Could not allocate a shared WebAssembly memory (is the document cross-origin isolated?)' });
     return;
   }
-
   self.Module = {
     wasmMemory: picked.memory,
     INITIAL_MEMORY: picked.bytes,
@@ -392,7 +394,22 @@ function startLeanModule() {
   };
 
   try {
-    importScripts(`${assetBase}/lean.js${assetQ}`);
+    // Fetch lean.js ourselves and hand it to the runtime as a **same-origin blob**.
+    //
+    // `importScripts` itself tolerates a cross-origin script, but this is a pthread
+    // build: the runtime spawns its thread pool with `new Worker(mainScriptUrlOrBlob)`,
+    // and a worker script must be same-origin. With a cross-origin asset base that
+    // throws during evaluation, and `importScripts` reports it only as
+    // "the script at … failed to load" — with every other asset fetching fine, which
+    // points at the wrong thing entirely. A blob URL is same-origin, and is what
+    // `mainScriptUrlOrBlob` exists for.
+    const response = await fetch(`${assetBase}/lean.js${assetQ}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status} fetching lean.js`);
+    const source = await response.text();
+    // Kept for the lifetime of the runtime: pthread sub-workers load it lazily.
+    mainScriptBlob = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    Module.mainScriptUrlOrBlob = mainScriptBlob;
+    importScripts(mainScriptBlob);
   } catch (err) {
     post({ type: 'error', data: 'Failed to load lean.js: ' + ((err && err.message) || err) });
   }
@@ -403,7 +420,7 @@ self.onmessage = async (event) => {
   if (msg.type === 'start') {
     try {
       libraryFiles = await loadLibrary();
-      startLeanModule();
+      await startLeanModule();
     } catch (err) {
       post({ type: 'error', data: 'Loading the Lean library failed: ' + ((err && err.message) || err) });
     }

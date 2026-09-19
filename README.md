@@ -267,13 +267,33 @@ without string literals. `window.__raw` holds the last run's unclassified stdout
 ## Packaging and hosting
 
 The page is **code, not assets**: `public/` is ~30 KB, and everything else is mirrored and gitignored.
-So a package can ship the code and let the assets come from a CDN. Three base URLs are configurable:
+So a package can ship the code and let the assets come from a CDN. All assets live in three sibling
+directories under **one base**:
 
-| what | query param | default | size |
-| --- | --- | --- | --- |
-| binaries + core layer (`lean.js`, `lean.wasm`, `core-layer.json` + packs) | `?baseUrl=` | `/lean-wasm` | 96.4 MiB |
-| per-file libraries (index + Std/Lean/Batteries) | `?libBase=` | `/lean-lib` | 377 MiB |
-| packed layers (Mathlib) | `?layerBase=` | `/lean-mathlib` | 316 MiB |
+```
+<base>/lean-wasm/     binaries (lean.js, lean.wasm) + the packed core layer    96.4 MiB
+<base>/lean-lib/      per-file libraries (Std, Lean, Batteries)                377 MiB
+<base>/lean-mathlib/  the packed Mathlib layer                                 316 MiB
+```
+
+That is exactly the layout of `public/`, so the default (`npm start`) is the same origin's root, and a
+single `?baseUrl=` moves all three at once:
+
+```
+http://localhost:8129/?baseUrl=https://cdn.example.com/lean
+```
+
+**The host must send two headers, and they are not interchangeable:**
+
+| header | needed for |
+| --- | --- |
+| `Access-Control-Allow-Origin` | everything fetched with `fetch()` — the binaries, core packs and layer packs |
+| `Cross-Origin-Resource-Policy: cross-origin` | `lean.js`, which the worker pulls in with `importScripts()` — a no-cors request that COEP checks against CORP rather than CORS |
+
+Miss the second and every asset downloads fine but the boot dies with `Failed to execute
+'importScripts' … failed to load`, which reads like a network problem and is not one. `serve.js` sends
+both, so a CDN layout can be tested locally: run `npm start`, start a second instance on another port,
+and point `?baseUrl=` at it (`http://localhost:8131` in development).
 
 Upstream's **library data is already CORS-enabled** (`Access-Control-Allow-Origin: *`), so the 347 MiB
 of packs and `.olean` files could be fetched from `lean.cau.li` with no hosting. **The two binaries are

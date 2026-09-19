@@ -47,12 +47,23 @@ const CODE_PATH = '/workspace/input.lean';
 const OPTIONAL_LIBRARIES = ['Std', 'Lean', 'Batteries'];
 
 /**
- * Where each kind of asset comes from, so a published package can point at a CDN
- * without editing code. `?baseUrl=` (binaries + core layer) is handled by the
- * worker; these two are for the on-demand libraries.
+ * Every asset lives under one base, in three sibling directories:
+ *
+ *   <base>/lean-wasm/     binaries (lean.js, lean.wasm) + the packed core layer
+ *   <base>/lean-lib/      per-file libraries (Std, Lean, Batteries)
+ *   <base>/lean-mathlib/  the packed Mathlib layer
+ *
+ * That is exactly the layout of `public/`, so `?baseUrl=` moves all three at once
+ * and defaults to this origin's root, which is what `npm start` serves. Point it
+ * at a CDN mirroring the same three directories and nothing else needs changing.
+ * The host must send `Access-Control-Allow-Origin` — the binaries and layers are
+ * fetched by `fetch()`, and a cross-origin `importScripts` under COEP needs it too.
+ * See README §Packaging and hosting.
  */
-const LIB_BASE = params.get('libBase') || '/lean-lib';
-const LAYER_BASE = params.get('layerBase') || '/lean-mathlib';
+const ASSET_ROOT = (params.get('baseUrl') || '').replace(/\/+$/, '');
+const ASSET_BASE = `${ASSET_ROOT}/lean-wasm`;
+const LIB_BASE = `${ASSET_ROOT}/lean-lib`;
+const LAYER_BASE = `${ASSET_ROOT}/lean-mathlib`;
 
 /**
  * Mathlib is not published per-file, so it arrives as a **packed layer**: the
@@ -391,14 +402,12 @@ function ensureLean() {
       return;
     }
 
-    const assetBase = params.get('baseUrl') || '/lean-wasm';
-    const libBase = LIB_BASE;
     const t0 = performance.now();
-    appendLog(`Starting the Lean runtime from ${assetBase}`);
+    appendLog(`Starting the Lean runtime from ${ASSET_BASE}`);
     appendLog('Loading the packed core layer (Init: 629 modules, ~31 MB in 5 packs)');
 
     worker = new Worker(
-      `./lean-worker.js?assetBase=${encodeURIComponent(assetBase)}&libBase=${encodeURIComponent(libBase)}`,
+      `./lean-worker.js?assetBase=${encodeURIComponent(ASSET_BASE)}&libBase=${encodeURIComponent(LIB_BASE)}`,
     );
     setState({ stage: 'loading' });
 

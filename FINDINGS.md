@@ -339,6 +339,43 @@ Two caveats on hotlinking upstream even where it is permitted:
    and throughput was poor in testing (96 MiB took minutes). Fine for development; asking a published
    package's users to pull 347 MiB from someone else's bucket is not.
 
+### Serving the assets from a different origin
+
+Everything above assumes the assets share the page's origin, which is true of `npm start` but not of a
+package consuming a CDN. Making that work needed two changes, both found by testing rather than
+reasoning — and my first diagnosis was wrong:
+
+1. **`Cross-Origin-Resource-Policy: cross-origin`, not just CORS.** `lean.js` arrives via
+   `importScripts()`, which is a **no-cors** request, and COEP checks that against CORP;
+   `Access-Control-Allow-Origin` does not satisfy it. Adding ACAO alone left every pack downloaded and
+   the boot dying at `Failed to execute 'importScripts' … failed to load` — a message that reads like a
+   network failure while the network is fine.
+2. **The bootstrap must be same-origin, so `lean.js` is fetched and imported from a blob URL.** Adding
+   CORP was not enough either. Isolating the mechanism in a throwaway worker showed cross-origin
+   `importScripts` works perfectly — `lean.js: ok` — so the failure was not the fetch. It is that this
+   is a pthread build: the runtime spawns its thread pool with `new Worker(mainScriptUrlOrBlob)`, and a
+   **worker script must be same-origin**, so a cross-origin main script throws during evaluation and
+   `importScripts` reports it only as "failed to load". The worker now fetches `lean.js` (a CORS
+   request ACAO covers) and imports a blob URL — which is precisely what Emscripten's
+   `mainScriptUrlOrBlob` is for.
+
+Verified by serving the page from `:8129` with `?baseUrl=http://localhost:8131`, a genuinely
+cross-origin load of all three directories:
+
+| program | assets from | result |
+| --- | --- | --- |
+| Std example | `:8131` — 1,449 files, 88.8 MiB | accepted, `[(1, 1), (2, 2), (3, 3)]` |
+| Mathlib example | `:8131` — 12,909 files, 809.8 MiB | accepted, `mine (x : ℝ) : x + 0 = x` |
+| default, no `?baseUrl=` | same origin | accepted (regression check) |
+
+So a CDN mirroring `public/`'s three directories under one base is all that is needed:
+
+```
+<base>/lean-wasm/  <base>/lean-lib/  <base>/lean-mathlib/
+```
+
+with `Access-Control-Allow-Origin` **and** `Cross-Origin-Resource-Policy: cross-origin` on all three.
+
 Hence the recommendation in §7: ship **code only** and treat every asset host as configuration.
 
 ## 6. Limitations
