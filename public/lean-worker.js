@@ -30,10 +30,15 @@ let compileBusy = false;
 // it must outlive the boot.
 let mainScriptBlob = null;
 
-const assetBase = (new URLSearchParams(location.search).get('assetBase') || '/lean-wasm').replace(/\/$/, '');
+// Configuration arrives either as a global or as a query string. The packaged runtime
+// (@live-codes/lean-wasm) hands this file over as a blob, and a blob URL carries no query string, so
+// it prepends `self.__LEAN_WASM_CONFIG__`; the demo loads this file directly and uses the query.
+const workerConfig = self.__LEAN_WASM_CONFIG__ ?? {};
+const workerParams = new URLSearchParams(location.search);
+const assetBase = (workerConfig.assetBase || workerParams.get('assetBase') || '/lean-wasm').replace(/\/$/, '');
 const assetQ = '';
 // Where the optional per-file libraries (Std, Lean, Batteries) are mirrored.
-const libBase = (new URLSearchParams(location.search).get('libBase') || '/lean-lib').replace(/\/$/, '');
+const libBase = (workerConfig.libBase || workerParams.get('libBase') || '/lean-lib').replace(/\/$/, '');
 
 const post = (msg) => self.postMessage(msg);
 
@@ -435,13 +440,13 @@ self.onmessage = async (event) => {
         results.push({ root, files: 0, bytes: 0, error: (err && err.message) || String(err) });
       }
     }
-    post({ type: 'modules_loaded', roots: msg.roots || [], results });
+    post({ type: 'modules_loaded', id: msg.id, roots: msg.roots || [], results });
   } else if (msg.type === 'load_layer') {
     try {
       const result = await loadPackedLayer(msg);
-      post({ type: 'layer_loaded', label: msg.label, ok: true, ...result });
+      post({ type: 'layer_loaded', id: msg.id, label: msg.label, ok: true, ...result });
     } catch (err) {
-      post({ type: 'layer_loaded', label: msg.label, ok: false, error: (err && err.message) || String(err) });
+      post({ type: 'layer_loaded', id: msg.id, label: msg.label, ok: false, error: (err && err.message) || String(err) });
     }
   }
 };

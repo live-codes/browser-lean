@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>@live-codes/lean-wasm — verification</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; margin: 1rem; background: #14161a; color: #e6e8ee; }
+      h1 { font-size: 15px; }
+      pre { white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 12.5px;
+            background: #1c1f26; border: 1px solid #2e3340; border-radius: 6px; padding: 10px; }
+      .ok { color: #6ee7a0; } .bad { color: #ff8f8f; } .muted { color: #98a0b3; }
+    </style>
+  </head>
+  <body>
+    <h1>@live-codes/lean-wasm — both entries</h1>
+    <p class="muted" id="env">checking environment…</p>
+    <pre id="out">running…</pre>
+
+    <script type="module">
+      // The page and the assets are deliberately on **different origins**: the package is loaded from
+      // this one, the runtime from BASE. That is how LiveCodes would use it (glue from a CDN, assets
+      // from wherever they are hosted), and it is the case that needs CORS *and* CORP on the assets.
+      const params = new URLSearchParams(location.search);
+      const BASE = params.get('assets') ?? 'http://localhost:8129/';
+
+      const log = [];
+      const results = {};
+      const out = document.getElementById('out');
+
+      function report(label, value, ok) {
+        results[label] = { ok, value };
+        log.push(`${ok ? '  ok  ' : ' FAIL '} ${label}: ${value}`);
+        out.textContent = log.join('\n');
+        document.documentElement.dataset.results = JSON.stringify(results);
+      }
+
+      const isolated = self.crossOriginIsolated === true;
+      document.getElementById('env').innerHTML = `crossOriginIsolated: <b>${isolated}</b> · assets: <code>${BASE}</code>`;
+
+      if (typeof Worker !== 'function') {
+        report('environment', 'no Worker in this document', false);
+      } else {
+        const { createCompiler } = await import('../src/index.js');
+
+        const show = (message) => {
+          log.push(`  ..   ${message}`);
+          out.textContent = log.join('\n');
+        };
+
+        // 1. The ES module entry, in this document.
+        try {
+          const lean = await createCompiler({ baseUrl: BASE, onProgress: show });
+
+          const sum = await lean.run('#eval 2 + 2');
+          report('esm: #eval 2 + 2', `output=${JSON.stringify(sum.output)} exit=${sum.exitCode}`, sum.output.trim() === '4' && sum.exitCode === 0);
+
+          const proof = await lean.run('theorem t (a : Nat) : a + 0 = a := by simp\n#check t');
+          report('esm: proof + #check', `output=${JSON.stringify(proof.output)} exit=${proof.exitCode}`, proof.exitCode === 0 && proof.output.includes('t (a : Nat) : a + 0 = a'));
+
+          const failing = await lean.run('#check this_does_not_exist');
+          report('esm: elaboration error', failing.errors[0] ?? '(none)', failing.exitCode === 1 && `${failing.errors[0]}`.includes('Unknown identifier'));
+
+          // A library the runtime has to fetch on demand, module by module.
+          const std = await lean.run(
+            'import Std.Data.HashMap\n\ndef counts (xs : List Nat) : Std.HashMap Nat Nat :=\n  xs.foldl (fun m x => m.insert x ((m.getD x 0) + 1)) {}\n\n#eval (counts [1, 2, 2, 3, 3, 3]).toList'
+          );
+          report('esm: import Std (loaded on demand)', `output=${JSON.stringify(std.output)} exit=${std.exitCode} libs=${JSON.stringify(std.libraries)}`, std.exitCode === 0 && std.output.trim() === '[(1, 1), (2, 2), (3, 3)]');
+
+          // The syntax probe. `full` on purpose: it is the mode that will load Lean if the session
+          // has not already, and this checks the packaged probe actually reports a parse error — at
+          // the end of the input, which for `def broken : Nat :=` is line 1, column 19.
+          const broken = 'def broken : Nat :=';
+          const syntax = await lean.run(broken, undefined, { syntaxCheck: 'full' });
+          report(
+            'esm: syntax probe (full)',
+            syntax.errors[0] ?? '(none)',
+            syntax.exitCode === 1 && /syntax error at line 1, column 19/.test(`${syntax.errors[0]}`)
+          );
+
+          lean.dispose();
+        } catch (error) {
+          report('esm entry', String(error?.message ?? error), false);
+        }
+
+        // 2. The IIFE entry, inside a classic worker — the shape LiveCodes uses: importScripts the
+        //    bundle from a CDN and drive it there.
+        try {
+          const bundle = new URL('../dist/lean-wasm.global.js', location.href).href;
+          const source = `
+            importScripts(${JSON.stringify(bundle)});
+            self.onmessage = async (event) => {
+              try {
+                const lean = await self.leanWasm.createCompiler({ baseUrl: event.data.baseUrl });
+                const result = await lean.run(event.data.code);
+                lean.dispose();
+                self.postMessage({ ok: true, result: { output: result.output, errors: result.errors, exitCode: result.exitCode } });
+              } catch (error) {
+                self.postMessage({ ok: false, error: String((error && error.message) || error) });
+              }
+            };
+            self.postMessage({ type: 'iife-loaded', hasApi: typeof self.leanWasm?.createCompiler === 'function' });
+          `;
+          const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+          const reply = await new Promise((resolve, reject) => {
+            worker.onmessage = (event) =>
+              event.data?.type === 'iife-loaded'
+                ? report('iife bundle exposes self.leanWasm.createCompiler', String(event.data.hasApi), event.data.hasApi)
+                : resolve(event.data);
+            worker.onerror = (event) => reject(new Error(event.message || 'worker error'));
+            worker.onmessage = (event) => {
+              if (event.data?.type === 'iife-loaded') {
+                report('iife bundle exposes self.leanWasm.createCompiler', String(event.data.hasApi), event.data.hasApi);
+                worker.postMessage({ baseUrl: BASE, code: '#eval "from the iife in a worker"' });
+                return;
+              }
+              resolve(event.data);
+            };
+            setTimeout(() => reject(new Error('iife worker timed out')), 120000);
+          });
+          worker.terminate();
+          report(
+            'iife in a worker',
+            reply.ok ? `output=${JSON.stringify(reply.result.output)} exit=${reply.result.exitCode}` : reply.error,
+            reply.ok && reply.result.output.trim() === '"from the iife in a worker"' && reply.result.exitCode === 0
+          );
+        } catch (error) {
+          report('iife entry', String(error?.message ?? error), false);
+        }
+      }
+
+      const allOk = Object.values(results).every((entry) => entry.ok);
+      log.push(allOk ? '\nALL PASS' : '\nFAILURES');
+      out.innerHTML = log.join('\n').replace('ALL PASS', '<span class="ok">ALL PASS</span>').replace('FAILURES', '<span class="bad">FAILURES</span>');
+      document.documentElement.dataset.status = allOk ? 'pass' : 'fail';
+      document.documentElement.dataset.done = 'true';
+    </script>
+  </body>
+</html>

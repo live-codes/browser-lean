@@ -7,3 +7,4 @@
 - Challenges hardcoded limits / magic numbers (e.g. a fixed retry cap, "what happens if we have more than 4 imports?") and expects behavior bounded by real progress or logic rather than an arbitrary count. Confidence: 0.5
 - Favors client-side / serverless solutions — code should run entirely in the browser with no server-side compilation or upload. Confidence: 0.6
 - Prefers a single unified configuration knob over multiple separate parameters — e.g. wants one `baseUrl` that drives all related asset paths rather than distinct `libBase`/`layerBase` params, even though the resources live in separate directories. Confidence: 0.7
+- Expects working code to be packaged as a reusable, publishable artifact (e.g. an npm package consumable in LiveCodes) in the same shape and conventions as an established sibling package (naming it as the template, like `@live-codes/clang-wasm`) rather than left as demo-specific code. Confidence: 0.55

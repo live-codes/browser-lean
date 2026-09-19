@@ -240,6 +240,16 @@ library functions working, and static assets that can be hosted anywhere. [FINDI
 §7 has the `lang-lean` shape that would follow, and notes which parts of `public/main.js` carry over
 almost unchanged.
 
+## npm package
+
+`packages/lean-wasm` is **`@live-codes/lean-wasm`** — the same runtime as a library, in the shape the
+other `@live-codes/*` language packages take: an ES module entry, an IIFE build for classic workers
+(which is how LiveCodes loads a language's driver), and `lean-wasm-fetch-assets` to materialise the
+assets for a host you control. It ships **code only** (~34 kB) because Lean's wasm is a single 96.2 MiB
+file and jsDelivr refuses files over 20 MB — the assets can never travel in a tarball.
+
+See [packages/lean-wasm/README.md](packages/lean-wasm/README.md).
+
 ## Layout
 
 ```
@@ -247,6 +257,7 @@ public/index.html      the page: examples, editor, output, diagnostics, log
 public/main.js         the driver: worker protocol, progress, message classification, dataset state
 public/lean-worker.js  the Lean runtime host (persistent Worker; adapted from upstream, Apache-2.0)
 scripts/fetch-assets.mjs  mirrors the pinned artifacts into public/lean-wasm/
+packages/lean-wasm/    the published package, `@live-codes/lean-wasm`
 serve.js               static server: COOP/COEP on by default, --no-isolation to compare
 FINDINGS.md            the spike log: what was measured, what breaks, what it means
 lean-run.png           screenshot of a verified run

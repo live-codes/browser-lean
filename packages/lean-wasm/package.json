@@ -1,0 +1,43 @@
+{
+  "name": "@live-codes/lean-wasm",
+  "version": "0.1.0",
+  "description": "Run Lean 4 in the browser with one API, on the real Lean kernel compiled to WebAssembly",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.js",
+    "./iife": "./dist/lean-wasm.global.js"
+  },
+  "bin": {
+    "lean-wasm-fetch-assets": "./bin/fetch-assets.mjs"
+  },
+  "files": [
+    "src",
+    "bin",
+    "scripts",
+    "dist",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:iife": "node scripts/build-iife.mjs",
+    "sync:worker": "node scripts/sync-worker.mjs",
+    "check": "node scripts/sync-worker.mjs --check",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "keywords": [
+    "lean",
+    "lean4",
+    "wasm",
+    "webassembly",
+    "theorem-prover",
+    "proof-assistant",
+    "mathlib",
+    "playground"
+  ]
+}
