@@ -47,6 +47,14 @@ const CODE_PATH = '/workspace/input.lean';
 const OPTIONAL_LIBRARIES = ['Std', 'Lean', 'Batteries'];
 
 /**
+ * Where each kind of asset comes from, so a published package can point at a CDN
+ * without editing code. `?baseUrl=` (binaries + core layer) is handled by the
+ * worker; these two are for the on-demand libraries.
+ */
+const LIB_BASE = params.get('libBase') || '/lean-lib';
+const LAYER_BASE = params.get('layerBase') || '/lean-mathlib';
+
+/**
  * Mathlib is not published per-file, so it arrives as a **packed layer**: the
  * 4,303-module closure upstream builds for its Real Analysis game, which brings
  * its tactic dependencies (Aesop, Qq, Plausible, ProofWidgets) with it. One layer
@@ -55,8 +63,8 @@ const OPTIONAL_LIBRARIES = ['Std', 'Lean', 'Batteries'];
 const OPTIONAL_LAYERS = [
   {
     label: 'Mathlib',
-    manifestUrl: '/lean-mathlib/real-analysis-layer.json',
-    packBase: '/lean-mathlib',
+    manifestUrl: `${LAYER_BASE}/real-analysis-layer.json`,
+    packBase: LAYER_BASE,
     roots: [
       'Mathlib',
       'Aesop',
@@ -384,7 +392,7 @@ function ensureLean() {
     }
 
     const assetBase = params.get('baseUrl') || '/lean-wasm';
-    const libBase = params.get('libBase') || '/lean-lib';
+    const libBase = LIB_BASE;
     const t0 = performance.now();
     appendLog(`Starting the Lean runtime from ${assetBase}`);
     appendLog('Loading the packed core layer (Init: 629 modules, ~31 MB in 5 packs)');

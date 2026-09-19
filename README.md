@@ -264,6 +264,34 @@ The page exposes `document.documentElement.dataset` (`status`, `stage`, `runs`, 
 `exitCode`, `initMs`, `runMs`) and its element ids as globals, so a headless probe can drive it
 without string literals. `window.__raw` holds the last run's unclassified stdout/stderr.
 
+## Packaging and hosting
+
+The page is **code, not assets**: `public/` is ~30 KB, and everything else is mirrored and gitignored.
+So a package can ship the code and let the assets come from a CDN. Three base URLs are configurable:
+
+| what | query param | default | size |
+| --- | --- | --- | --- |
+| binaries + core layer (`lean.js`, `lean.wasm`, `core-layer.json` + packs) | `?baseUrl=` | `/lean-wasm` | 96.4 MiB |
+| per-file libraries (index + Std/Lean/Batteries) | `?libBase=` | `/lean-lib` | 377 MiB |
+| packed layers (Mathlib) | `?layerBase=` | `/lean-mathlib` | 316 MiB |
+
+Upstream's **library data is already CORS-enabled** (`Access-Control-Allow-Origin: *`), so the 347 MiB
+of packs and `.olean` files could be fetched from `lean.cau.li` with no hosting. **The two binaries are
+not** — they are served through a Cloudflare Function with `Cross-Origin-Resource-Policy: same-origin`
+and no CORS — and they are the only part that must be hosted deliberately.
+
+`lean.wasm` is 96.2 MiB, which rules out the obvious free CDNs:
+
+- **jsDelivr** has a 20 MB *per-file* limit on top of the 150 MB package limit, so the wasm cannot be
+  served there at all (the 5 core packs, ~6 MB each, would fit).
+- **GitHub Releases** send no `Access-Control-Allow-Origin` (and `Content-Disposition: attachment`).
+- **GitHub Pages** does send `*` and would hold the file under its 100 MiB limit, but is not intended as
+  a CDN and has a soft 100 GB/month bandwidth cap.
+
+**Cloudflare R2 / B2 / Bunny** (96 MB stored is cents per month; egress free on R2) — or asking upstream
+to add the header — is the way to host the binaries. Full audit, including the `HEAD`-vs-`GET` trap that
+makes this look the opposite of what it is, in [FINDINGS.md](FINDINGS.md) §5.
+
 ## Status
 
 Spike complete. The page runs Lean 4 client-side, verified end to end in headless Chrome for

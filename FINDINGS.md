@@ -294,6 +294,53 @@ token 'N', "Not found:"` — a key-name mismatch, where the page sent `manifest`
 because the failure mode of a bad manifest URL is "the compiler cannot find a library we think we
 loaded", which the page now also reports separately (see the `unresolved` note below).
 
+### Hosting: which assets are already on a CORS-enabled CDN
+
+For publishing this as a package, "can we just point at upstream?" splits by asset type, and the split
+is not where you would guess. Measured with a ranged `GET` carrying an `Origin` header:
+
+| asset | host | `Access-Control-Allow-Origin` | usable from another origin? |
+| --- | --- | --- | --- |
+| `lean.wasm` (96.2 MiB), `lean.js` (148 KB) | lean.cau.li, via a Cloudflare Function | none — and `Cross-Origin-Resource-Policy: same-origin` | **no** |
+| `core-layer.json`, `core-lib/*.pack` (30.7 MiB) | lean.cau.li, static Pages | `*` | yes |
+| `lean-lib-files.json`, `lean-lib/**` (377 MiB) | lean.cau.li, static Pages | `*` | yes |
+| `real-analysis-layer.json`, `real-analysis-lib/*.pack` (316 MiB) | lean.cau.li, static Pages | `*` | yes |
+| `lean.js` + `lean.wasm` (older build, 216 MiB) | lean4-wasm.timqian.com (R2) | `*` | yes, but the wrong build |
+
+So **everything except the two binaries is already served with `Access-Control-Allow-Origin: *`** — the
+~347 MiB of library data could be fetched straight from upstream with no hosting at all. The one thing
+that cannot is `lean.wasm`, and it is 96.2 MiB of the total.
+
+The trap worth recording: on this host a **`HEAD` omits the CORS headers that a `GET` returns**. Testing
+`https://lean4-wasm.timqian.com` earlier, `HEAD` showed no `Access-Control-Allow-Origin` and the host
+looked unusable; a real `GET` returned `*`. I very nearly drew the opposite conclusion twice. Test with
+a ranged `GET`.
+
+Alternatives checked, so nobody re-checks them:
+
+- **jsDelivr** is not a route to this at all, independent of the 150 MB package limit: there is also a
+  **20 MB per-file** limit, and `lean.wasm` is 96.2 MiB. The core packs (5 files, ~6 MB each, 30.7 MiB
+  total) would fit; the wasm never will without a granted increase.
+- **GitHub Releases** do not work: the redirect target returns **no `Access-Control-Allow-Origin`** and
+  sends `Content-Disposition: attachment`. Public and huge, but not fetchable from a page.
+- **GitHub Pages** does work (`Access-Control-Allow-Origin: *`), and would hold a 96.2 MiB file under the
+  100 MiB limit — but it has a soft 100 GB/month bandwidth cap and is explicitly not intended as a CDN.
+- **Cloudflare R2 / B2 / Bunny** are the honest answer for the binaries: 96 MB to store is cents per
+  month, egress is free on R2, and CORS is a bucket setting.
+
+Two caveats on hotlinking upstream even where it is permitted:
+
+1. **Those paths are unversioned and mutable.** Only the Function honours `?v=`; the static packs are
+   served with `Cache-Control: public, max-age=0, must-revalidate` and `cf-cache-status: DYNAMIC`, so a
+   redeploy changes the bytes under a fixed URL. The manifests carry `leanCommit`, so a consumer can
+   refuse a layer built for a different binary — that check matters more here than the URL pinning that
+   works for the binaries.
+2. **They are not edge-cached.** `cf-cache-status: DYNAMIC` means every consumer reaches origin storage,
+   and throughput was poor in testing (96 MiB took minutes). Fine for development; asking a published
+   package's users to pull 347 MiB from someone else's bucket is not.
+
+Hence the recommendation in §7: ship **code only** and treat every asset host as configuration.
+
 ## 6. Limitations
 
 - **Syntax errors are silently accepted.** This is the most surprising finding, and it is measured,
