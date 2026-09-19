@@ -10,10 +10,14 @@
  * limits flags `3` (has-max | shared), min 256 pages, max 32768 pages. See
  * FINDINGS.md §2 for how that was read off the artifact.
  *
- *   node serve.js [port] [root] [--no-isolation]
+ *   node serve.js [port] [root] [--no-isolation] [--spa-fallback]
  *
- * `root` defaults to `public/` and is resolved against this file. Pass
- * `--no-isolation` to omit COOP/COEP, which is how the failure is reproduced.
+ * `root` defaults to `public/` and is resolved against this file.
+ * `--no-isolation` omits COOP/COEP, which is how the isolation failure is reproduced.
+ * `--spa-fallback` answers a missing file with `index.html` and a `200`, the way
+ * Cloudflare Pages does when it has a fallback configured. That is not an obscure
+ * host quirk to tolerate: it is what made a broken import look like a successful
+ * download, so it is worth being able to reproduce on demand.
  */
 
 import { createServer } from 'node:http';
@@ -23,17 +27,18 @@ import { fileURLToPath } from 'node:url';
 
 const argv = process.argv.slice(2);
 const noIsolation = argv.includes('--no-isolation');
+const spaFallback = argv.includes('--spa-fallback');
 const positional = argv.filter((arg) => !arg.startsWith('-'));
 
 const PORT = Number(positional[0] ?? 8129);
 const ROOT = resolve(fileURLToPath(new URL('./', import.meta.url)), positional[1] ?? 'public');
 
-// The demo page imports the package's ES module entry rather than keeping its own copy of the driver,
-// so the package directory needs to be reachable. A path prefix, not a symlink or a copy: one file
-// tree, served as-is.
-const MOUNTS = [
-  ['/vendor/lean-wasm/', resolve(fileURLToPath(new URL('./', import.meta.url)), 'packages/lean-wasm')],
-];
+// Nothing here maps URLs to files except the root itself, because a deployed static host cannot do
+// that either: the page must work from the files alone. An earlier version mounted the package
+// directory at `/vendor/lean-wasm/` so the page could import its ES module entry, which worked here
+// and 404ed on Cloudflare Pages — where the SPA fallback answered with `index.html`, so the browser
+// refused the module for having MIME type `text/html`. The build is vendored into `public/vendor/`
+// by `npm run sync:vendor` instead, and this server is deliberately as dumb as the host.
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -52,15 +57,8 @@ const TYPES = {
 const server = createServer(async (req, res) => {
   const urlPath = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
 
-  let base = ROOT;
-  let rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
-  for (const [prefix, target] of MOUNTS) {
-    if (urlPath.startsWith(prefix)) {
-      base = target;
-      rel = urlPath.slice(prefix.length);
-      break;
-    }
-  }
+  const base = ROOT;
+  const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
   const filePath = normalize(join(base, rel));
 
   if (!filePath.startsWith(normalize(base))) {
@@ -68,16 +66,24 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  let served = filePath;
   let body;
   try {
     body = await readFile(filePath);
   } catch {
-    res.writeHead(404, { 'Content-Type': 'text/plain' }).end(`Not found: /${rel}`);
-    return;
+    // Opt-in impersonation of a host with a fallback: the file is missing, so it answers with its
+    // shell and a `200`. That is how a wrong URL comes to look like a successful download, and how a
+    // module import ends up refused for having MIME type `text/html`.
+    if (!spaFallback) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' }).end(`Not found: /${rel}`);
+      return;
+    }
+    served = join(base, 'index.html');
+    body = await readFile(served);
   }
 
   const headers = {
-    'Content-Type': TYPES[extname(filePath).toLowerCase()] ?? 'application/octet-stream',
+    'Content-Type': TYPES[extname(served).toLowerCase()] ?? 'application/octet-stream',
     'Content-Length': body.length,
     // The page itself is small and changes; the ~800 MB of Lean assets are
     // fetched once and cached by the browser, not here.

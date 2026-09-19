@@ -203,6 +203,14 @@
       </section>
     </main>
 
+    <!--
+      The package's IIFE build, copied in by `npm run sync:vendor` so this directory is deployable as
+      it stands. A static host serves files rather than routes: it cannot reach `packages/`, and a
+      path like `/vendor/lean-wasm/src/index.js` comes back as the host's HTML fallback, which the
+      browser refuses to run as a module for having MIME type `text/html`.
+    -->
+    <script src="./vendor/lean-wasm.global.js"></script>
     <script type="module" src="./main.js"></script>
   </body>
 </html>
+

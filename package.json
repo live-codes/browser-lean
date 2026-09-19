@@ -8,10 +8,12 @@
   "scripts": {
     "start": "node serve.js",
     "start:no-isolation": "node serve.js 8129 public --no-isolation",
+    "start:spa-fallback": "node serve.js 8129 public --spa-fallback",
     "assets": "node packages/lean-wasm/bin/fetch-assets.mjs public",
     "assets:wasm": "node packages/lean-wasm/bin/fetch-assets.mjs public --only wasm",
     "assets:libs": "node packages/lean-wasm/bin/fetch-assets.mjs public --only lib",
     "assets:mathlib": "node packages/lean-wasm/bin/fetch-assets.mjs public --only mathlib",
-    "check": "node --check serve.js && node --check public/main.js && node --check packages/lean-wasm/bin/fetch-assets.mjs && node --check packages/lean-wasm/worker/lean-worker.js"
+    "sync:vendor": "node scripts/vendor-package.mjs",
+    "check": "node --check serve.js && node --check public/main.js && node --check scripts/vendor-package.mjs && node --check packages/lean-wasm/bin/fetch-assets.mjs && node --check packages/lean-wasm/worker/lean-worker.js && node scripts/vendor-package.mjs --check"
   }
 }

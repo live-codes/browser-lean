@@ -2,15 +2,17 @@
  * Driver for the demo page.
  *
  * The compiler is not implemented here: it is `@live-codes/lean-wasm`, the package in
- * `packages/lean-wasm`, imported through the `/vendor/lean-wasm/` mount that `serve.js` adds. So this
- * file is only the page — examples, panes, keyboard, and the state a headless probe reads — and the
- * demo exercises exactly the artifact a consumer installs, rather than a copy of it.
+ * `packages/lean-wasm`. `index.html` loads its IIFE build from `./vendor/`, vendored by
+ * `npm run sync:vendor`, which is the artifact a host and a worker both have to consume — files, not
+ * routes, since a static host cannot reach `packages/`. So this file is only the page — examples,
+ * panes, keyboard, and the state a headless probe reads — and the demo exercises exactly the artifact
+ * a consumer installs rather than a copy of it.
  *
  * `?baseUrl=` points at the directory holding `lean-wasm/`, `lean-lib/` and `lean-mathlib/`; the
  * default is this origin's root, which is what `npm start` serves.
  */
 
-import { createCompiler } from '/vendor/lean-wasm/src/index.js';
+const { createCompiler } = globalThis.leanWasm;
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);

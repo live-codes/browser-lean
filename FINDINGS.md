@@ -420,6 +420,31 @@ Verified by pointing the demo at a compressed mirror on another origin: the proo
 from `lean.wasm.gz`, `Lean ready in 4.6s`) and `import Std` loaded all 1,449 files from `.gz` sources.
 The plain layout was re-verified after the change — the probe 404s and falls back.
 
+### Two more things a deployment has to get right
+
+Both were found by deploying to Cloudflare Pages, and both are the same mistake in different clothes:
+trusting the machine you developed on.
+
+**The page must not depend on a route, only on files.** The first deploy failed before it started:
+`Failed to load module script: Expected a JavaScript-or-Module script but the server responded with a
+MIME type of "text/html"`. The page imported the package's ES module entry through `/vendor/lean-wasm/`,
+a path prefix that `serve.js` mapped onto `packages/lean-wasm/` — a route that exists on this machine and
+nowhere else. On Pages it fell through to the SPA fallback and came back as `index.html`, so the MIME
+type was `text/html` and the browser refused it. The build is now vendored into `public/vendor/` by
+`npm run sync:vendor` (generated from the package's `dist/`, drift-checked in `npm run check`), loaded as
+a plain `<script>`, and `serve.js` no longer maps anything — it is as dumb as the host, so the mistake
+fails locally too. Everything else about the deploy was fine: the wasm, the core layer, the per-file
+library tree and Mathlib were all present and correctly typed, and it is only this one import that broke.
+
+**A static host still needs COOP/COEP, and on Pages that means a `_headers` file.** Isolation is not
+something the runtime can arrange for itself (§2), and the deploy had no headers at all, so the page
+would have loaded and then failed to construct its shared memory. Cloudflare Pages reads `_headers` from
+the published directory, so `public/_headers` now carries COOP/COEP plus the two CORS headers a CDN role
+needs (`Access-Control-Allow-Origin` for fetched assets, `Cross-Origin-Resource-Policy` for `lean.js`,
+which arrives via `importScripts` as a no-cors request). Without COEP `require-corp` there is no
+`SharedArrayBuffer`; without CORP, a cross-origin boot fetches everything and then dies on
+`importScripts`.
+
 ## 6. Limitations
 
 - **Syntax errors are no longer silently accepted** — worked around in the page, with the real fix

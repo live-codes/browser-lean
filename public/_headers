@@ -1,0 +1,21 @@
+/*
+  Cloudflare Pages headers for the demo. Pages reads this file from the published directory and applies
+  it to the responses — which is the only way a static host can send the two headers Lean needs.
+
+  Cross-Origin-Opener-Policy + Cross-Origin-Embedder-Policy buy `crossOriginIsolated`, which is what
+  makes `SharedArrayBuffer` available. Lean's wasm is a pthread build whose memory is declared `shared`,
+  so without these the runtime cannot construct its memory and the page cannot boot at all. This is a
+  measured requirement: lean.wasm imports a memory with limits flags 3 (has-max | shared).
+
+  The other two are for the case this tree is also someone's asset CDN, which is how LiveCodes would
+  consume it from another origin. They are not interchangeable:
+    Access-Control-Allow-Origin  — for the fetch()ed binaries, oleans and layer packs
+    Cross-Origin-Resource-Policy — for lean.js, which the worker pulls in with importScripts(), a
+                                   no-cors request that COEP checks against CORP, not against CORS
+  Without the second, a cross-origin boot loads every other asset and then fails on importScripts.
+*/
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Access-Control-Allow-Origin: *
+  Cross-Origin-Resource-Policy: cross-origin

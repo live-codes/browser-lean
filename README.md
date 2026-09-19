@@ -263,20 +263,31 @@ See [packages/lean-wasm/README.md](packages/lean-wasm/README.md).
 
 ```
 public/index.html      the page: examples, editor, output, diagnostics, log
-public/main.js         the demo's UI only — it imports the package below, and owns no driver logic
+public/main.js         the demo's UI only — it drives the package below, and owns no driver logic
+public/vendor/         the package's browser build, vendored by `npm run sync:vendor` (committed)
+public/_headers        COOP/COEP for Cloudflare Pages, which is how a static host gets isolation
 packages/lean-wasm/    the published package, `@live-codes/lean-wasm`
   worker/lean-worker.js    the Lean runtime host (adapted from upstream, Apache-2.0) — a build input
   src/                     the compiler, asset resolution, message classification, syntax probe
   bin/fetch-assets.mjs     the asset CLI (`npm run assets`), which also writes compressed layouts
-  dist/lean-wasm.global.js the IIFE build, committed
-serve.js               static server: COOP/COEP on by default, and mounts the package at /vendor/
+  dist/lean-wasm.global.js the IIFE build, which is what gets vendored
+serve.js               static server: COOP/COEP on by default, and nothing else
 FINDINGS.md            the spike log: what was measured, what breaks, what it means
 lean-run.png           screenshot of a verified run
 ```
 
-There is no bundler and no tracked `node_modules`: the page imports the package's ES module entry
-directly, through the `/vendor/lean-wasm/` mount `serve.js` adds, so the demo runs the same code a
-consumer installs rather than a copy of it.
+There is no bundler and no tracked `node_modules`. The page loads the package's IIFE build —
+`self.leanWasm.createCompiler({ baseUrl })`, the same artifact a worker gets from `importScripts` — and
+that build is copied into `public/vendor/` by a script rather than committed by hand, so there is still
+exactly one implementation of the driver.
+
+**`public/` is deployable as it stands**, which is the point of vendoring it. An earlier version
+imported the package's ES module entry through a `/vendor/lean-wasm/` path prefix that only `serve.js`
+knew about: correct locally, and on Cloudflare Pages the request fell through to the SPA fallback, came
+back as `index.html`, and the browser refused to run it as a module — `Expected a JavaScript-or-Module
+script but the server responded with a MIME type of "text/html"`. A static host serves files, not
+routes; `serve.js` is now deliberately as dumb as the host it stands in for, so this class of mistake
+fails locally too.
 
 ## Verifying
 
@@ -285,7 +296,8 @@ consumer installs rather than a copy of it.
 | mirror the artifacts | `npm run assets` |
 | serve the page | `npm start` → http://localhost:8129/ |
 | see the isolation failure | `npm run start:no-isolation` |
-| syntax-check | `npm run check` |
+| re-vendor the package build | `npm run sync:vendor` |
+| syntax-check and drift-check | `npm run check` |
 
 The page exposes `document.documentElement.dataset` (`status`, `stage`, `runs`, `isolated`,
 `exitCode`, `initMs`, `runMs`) and its element ids as globals, so a headless probe can drive it
@@ -324,6 +336,20 @@ Miss the second and every asset downloads fine but the boot dies with `Failed to
 'importScripts' … failed to load`, which reads like a network problem and is not one. `serve.js` sends
 both, so a CDN layout can be tested locally: run `npm start`, start a second instance on another port,
 and point `?baseUrl=` at it (`http://localhost:8131` in development).
+
+**The page's own host needs two more, and they are not optional either.** Isolation is what makes
+`SharedArrayBuffer` exist, so a site serving the page must send `Cross-Origin-Opener-Policy:
+same-origin` and `Cross-Origin-Embedder-Policy: require-corp` — the package cannot arrange this for
+itself. Cloudflare Pages reads those from a `_headers` file in the published directory, which is what
+`public/_headers` is, so the directory uploads as it stands:
+
+```
+npm run sync:vendor     # refresh the vendored package build (committed, drift-checked)
+# upload public/        # the page, _headers, vendor/, and the three asset directories
+```
+
+One directory then serves both the page and the assets, which makes the deploy its own `baseUrl` — and
+the isolation the page needs is also what a LiveCodes embed would need from the same origin.
 
 Upstream's **library data is already CORS-enabled** (`Access-Control-Allow-Origin: *`), so the 347 MiB
 of packs and `.olean` files could be fetched from `lean.cau.li` with no hosting. **The two binaries are
