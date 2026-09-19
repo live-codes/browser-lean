@@ -7,8 +7,8 @@
 // a nested one — but the script URL must be same-origin, so the runtime is handed over as a **blob**
 // that is generated here.
 //
-// The worker's own source arrives as a string (see scripts/sync-worker.mjs); the demo serves the same
-// file as `public/lean-worker.js`, so there is one implementation.
+// The worker's own source arrives as a string (see scripts/sync-worker.mjs, which generates it from
+// `worker/lean-worker.js`), so there is one implementation and the demo in this repo consumes it too.
 
 import { RUNTIME_WORKER_SOURCE } from './runtime-worker.js';
 

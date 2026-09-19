@@ -523,9 +523,10 @@ src/livecodes/languages/lean/lang-lean-script.ts    creates the Worker, wires th
                                                     livecodes.lean.{run,input,loaded,output,error,exitCode}
 ```
 
-with `public/lean-worker.js` and the severity classifier from `public/main.js` carrying over almost
-unchanged, and the `{output, error, exitCode}` contract filled from the severity split in §3 —
-`information` messages become `output`, everything else becomes `error`. `exitCode` must be derived
+with the driver already written: that is `packages/lean-wasm` (`@live-codes/lean-wasm`), which owns the
+worker host, the library and layer loading, and the severity classifier, and which the demo in this
+repo now runs on. The `{output, error, exitCode}` contract comes from the severity split in §3 —
+`information` messages become `output`, everything else becomes `error` — and `exitCode` is derived
 from the diagnostics rather than from the runtime's own `success` flag, which is `true` for a file
 that elaborates with errors (§3).
 

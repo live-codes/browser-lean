@@ -20,7 +20,7 @@ not included in this package, so their licences attach to their own files and no
 
 One file is adapted rather than written from scratch, and the notice belongs with it:
 
-- **`src/runtime-worker.js`** (generated from `public/lean-worker.js`) is derived from
+- **`src/runtime-worker.js`** (generated from `worker/lean-worker.js`) is derived from
   `lean-worker-persistent.worker.js` in
   [cauli/lean4-wasm-in-browser](https://github.com/cauli/lean4-wasm-in-browser) (Apache-2.0). The
   init sequence, the export names it calls, and its reading of the fork's IO result tags come from

@@ -237,8 +237,8 @@ else. Two ways forward, in preference order:
 
 Everything else is now in place: a single long-lived Worker per page, ~0.3 s compiles, `#eval` of
 library functions working, and static assets that can be hosted anywhere. [FINDINGS.md](FINDINGS.md)
-§7 has the `lang-lean` shape that would follow, and notes which parts of `public/main.js` carry over
-almost unchanged.
+§7 has the `lang-lean` shape that would follow. The driver it would need is no longer hypothetical: it
+is the package below, and the demo in this repo already runs on it.
 
 ## npm package
 
@@ -254,16 +254,20 @@ See [packages/lean-wasm/README.md](packages/lean-wasm/README.md).
 
 ```
 public/index.html      the page: examples, editor, output, diagnostics, log
-public/main.js         the driver: worker protocol, progress, message classification, dataset state
-public/lean-worker.js  the Lean runtime host (persistent Worker; adapted from upstream, Apache-2.0)
-scripts/fetch-assets.mjs  mirrors the pinned artifacts into public/lean-wasm/
+public/main.js         the demo's UI only — it imports the package below, and owns no driver logic
 packages/lean-wasm/    the published package, `@live-codes/lean-wasm`
-serve.js               static server: COOP/COEP on by default, --no-isolation to compare
+  worker/lean-worker.js    the Lean runtime host (adapted from upstream, Apache-2.0) — a build input
+  src/                     the compiler, asset resolution, message classification, syntax probe
+  dist/lean-wasm.global.js the IIFE build, committed
+scripts/fetch-assets.mjs  mirrors the pinned artifacts into public/lean-wasm/
+serve.js               static server: COOP/COEP on by default, and mounts the package at /vendor/
 FINDINGS.md            the spike log: what was measured, what breaks, what it means
 lean-run.png           screenshot of a verified run
 ```
 
-There is no bundler and no `node_modules`.
+There is no bundler and no tracked `node_modules`: the page imports the package's ES module entry
+directly, through the `/vendor/lean-wasm/` mount `serve.js` adds, so the demo runs the same code a
+consumer installs rather than a copy of it.
 
 ## Verifying
 

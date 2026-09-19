@@ -1,23 +1,16 @@
 /**
- * Driver for the Lean 4 playground.
+ * Driver for the demo page.
  *
- * The runtime host is `public/lean-worker.js`, a persistent Worker that loads the
- * packed Lean core layer once, initialises the Lean runtime once, and then
- * compiles repeatedly through the fork's `lean_wasm_compile` export — which
- * caches the imported environment inside Lean, so the second compile for the same
- * import set is milliseconds rather than a fresh boot.
+ * The compiler is not implemented here: it is `@live-codes/lean-wasm`, the package in
+ * `packages/lean-wasm`, imported through the `/vendor/lean-wasm/` mount that `serve.js` adds. So this
+ * file is only the page — examples, panes, keyboard, and the state a headless probe reads — and the
+ * demo exercises exactly the artifact a consumer installs, rather than a copy of it.
  *
- * This is the architecture of cauli/lean4-wasm-in-browser, whose artifact set we
- * mirror (see scripts/fetch-assets.mjs). It replaces an earlier version of this
- * page that drove `lean4.js` from the CDN: that wrapper built a fresh iframe per
- * run, so every Run rewrote the whole library and re-instantiated a 131 MB module
- * (~2 minutes per run), and its library was missing the `.ir` files needed to
- * `#eval` library functions.
- *
- * Everything here is presentation: lazy start, progress reporting, message
- * classification, and the `document.documentElement.dataset` state that scripted
- * checks read.
+ * `?baseUrl=` points at the directory holding `lean-wasm/`, `lean-lib/` and `lean-mathlib/`; the
+ * default is this origin's root, which is what `npm start` serves.
  */
+
+import { createCompiler } from '/vendor/lean-wasm/src/index.js';
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -36,232 +29,9 @@ const els = {
   log: $('log'),
 };
 
-// Element ids as globals, so headless probes can drive the page without string
-// literals.
+// Element ids as globals, so headless probes can drive the page without string literals.
 Object.assign(window, els);
 window.params = params;
-
-const CODE_PATH = '/workspace/input.lean';
-
-/**
- * How hard to look for syntax errors the runtime swallows (see FINDINGS.md §6.1).
- *
- *   auto (default)  parse the source with Lean's own parser, but only when the Lean
- *                   library is already loaded for some other reason — so the check is
- *                   free and no run pays for it. In a session that never imports Lean
- *                   or Mathlib, syntax errors stay silent.
- *   full            always parse, loading the Lean and Std libraries (~350 MiB) if
- *                   they are not already there.
- *   0               off.
- *
- * A cheaper trick does not exist: appending a probe command and seeing whether the
- * parser reaches it does not work, because Lean's parser *recovers* from incomplete
- * input and runs what follows.
- */
-const SYNTAX_MODE = params.get('syntaxCheck') ?? 'auto';
-
-let syntaxProbeNoted = false;
-
-/**
- * What the worker has already installed for this page. This has to outlive a run:
- * the worker's filesystem persists, so "is the Lean library here?" is a property of
- * the session, not of the run — which is what makes `auto` free after the first time
- * something imports Lean.
- */
-const loadedRoots = new Set();
-const loadedLayerLabels = new Set();
-
-/**
- * The runtime's `lean_wasm_compile` reports elaboration errors but **not parse
- * errors**: its collection loop reads the command state's message log after
- * `elabCommandAtFrontend`, which resets that log, so the parser's messages are
- * wiped before it looks. The fix is a change in the fork's Lean source — which
- * would mean rebuilding the wasm — so the page works around it: it hands the
- * source to Lean's own parser in a second, tiny compile and reports what the
- * parser says. `Parser.parseCommand` is a pure function, so this needs no
- * elaborator state beyond the environment.
- *
- * The probe is a separate compile on purpose: a file that fails to parse cannot
- * reliably run anything appended to it, because the parser consumes the rest.
- */
-function leanStringLiteral(source) {
-  const escaped = source
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t')
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
-    .replace(/\u2028|\u2029/g, ' ');
-  return `"${escaped}"`;
-}
-
-function syntaxProbeSource(code) {
-  // The probe must be parsed in the same environment the user's file would be, or
-  // notation the user's imports provide (`ℝ` from Mathlib, say) reads as a syntax
-  // error — a false positive that is worse than the silence this fixes. So the
-  // user's own import lines are carried over.
-  const imports = importLines(code);
-  return `${imports ? imports + '\n' : ''}import Lean
-open Lean
-
-run_cmd do
-  let src := ${leanStringLiteral(code)}
-  let ictx := Parser.mkInputContext src "<your code>"
-  let (_, ps, msgs) ← Parser.parseHeader ictx
-  let pmctx : Parser.ParserModuleContext := { env := (← getEnv), options := (← getOptions) }
-  let mut pstate := ps
-  let mut log : MessageLog := msgs
-  let mut done := false
-  while !done do
-    let (cmd, ps', log') := Parser.parseCommand ictx pmctx pstate log
-    pstate := ps'
-    log := log'
-    done := Parser.isTerminalCommand cmd
-  let errs := log.toList.filter (fun m => m.severity == MessageSeverity.error)
-  if !errs.isEmpty then
-    let mut out := ""
-    for m in errs do
-      out := out ++ s!"syntax error at line {m.pos.line}, column {m.pos.column}\\n"
-    throwError "{out}"
-`;
-}
-
-/** Roots the worker can fetch per-file (mirrored by `npm run assets:libs`). */
-const OPTIONAL_LIBRARIES = ['Std', 'Lean', 'Batteries'];
-
-/**
- * Every asset lives under one base, in three sibling directories:
- *
- *   <base>/lean-wasm/     binaries (lean.js, lean.wasm) + the packed core layer
- *   <base>/lean-lib/      per-file libraries (Std, Lean, Batteries)
- *   <base>/lean-mathlib/  the packed Mathlib layer
- *
- * That is exactly the layout of `public/`, so `?baseUrl=` moves all three at once
- * and defaults to this origin's root, which is what `npm start` serves. Point it
- * at a CDN mirroring the same three directories and nothing else needs changing.
- * The host must send `Access-Control-Allow-Origin` — the binaries and layers are
- * fetched by `fetch()`, and a cross-origin `importScripts` under COEP needs it too.
- * See README §Packaging and hosting.
- */
-const ASSET_ROOT = (params.get('baseUrl') || '').replace(/\/+$/, '');
-const ASSET_BASE = `${ASSET_ROOT}/lean-wasm`;
-const LIB_BASE = `${ASSET_ROOT}/lean-lib`;
-const LAYER_BASE = `${ASSET_ROOT}/lean-mathlib`;
-
-/**
- * Mathlib is not published per-file, so it arrives as a **packed layer**: the
- * 4,303-module closure upstream builds for its Real Analysis game, which brings
- * its tactic dependencies (Aesop, Qq, Plausible, ProofWidgets) with it. One layer
- * answers for all of those roots. Mirror it with `npm run assets:mathlib`.
- */
-const OPTIONAL_LAYERS = [
-  {
-    label: 'Mathlib',
-    manifestUrl: `${LAYER_BASE}/real-analysis-layer.json`,
-    packBase: LAYER_BASE,
-    roots: [
-      'Mathlib',
-      'Aesop',
-      'Qq',
-      'Plausible',
-      'ProofWidgets',
-      'ImportGraph',
-      'LeanSearchClient',
-      'Game',
-    ],
-  },
-];
-
-/** Which asset command supplies a root, for the "not mirrored" note. */
-function assetCommandFor(root) {
-  if (OPTIONAL_LIBRARIES.includes(root)) return 'npm run assets:libs';
-  if (OPTIONAL_LAYERS.some((layer) => layer.roots.includes(root))) return 'npm run assets:mathlib';
-  return null;
-}
-
-/**
- * Roots that cannot be supplied at all, with the reason. Importing one produces
- * Lean's own "unknown module prefix" error, which reads like a typo rather than a
- * documented limit of the playground — so say which it is. (Same idea as
- * browser-haskell's module rules.) See FINDINGS.md §5.
- */
-const UNAVAILABLE_LIBRARIES = {
-  Lake: 'Lake is a build tool, and there is no build step here.',
-};
-
-/** Strip comments so a commented-out import does not trigger a note. */
-function stripComments(code) {
-  return code.replace(/\/-[\s\S]*?-\//g, '').replace(/--[^\n]*/g, '');
-}
-
-function importedRoots(code) {
-  const roots = [];
-  for (const line of stripComments(code).split('\n')) {
-    const match = /^\s*import\s+([A-Za-z0-9_'.]+)/.exec(line);
-    if (!match) continue;
-    const root = match[1].replace(/^'/, '').split('.')[0];
-    if (root && !roots.includes(root)) roots.push(root);
-  }
-  return roots;
-}
-
-/** The user's `import` lines, verbatim, so the syntax probe shares their environment. */
-function importLines(code) {
-  return stripComments(code)
-    .split('\n')
-    .filter((line) => /^\s*import\s+\S/.test(line))
-    .map((line) => line.trim())
-    .join('\n');
-}
-
-function unavailableImportNotes(code, notMirrored = []) {
-  const notes = [];
-  const add = (note) => {
-    if (!notes.includes(note)) notes.push(note);
-  };
-  for (const root of importedRoots(code)) {
-    if (notMirrored.includes(root)) {
-      const command = assetCommandFor(root);
-      add(
-        command
-          ? `${root} is not mirrored. Run \`${command}\` to fetch it.`
-          : `${root} is not available in this playground.`,
-      );
-    } else if (UNAVAILABLE_LIBRARIES[root]) {
-      add(UNAVAILABLE_LIBRARIES[root]);
-    }
-  }
-  return notes;
-}
-
-/** Roots named by Lean's "unknown module prefix 'X'" diagnostics. */
-function missingRoots(problems) {
-  const roots = [];
-  for (const problem of problems) {
-    const match = /unknown module prefix '([^']+)'/.exec(problem.text);
-    if (match && !roots.includes(match[1])) roots.push(match[1]);
-  }
-  return roots;
-}
-
-/**
- * Mathlib modules outside the published closure fail a different way: the prefix
- * resolves, but the object file is absent, so the compiler says so by path rather
- * than by prefix. Worth explaining, because "Mathlib" being available here does not
- * mean all of Mathlib is.
- */
-function outsideClosureNotes(problems) {
-  const notes = [];
-  for (const problem of problems) {
-    const match = /object file '[^']*' of module (\S+)/.exec(problem.text);
-    if (!match) continue;
-    const note = `${match[1]} is not in the published Mathlib closure. Upstream ships only the 4,303 modules its Real Analysis course needs, so some of Mathlib is available here and some is not.`;
-    if (!notes.includes(note)) notes.push(note);
-  }
-  return notes;
-}
 
 const EXAMPLES = [
   {
@@ -340,14 +110,9 @@ theorem mine (x : ℝ) : x + 0 = x := by ring
   },
 ];
 
-let worker = null;
+let compiler = null;
 let starting = null;
-let ready = false;
 let busy = false;
-let nextRunId = 1;
-let pending = null;
-let stdout = '';
-let stderr = '';
 
 function setState(update) {
   const ds = document.documentElement.dataset;
@@ -365,12 +130,13 @@ function appendLog(line) {
     els.log.classList.remove('empty');
   }
   els.log.textContent += (els.log.textContent ? '\n' : '') + line;
+  // The scrolling element is the panes container; the <pre> itself never overflows.
   const panes = els.log.parentElement?.parentElement;
   if (panes) panes.scrollTop = panes.scrollHeight;
 }
 
 function setPane(el, text, emptyText) {
-  const value = (text ?? '').replace(/\u001b\[[0-9;]*m/g, '').trimEnd();
+  const value = (text ?? '').trimEnd();
   if (!value) {
     el.textContent = emptyText;
     el.classList.add('empty');
@@ -380,8 +146,8 @@ function setPane(el, text, emptyText) {
   el.classList.remove('empty');
 }
 
-// While a run is in flight the log is what is moving, so follow it; once the run
-// settles, jump back to the top so the verdict and diagnostics are on screen.
+// While a run is in flight the log is what is moving, so follow it; once the run settles, jump back to
+// the top so the verdict and diagnostics are on screen.
 function scrollToResults() {
   const panes = els.log.parentElement?.parentElement;
   if (panes) panes.scrollTop = 0;
@@ -394,355 +160,43 @@ function setBusy(value) {
 }
 
 /**
- * Lines the wasm build emits about itself rather than about the user's program.
- * Match narrowly by hand, so a real diagnostic can never be swallowed: an
- * unrecognised line is always shown.
+ * Boot the runtime once. The package owns the worker, the library loading and the message
+ * classification; all this does is report progress and remember the compiler.
  */
-function isToolchainNoise(line) {
-  return (
-    line.startsWith('[DEBUG:') ||
-    line.startsWith('mainModule? =') ||
-    line.startsWith('- /lib/lean/') ||
-    line.startsWith('wasm streaming compile failed:') ||
-    line === 'falling back to ArrayBuffer instantiation'
-  );
-}
-
-function messageText(msg) {
-  const data = msg.data;
-  if (typeof data === 'string') return data;
-  if (data && typeof data === 'object') return data.msg ?? data.message ?? JSON.stringify(data);
-  return String(data ?? '');
-}
-
-/**
- * Split both streams into the user's program output and real diagnostics.
- *
- * Two shapes arrive here. If the build emits JSON messages (one per line, as
- * `lean --json` does) the `severity` field is authoritative and explains why
- * errors can appear on stdout. Otherwise the text is plain, and the stream it
- * arrived on is the best signal available: stdout is `#eval`/`#check` results,
- * stderr is diagnostics.
- */
-function collect(out, err) {
-  const info = [];
-  const problems = [];
-  let noise = 0;
-
-  for (const [stream, text] of [
-    ['stdout', out],
-    ['stderr', err],
-  ]) {
-    for (const raw of (text ?? '').split('\n')) {
-      const line = raw.trim();
-      if (!line) continue;
-      if (isToolchainNoise(line)) {
-        noise += 1;
-        continue;
-      }
-
-      let msg = null;
-      if (line.startsWith('{')) {
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          msg = null;
-        }
-      }
-
-      if (msg && typeof msg === 'object' && msg.severity) {
-        const entry = { severity: msg.severity, text: messageText(msg), pos: msg.pos };
-        (msg.severity === 'information' ? info : problems).push(entry);
-      } else {
-        const entry = { severity: stream === 'stdout' ? 'output' : 'error', text: line, pos: null };
-        (stream === 'stdout' ? info : problems).push(entry);
-      }
-    }
-  }
-
-  return { info, problems, noise };
-}
-
-function formatProblems(problems) {
-  // A message that already carries a position (the syntax probe builds its own)
-  // does not need the runtime's position appended to it as well.
-  const ownsPosition = /\(line \d+, col \d+\)|at line \d+, column \d+/;
-  return problems
-    .map(({ severity, text, pos }) => {
-      const where =
-        pos?.line != null && !ownsPosition.test(text)
-          ? `  (line ${pos.line}${pos.column != null ? `, col ${pos.column}` : ''})`
-          : '';
-      return severity === 'output' ? text : `${severity}: ${text}${where}`;
-    })
-    .join('\n');
-}
-
-/**
- * Boot the worker: it fetches and unpacks the core layer itself, then brings up
- * the Lean runtime and imports Init, which is the expensive part and happens
- * exactly once per page.
- */
-function ensureLean() {
-  if (ready) return Promise.resolve();
+async function ensureCompiler() {
+  if (compiler) return compiler;
   if (starting) return starting;
 
-  starting = new Promise((resolve, reject) => {
-    if (typeof SharedArrayBuffer === 'undefined') {
-      reject(
-        new Error(
-          'SharedArrayBuffer is unavailable, so the Lean runtime cannot start. This page must be ' +
-            'served with Cross-Origin-Opener-Policy: same-origin and Cross-Origin-Embedder-Policy: ' +
-            'require-corp (npm start does this; npm run start:no-isolation does not).',
-        ),
-      );
-      return;
-    }
+  starting = (async () => {
+    const baseUrl = params.get('baseUrl') || new URL('/', location.href).href;
+    appendLog(`Starting the Lean runtime from ${baseUrl}`);
 
     const t0 = performance.now();
-    appendLog(`Starting the Lean runtime from ${ASSET_BASE}`);
-    appendLog('Loading the packed core layer (Init: 629 modules, ~31 MB in 5 packs)');
+    const created = await createCompiler({
+      baseUrl,
+      syntaxCheck: params.get('syntaxCheck') ?? 'auto',
+      onProgress: (message) => {
+        setState({ stage: 'loading' });
+        setStatus(message, 'busy');
+        appendLog(message);
+      },
+      onStatus: (message) => setStatus(message, 'busy'),
+    });
 
-    worker = new Worker(
-      `./lean-worker.js?assetBase=${encodeURIComponent(ASSET_BASE)}&libBase=${encodeURIComponent(LIB_BASE)}`,
-    );
-    setState({ stage: 'loading' });
+    const initMs = Math.round(performance.now() - t0);
+    setState({ initMs });
+    appendLog(`Lean ready in ${(initMs / 1000).toFixed(1)}s`);
+    setStatus('Lean loaded. Ready.', 'ok');
+    compiler = created;
+    return created;
+  })();
 
-    // The boot can wedge — most obviously when a shared memory is granted but the
-    // pthread workers cannot start — and without this the page would sit at
-    // "loading" forever with no explanation. Every message resets the clock,
-    // including the worker's throttled heartbeat, so a slow but live import is
-    // never mistaken for a dead one.
-    let lastActivity = Date.now();
-    const IDLE_LIMIT_MS = 60000;
-    const watchdog = setInterval(() => {
-      if (Date.now() - lastActivity > IDLE_LIMIT_MS) {
-        clearInterval(watchdog);
-        reject(
-          new Error(
-            `The Lean runtime stopped responding while loading (no progress for ${IDLE_LIMIT_MS / 1000}s). ` +
-              'Shared memory was granted but the runtime did not finish starting — the pthread workers ' +
-              'may have been blocked.',
-          ),
-        );
-      }
-    }, 5000);
-
-    const finish = (fn) => (value) => {
-      clearInterval(watchdog);
-      fn(value);
-    };
-    const resolveOnce = finish(resolve);
-    const rejectOnce = finish(reject);
-
-    worker.onerror = (event) => {
-      rejectOnce(new Error(event.message || 'Lean worker error'));
-    };
-
-    worker.onmessage = (event) => {
-      const msg = event.data || {};
-      lastActivity = Date.now();
-
-      if (msg.type === 'library') {
-        if (msg.stage === 'manifest') {
-          setStatus(`Core layer: ${msg.modules} modules in ${msg.packs} packs…`, 'busy');
-        } else if (msg.stage === 'pack') {
-          setStatus(`Loading core pack ${msg.loaded}/${msg.total} (${msg.file})…`, 'busy');
-        } else if (msg.stage === 'written') {
-          appendLog(`Wrote ${msg.files} library files into the virtual FS`);
-        }
-        return;
-      }
-
-      if (msg.type === 'memory') {
-        if (msg.failed) appendLog(`Shared memory of ${msg.mb} MB refused; stepping down`);
-        else appendLog(`Shared WebAssembly memory: ${msg.mb} MB (max ${msg.maximumPages} pages)`);
-        return;
-      }
-
-      if (msg.type === 'status') {
-        setStatus(msg.data, 'busy');
-        return;
-      }
-
-      if (msg.type === 'ready') {
-        ready = true;
-        setState({ initMs: Math.round(performance.now() - t0) });
-        appendLog(`Lean ready in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-        setStatus('Lean loaded. Ready.', 'ok');
-        resolveOnce();
-        return;
-      }
-
-      if (msg.type === 'error') {
-        rejectOnce(new Error(msg.data));
-        return;
-      }
-
-      // Compile-time output. `stdout`/`stderr` belong to whichever run is pending.
-      if (msg.type === 'stdout') {
-        stdout += msg.data + '\n';
-        return;
-      }
-      if (msg.type === 'stderr') {
-        stderr += msg.data + '\n';
-        return;
-      }
-      if (msg.type === 'result') {
-        const settle = pending;
-        pending = null;
-        if (settle) settle(msg);
-        return;
-      }
-    };
-
-    worker.postMessage({ type: 'start' });
-  }).catch((err) => {
+  try {
+    return await starting;
+  } catch (err) {
     starting = null;
     throw err;
-  });
-
-  return starting;
-}
-
-function compile(code) {
-  return new Promise((resolve) => {
-    const id = nextRunId++;
-    window.__compiles = (window.__compiles || 0) + 1;
-    stdout = '';
-    stderr = '';
-    pending = (msg) => resolve({ ...msg, stdout, stderr });
-    worker.postMessage({ type: 'compile', id, code, path: CODE_PATH });
-  });
-}
-
-/** Record the outcome of one library fetch, and remember what we could not get. */
-function logLoadResult(entry, state) {
-  if (entry.files > 0) {
-    loadedRoots.add(entry.root);
-    appendLog(`Loaded ${entry.root}: ${entry.files} files (${(entry.bytes / 1048576).toFixed(1)} MiB)`);
-    return;
   }
-  // Already installed by an earlier run in this page — not a missing library.
-  if (entry.alreadyLoaded) {
-    loadedRoots.add(entry.root);
-    return;
-  }
-  if (!state.notMirrored.includes(entry.root)) state.notMirrored.push(entry.root);
-  appendLog(`No files for ${entry.root}${entry.error ? `: ${entry.error}` : ' (not mirrored)'}`);
-}
-
-/** Ask the worker to fetch and install a library root, resolving when it is done. */
-function loadModules(roots) {
-  return new Promise((resolve) => {
-    const onMessage = (event) => {
-      const msg = event.data || {};
-      if (msg.type === 'modules' && msg.stage === 'progress') {
-        setStatus(`Loading ${msg.root}: ${msg.files}/${msg.total} files…`, 'busy');
-        return;
-      }
-      if (msg.type === 'modules_loaded') {
-        worker.removeEventListener('message', onMessage);
-        resolve(msg.results || []);
-      }
-    };
-    worker.addEventListener('message', onMessage);
-    worker.postMessage({ type: 'load_modules', roots });
-  });
-}
-
-/** Ask the worker to install a packed layer, resolving when it finishes. */
-function loadLayer(layer) {
-  return new Promise((resolve) => {
-    const onMessage = (event) => {
-      const msg = event.data || {};
-      if (msg.type === 'layer' && msg.stage === 'progress') {
-        setStatus(
-          `Loading ${msg.label}: pack ${msg.pack}/${msg.packs} (${(msg.bytes / 1048576).toFixed(0)} MiB)…`,
-          'busy',
-        );
-        return;
-      }
-      if (msg.type === 'layer_loaded' && msg.label === layer.label) {
-        worker.removeEventListener('message', onMessage);
-        resolve(msg);
-      }
-    };
-    worker.addEventListener('message', onMessage);
-    worker.postMessage({ type: 'load_layer', ...layer });
-  });
-}
-
-/**
- * Make `roots` resolvable, by whatever transport each one needs: a packed layer or
- * the per-file library tree, or both. Returns whether anything was actually
- * installed — which is what decides whether a recompile is worth doing.
- */
-async function ensureRoots(roots, state) {
-  const wanted = roots.filter((root) => !state.attempted.has(root));
-  if (wanted.length === 0) return false;
-  wanted.forEach((root) => state.attempted.add(root));
-
-  let progress = false;
-
-  for (const layer of OPTIONAL_LAYERS) {
-    if (!wanted.some((root) => layer.roots.includes(root))) continue;
-    if (state.layers.has(layer.label)) continue;
-    state.layers.add(layer.label);
-
-    setStatus(`Loading ${layer.label}…`, 'busy');
-    const result = await loadLayer(layer);
-    if (result.ok) {
-      if (result.alreadyLoaded) {
-        loadedLayerLabels.add(layer.label);
-        appendLog(`${layer.label} layer already loaded`);
-      } else {
-        loadedLayerLabels.add(layer.label);
-        appendLog(
-          `Loaded the ${layer.label} layer: ${result.files} files (${(result.bytes / 1048576).toFixed(1)} MiB)`,
-        );
-        progress = true;
-      }
-    } else {
-      appendLog(`Could not load the ${layer.label} layer: ${result.error}`);
-      if (!state.notMirrored.includes(layer.label)) state.notMirrored.push(layer.label);
-    }
-  }
-
-  const perFile = wanted.filter((root) => OPTIONAL_LIBRARIES.includes(root));
-  if (perFile.length > 0) {
-    setStatus(`Loading ${perFile.join(', ')}…`, 'busy');
-    for (const entry of await loadModules(perFile)) {
-      logLoadResult(entry, state);
-      if (entry.files > 0) progress = true;
-    }
-  }
-
-  return progress;
-}
-
-/** Backstop against a mirror that never satisfies an import. */
-const MAX_LOAD_ROUNDS = 8;
-
-/**
- * Compile, loading whatever the compiler says is missing, until it settles.
- *
- * Both the user's program and the syntax probe go through this: Lean names only
- * the first missing prefix per compile (the frontend aborts with an uncaught
- * exception), so a file needing several libraries takes one round each — bounded
- * by progress, never by how many imports it has.
- */
-async function compileWithLibraries(code, state) {
-  await ensureRoots(importedRoots(code), state);
-
-  let result = await compile(code);
-  for (let round = 0; round < MAX_LOAD_ROUNDS; round++) {
-    const { problems } = collect(result.stdout, result.stderr);
-    if (!(await ensureRoots(missingRoots(problems), state))) break;
-    setStatus('Recompiling with the newly loaded library…', 'busy');
-    result = await compile(code);
-  }
-  return result;
 }
 
 async function run() {
@@ -756,96 +210,33 @@ async function run() {
   setState({ status: 'running', runs, exitCode: '' });
 
   try {
-    await ensureLean();
+    const lean = await ensureCompiler();
 
     setStatus('Elaborating and kernel-checking…', 'busy');
     appendLog(`Run #${runs}: ${code.split('\n').length} line(s)`);
 
-    const t0 = performance.now();
-    const compilesBefore = window.__compiles || 0;
-    const state = { attempted: new Set(), layers: new Set(), notMirrored: [] };
+    const result = await lean.run(code);
+    const seconds = (result.compileMs / 1000).toFixed(2);
 
-    const result = await compileWithLibraries(code, state);
-
-    // If a root is still absent after everything we tried, say so rather than
-    // leaving a bare "unknown module prefix" to be puzzled over.
-    const unresolved = missingRoots(collect(result.stdout, result.stderr).problems).filter((root) =>
-      state.attempted.has(root),
-    );
-
-    const runMs = Math.round(performance.now() - t0);
-
-    const { info, problems, noise } = collect(result.stdout, result.stderr);
-
-    // A clean run is exactly the case we cannot trust: the runtime says nothing
-    // whether the file elaborated or merely failed to parse. Whether checking is
-    // affordable comes first — `auto` skips it unless the Lean library is already in
-    // this session, so nothing pays ~350 MiB just to be told about a typo.
-    if (SYNTAX_MODE !== '0' && code.trim() && !problems.some((p) => p.severity === 'error')) {
-      const leanReady = loadedRoots.has('Lean') || loadedLayerLabels.size > 0;
-      if (SYNTAX_MODE === 'full' || leanReady) {
-        const probeSource = syntaxProbeSource(code);
-        const probe = await compileWithLibraries(probeSource, state);
-        const probeProblems = collect(probe.stdout, probe.stderr).problems;
-        const syntaxErrors = probeProblems.filter((p) =>
-          /syntax error at line \d+, column \d+/.test(p.text),
-        );
-        if (syntaxErrors.length > 0) {
-          problems.push(...syntaxErrors);
-          appendLog(`Syntax probe: ${syntaxErrors.length} parse error(s)`);
-        } else if (probeProblems.length > 0) {
-          appendLog(`Syntax probe unavailable: ${probeProblems[0].text.split('\n')[0]}`);
-        }
-      } else if (!syntaxProbeNoted) {
-        syntaxProbeNoted = true;
-        appendLog('Syntax check: skipped — it needs the Lean library, which this session has not loaded');
-      }
-    }
-
-    // `success` from the runtime only means the compile call did not fail at the
-    // IO level — it is true for a file that elaborates with errors. Whether the
-    // kernel accepted the program is decided by the diagnostics.
-    const hasErrors = problems.some((p) => p.severity === 'error') || !result.success;
-    const exitCode = hasErrors ? 1 : 0;
-
-    // The unclassified streams, for scripted probes and for anyone debugging why
-    // something was filtered.
-    window.__raw = { stdout: result.stdout, stderr: result.stderr, success: result.success, elapsed: result.elapsed };
-
-    // Lean's own "unknown module prefix" is accurate but reads like a typo; add
-    // the reason when the failure involves a library we cannot supply.
-    const notes = hasErrors
-      ? [
-          ...unavailableImportNotes(code, state.notMirrored),
-          ...outsideClosureNotes(problems),
-          ...unresolved.map(
-            (root) => `Loaded ${root}, but the compiler still cannot find it — the mirror looks incomplete.`,
-          ),
-        ]
-      : [];
-    const diagnostics = [formatProblems(problems), ...notes.map((n) => `note: ${n}`)]
-      .filter(Boolean)
-      .join('\n');
-
-    setPane(els.output, info.map((m) => m.text).join('\n'), 'No output.');
+    setPane(els.output, result.output, 'No output.');
     setPane(
       els.diagnostics,
-      diagnostics,
+      result.errors.join('\n'),
       'No diagnostics — the kernel accepted everything in this file.',
     );
 
-    setState({ status: 'done', exitCode, runMs });
+    setState({ status: 'done', exitCode: result.exitCode, runMs: result.compileMs });
     appendLog(
-      `Done in ${(runMs / 1000).toFixed(2)}s (exit code ${exitCode}) — ` +
-        `${(window.__compiles || 0) - compilesBefore} compile(s)` +
-        (noise ? `, filtered ${noise} trace line(s)` : ''),
+      `Done in ${seconds}s (exit code ${result.exitCode})` +
+        (result.libraries.length > 0 ? ` — loaded ${result.libraries.join(', ')}` : '') +
+        (result.noise > 0 ? ` — filtered ${result.noise} trace line(s)` : ''),
     );
     scrollToResults();
     setStatus(
-      exitCode === 0
-        ? `Accepted by the kernel in ${(runMs / 1000).toFixed(2)}s.`
-        : `Rejected in ${(runMs / 1000).toFixed(2)}s.`,
-      exitCode === 0 ? 'ok' : 'err',
+      result.exitCode === 0
+        ? `Accepted by the kernel in ${seconds}s.`
+        : `Rejected in ${seconds}s.`,
+      result.exitCode === 0 ? 'ok' : 'err',
     );
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -892,11 +283,8 @@ function init() {
     }
   });
 
-  // The runtime needs SharedArrayBuffer, which normally means cross-origin
-  // isolation — but not necessarily: Chrome's reverse origin trial grants SAB to a
-  // page that is *not* isolated. So test the capability the runtime actually
-  // needs, not the header, or the page would refuse to start in exactly the
-  // configuration LiveCodes would have to use.
+  // The runtime needs a SharedArrayBuffer, which is what "cross-origin isolated" buys. The package
+  // throws with the same explanation; showing it up front saves a confusing first run.
   const hasSAB = typeof SharedArrayBuffer !== 'undefined';
   const isolated = self.crossOriginIsolated === true;
 
@@ -912,9 +300,9 @@ function init() {
     els.banner.className = 'show';
     els.banner.textContent =
       'SharedArrayBuffer is unavailable, so the Lean runtime cannot boot. Serve the page with ' +
-      'COOP/COEP (npm start) — Lean needs a shared WebAssembly memory. An embedded page that cannot ' +
-      'set those headers has only Chrome\'s reverse origin trial for SharedArrayBuffer, and that ' +
-      'does not exist in Firefox or Safari.';
+      "COOP/COEP (npm start) — Lean needs a shared WebAssembly memory. An embedded page that cannot " +
+      "set those headers has only Chrome's reverse origin trial for SharedArrayBuffer, and that does " +
+      'not exist in Firefox or Safari.';
     setStatus('SharedArrayBuffer required.', 'err');
   }
 

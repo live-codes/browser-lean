@@ -157,7 +157,7 @@ classification, the probe's source generation, and that the generated worker mod
 Building from a checkout needs `esbuild`, which is a devDependency, so on a machine with
 `npm config get omit` set to `dev` use `npm install --include=dev` — otherwise npm reports success and
 installs nothing. `npm run build:iife` regenerates `dist/lean-wasm.global.js` and
-`npm run sync:worker` regenerates `src/runtime-worker.js` from `public/lean-worker.js`;
+`npm run sync:worker` regenerates `src/runtime-worker.js` from `worker/lean-worker.js`;
 `npm run check` fails if the latter has drifted.
 
 ## Using it in LiveCodes

@@ -28,6 +28,13 @@ const positional = argv.filter((arg) => !arg.startsWith('-'));
 const PORT = Number(positional[0] ?? 8129);
 const ROOT = resolve(fileURLToPath(new URL('./', import.meta.url)), positional[1] ?? 'public');
 
+// The demo page imports the package's ES module entry rather than keeping its own copy of the driver,
+// so the package directory needs to be reachable. A path prefix, not a symlink or a copy: one file
+// tree, served as-is.
+const MOUNTS = [
+  ['/vendor/lean-wasm/', resolve(fileURLToPath(new URL('./', import.meta.url)), 'packages/lean-wasm')],
+];
+
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -44,10 +51,19 @@ const TYPES = {
 
 const server = createServer(async (req, res) => {
   const urlPath = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
-  const rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
-  const filePath = normalize(join(ROOT, rel));
 
-  if (!filePath.startsWith(normalize(ROOT))) {
+  let base = ROOT;
+  let rel = urlPath === '/' ? 'index.html' : urlPath.replace(/^\/+/, '');
+  for (const [prefix, target] of MOUNTS) {
+    if (urlPath.startsWith(prefix)) {
+      base = target;
+      rel = urlPath.slice(prefix.length);
+      break;
+    }
+  }
+  const filePath = normalize(join(base, rel));
+
+  if (!filePath.startsWith(normalize(base))) {
     res.writeHead(403, { 'Content-Type': 'text/plain' }).end('Forbidden');
     return;
   }
