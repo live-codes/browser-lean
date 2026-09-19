@@ -43,6 +43,91 @@ window.params = params;
 
 const CODE_PATH = '/workspace/input.lean';
 
+/**
+ * How hard to look for syntax errors the runtime swallows (see FINDINGS.md §6.1).
+ *
+ *   auto (default)  parse the source with Lean's own parser, but only when the Lean
+ *                   library is already loaded for some other reason — so the check is
+ *                   free and no run pays for it. In a session that never imports Lean
+ *                   or Mathlib, syntax errors stay silent.
+ *   full            always parse, loading the Lean and Std libraries (~350 MiB) if
+ *                   they are not already there.
+ *   0               off.
+ *
+ * A cheaper trick does not exist: appending a probe command and seeing whether the
+ * parser reaches it does not work, because Lean's parser *recovers* from incomplete
+ * input and runs what follows.
+ */
+const SYNTAX_MODE = params.get('syntaxCheck') ?? 'auto';
+
+let syntaxProbeNoted = false;
+
+/**
+ * What the worker has already installed for this page. This has to outlive a run:
+ * the worker's filesystem persists, so "is the Lean library here?" is a property of
+ * the session, not of the run — which is what makes `auto` free after the first time
+ * something imports Lean.
+ */
+const loadedRoots = new Set();
+const loadedLayerLabels = new Set();
+
+/**
+ * The runtime's `lean_wasm_compile` reports elaboration errors but **not parse
+ * errors**: its collection loop reads the command state's message log after
+ * `elabCommandAtFrontend`, which resets that log, so the parser's messages are
+ * wiped before it looks. The fix is a change in the fork's Lean source — which
+ * would mean rebuilding the wasm — so the page works around it: it hands the
+ * source to Lean's own parser in a second, tiny compile and reports what the
+ * parser says. `Parser.parseCommand` is a pure function, so this needs no
+ * elaborator state beyond the environment.
+ *
+ * The probe is a separate compile on purpose: a file that fails to parse cannot
+ * reliably run anything appended to it, because the parser consumes the rest.
+ */
+function leanStringLiteral(source) {
+  const escaped = source
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '')
+    .replace(/\u2028|\u2029/g, ' ');
+  return `"${escaped}"`;
+}
+
+function syntaxProbeSource(code) {
+  // The probe must be parsed in the same environment the user's file would be, or
+  // notation the user's imports provide (`ℝ` from Mathlib, say) reads as a syntax
+  // error — a false positive that is worse than the silence this fixes. So the
+  // user's own import lines are carried over.
+  const imports = importLines(code);
+  return `${imports ? imports + '\n' : ''}import Lean
+open Lean
+
+run_cmd do
+  let src := ${leanStringLiteral(code)}
+  let ictx := Parser.mkInputContext src "<your code>"
+  let (_, ps, msgs) ← Parser.parseHeader ictx
+  let pmctx : Parser.ParserModuleContext := { env := (← getEnv), options := (← getOptions) }
+  let mut pstate := ps
+  let mut log : MessageLog := msgs
+  let mut done := false
+  while !done do
+    let (cmd, ps', log') := Parser.parseCommand ictx pmctx pstate log
+    pstate := ps'
+    log := log'
+    done := Parser.isTerminalCommand cmd
+  let errs := log.toList.filter (fun m => m.severity == MessageSeverity.error)
+  if !errs.isEmpty then
+    let mut out := ""
+    for m in errs do
+      out := out ++ s!"syntax error at line {m.pos.line}, column {m.pos.column}\\n"
+    throwError "{out}"
+`;
+}
+
 /** Roots the worker can fetch per-file (mirrored by `npm run assets:libs`). */
 const OPTIONAL_LIBRARIES = ['Std', 'Lean', 'Batteries'];
 
@@ -120,6 +205,15 @@ function importedRoots(code) {
     if (root && !roots.includes(root)) roots.push(root);
   }
   return roots;
+}
+
+/** The user's `import` lines, verbatim, so the syntax probe shares their environment. */
+function importLines(code) {
+  return stripComments(code)
+    .split('\n')
+    .filter((line) => /^\s*import\s+\S/.test(line))
+    .map((line) => line.trim())
+    .join('\n');
 }
 
 function unavailableImportNotes(code, notMirrored = []) {
@@ -370,10 +464,13 @@ function collect(out, err) {
 }
 
 function formatProblems(problems) {
+  // A message that already carries a position (the syntax probe builds its own)
+  // does not need the runtime's position appended to it as well.
+  const ownsPosition = /\(line \d+, col \d+\)|at line \d+, column \d+/;
   return problems
     .map(({ severity, text, pos }) => {
       const where =
-        pos?.line != null
+        pos?.line != null && !ownsPosition.test(text)
           ? `  (line ${pos.line}${pos.column != null ? `, col ${pos.column}` : ''})`
           : '';
       return severity === 'output' ? text : `${severity}: ${text}${where}`;
@@ -520,14 +617,18 @@ function compile(code) {
 }
 
 /** Record the outcome of one library fetch, and remember what we could not get. */
-function logLoadResult(entry, notMirrored) {
+function logLoadResult(entry, state) {
   if (entry.files > 0) {
+    loadedRoots.add(entry.root);
     appendLog(`Loaded ${entry.root}: ${entry.files} files (${(entry.bytes / 1048576).toFixed(1)} MiB)`);
     return;
   }
   // Already installed by an earlier run in this page — not a missing library.
-  if (entry.alreadyLoaded) return;
-  if (!notMirrored.includes(entry.root)) notMirrored.push(entry.root);
+  if (entry.alreadyLoaded) {
+    loadedRoots.add(entry.root);
+    return;
+  }
+  if (!state.notMirrored.includes(entry.root)) state.notMirrored.push(entry.root);
   appendLog(`No files for ${entry.root}${entry.error ? `: ${entry.error}` : ' (not mirrored)'}`);
 }
 
@@ -593,8 +694,10 @@ async function ensureRoots(roots, state) {
     const result = await loadLayer(layer);
     if (result.ok) {
       if (result.alreadyLoaded) {
+        loadedLayerLabels.add(layer.label);
         appendLog(`${layer.label} layer already loaded`);
       } else {
+        loadedLayerLabels.add(layer.label);
         appendLog(
           `Loaded the ${layer.label} layer: ${result.files} files (${(result.bytes / 1048576).toFixed(1)} MiB)`,
         );
@@ -610,12 +713,36 @@ async function ensureRoots(roots, state) {
   if (perFile.length > 0) {
     setStatus(`Loading ${perFile.join(', ')}…`, 'busy');
     for (const entry of await loadModules(perFile)) {
-      logLoadResult(entry, state.notMirrored);
+      logLoadResult(entry, state);
       if (entry.files > 0) progress = true;
     }
   }
 
   return progress;
+}
+
+/** Backstop against a mirror that never satisfies an import. */
+const MAX_LOAD_ROUNDS = 8;
+
+/**
+ * Compile, loading whatever the compiler says is missing, until it settles.
+ *
+ * Both the user's program and the syntax probe go through this: Lean names only
+ * the first missing prefix per compile (the frontend aborts with an uncaught
+ * exception), so a file needing several libraries takes one round each — bounded
+ * by progress, never by how many imports it has.
+ */
+async function compileWithLibraries(code, state) {
+  await ensureRoots(importedRoots(code), state);
+
+  let result = await compile(code);
+  for (let round = 0; round < MAX_LOAD_ROUNDS; round++) {
+    const { problems } = collect(result.stdout, result.stderr);
+    if (!(await ensureRoots(missingRoots(problems), state))) break;
+    setStatus('Recompiling with the newly loaded library…', 'busy');
+    result = await compile(code);
+  }
+  return result;
 }
 
 async function run() {
@@ -638,28 +765,7 @@ async function run() {
     const compilesBefore = window.__compiles || 0;
     const state = { attempted: new Set(), layers: new Set(), notMirrored: [] };
 
-    // Read the program's imports first. Lean reports only the first missing prefix
-    // per compile (the frontend aborts with an uncaught exception), so discovering
-    // roots one compile at a time would make the number of compile rounds depend on
-    // how many libraries a program imports. Reading the imports removes that: eight
-    // imports from three libraries cost one load phase, not eight.
-    await ensureRoots(importedRoots(code), state);
-
-    let result = await compile(code);
-
-    // Anything still missing is a transitive dependency, so keep asking the
-    // compiler and loading what it names. Bounded by progress, not by a count: the
-    // cap is only a backstop against a mirror that never satisfies an import.
-    const MAX_ROUNDS = 8;
-    for (let round = 0; round < MAX_ROUNDS; round++) {
-      const { problems } = collect(result.stdout, result.stderr);
-      const progressed = await ensureRoots(missingRoots(problems), state);
-      // Only a round that actually installed something earns a recompile; a root
-      // that was already present changes nothing, so stop rather than spin.
-      if (!progressed) break;
-      setStatus('Recompiling with the newly loaded library…', 'busy');
-      result = await compile(code);
-    }
+    const result = await compileWithLibraries(code, state);
 
     // If a root is still absent after everything we tried, say so rather than
     // leaving a bare "unknown module prefix" to be puzzled over.
@@ -670,6 +776,31 @@ async function run() {
     const runMs = Math.round(performance.now() - t0);
 
     const { info, problems, noise } = collect(result.stdout, result.stderr);
+
+    // A clean run is exactly the case we cannot trust: the runtime says nothing
+    // whether the file elaborated or merely failed to parse. Whether checking is
+    // affordable comes first — `auto` skips it unless the Lean library is already in
+    // this session, so nothing pays ~350 MiB just to be told about a typo.
+    if (SYNTAX_MODE !== '0' && code.trim() && !problems.some((p) => p.severity === 'error')) {
+      const leanReady = loadedRoots.has('Lean') || loadedLayerLabels.size > 0;
+      if (SYNTAX_MODE === 'full' || leanReady) {
+        const probeSource = syntaxProbeSource(code);
+        const probe = await compileWithLibraries(probeSource, state);
+        const probeProblems = collect(probe.stdout, probe.stderr).problems;
+        const syntaxErrors = probeProblems.filter((p) =>
+          /syntax error at line \d+, column \d+/.test(p.text),
+        );
+        if (syntaxErrors.length > 0) {
+          problems.push(...syntaxErrors);
+          appendLog(`Syntax probe: ${syntaxErrors.length} parse error(s)`);
+        } else if (probeProblems.length > 0) {
+          appendLog(`Syntax probe unavailable: ${probeProblems[0].text.split('\n')[0]}`);
+        }
+      } else if (!syntaxProbeNoted) {
+        syntaxProbeNoted = true;
+        appendLog('Syntax check: skipped — it needs the Lean library, which this session has not loaded');
+      }
+    }
 
     // `success` from the runtime only means the compile call did not fail at the
     // IO level — it is true for a file that elaborates with errors. Whether the

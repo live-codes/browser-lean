@@ -380,13 +380,8 @@ Hence the recommendation in §7: ship **code only** and treat every asset host a
 
 ## 6. Limitations
 
-- **Syntax errors are silently accepted.** This is the most surprising finding, and it is measured,
-  not inferred. `def broken : Nat :=`, `#eval (1 +`, and `def x : Nat := 5` followed by `@@@` all
-  produce **empty stdout, empty stderr, `success: true`** — the page reports "accepted". Elaboration
-  and kernel errors *are* reported, with positions. So the fork's compile entry appears to drop parse
-  failures before they reach the message channel. For a playground this is a real gap: a typo gets no
-  feedback. It is worth reporting upstream; until then the page cannot distinguish "your proof is
-  fine" from "your file did not parse".
+- **Syntax errors are no longer silently accepted** — worked around in the page, with the real fix
+  being one function upstream. The cause, the workaround, its cost and its switch are all in §6.1.
 - **Cross-origin isolation is mandatory** (§2), with no shim and no fallback. A *stub* `SharedArrayBuffer`
   is not enough here, unlike the situation `browser-cobol` documented: this runtime really does construct
   one for its pthread pool, so a fake satisfies the type check and then wedges the boot. That is why the
@@ -405,6 +400,96 @@ Hence the recommendation in §7: ship **code only** and treat every asset host a
   are mirrored. The packs and manifest *do* send `Access-Control-Allow-Origin: *`, but one version
   story is simpler than two.
 - **Chrome only, as tested.** Safari, Firefox and mobile were not exercised.
+
+### 6.1 Syntax errors: cause, workaround, one-function fix
+
+Measured, not inferred: `def broken : Nat :=`, `#eval (1 +`, and `def x : Nat := 5` followed by `@@@`
+all produced **empty stdout, empty stderr, `success: true`**, so the page reported "accepted" while
+elaboration and kernel errors reported normally.
+
+**Cause.** From the fork's `Lean.Shell.wasmCompile` (`src/Lean/Shell.lean`) together with
+`Lean.Elab.Frontend.processCommand`:
+
+```lean
+-- Frontend.processCommand
+match ... Parser.parseCommand ictx pmctx pstate cmdState.messages with
+| (cmd, ps, messages) =>
+  setParserState ps
+  setMessages messages          -- the parser's messages go into the command state
+  elabCommandAtFrontend cmd     -- …and this resets that log when it starts
+```
+
+and the fork's collection loop reads the log *after* `processCommand` returns:
+
+```lean
+    acc := acc ++ (← Elab.Frontend.getCommandState).messages
+```
+
+So parse messages are written and then wiped inside the same command, before anything reads them.
+Elaboration messages survive because they are logged after the reset.
+
+**The upstream fix** is to capture the parser's own `MessageLog` between those two calls —
+`Parser.parseCommand` is pure (`Id.run`), so it returns the accumulated log directly:
+
+```lean
+let (cmd, ps', log') := Parser.parseCommand ictx pmctx pstate log
+acc := acc ++ log'
+```
+
+That needs a wasm rebuild, so it is out of scope here. Worth noting it is **not fixed on any branch**:
+`master` has no wasm entry points at all, and the wasm branches share the flawed loop.
+
+**Workaround, implemented in the page.** The page does that parse itself in a second, small compile:
+`syntaxProbeSource` builds a Lean file that imports Lean (and the user's own imports) and runs a
+`run_cmd` which parses the user's source with `Parser.parseHeader` + `Parser.parseCommand` and throws
+with the error positions.
+
+| source | before | now |
+| --- | --- | --- |
+| `def broken : Nat :=` | accepted, exit 0 | `error: syntax error at line 2, column 0`, exit 1 |
+| `def x : Nat := 5` / `@@@` / `#eval x` | accepted, exit 0 | same error, exit 1 — and `#eval x` still printed `5`, so the parser recovered and only the probe caught it |
+| a valid `induction` proof | accepted | accepted — no false positive |
+| the Mathlib example | accepted | accepted |
+
+Note the second row: a *recoverable* parse error is invisible to any "did the file run to the end"
+trick, which is why this parses the text rather than appending a sentinel.
+
+Two things it got wrong first, both caught by testing rather than reasoning:
+
+- **The probe must import what the user imports.** Parsing `ℝ` without Mathlib's notation produced a
+  bogus syntax error on a file the kernel accepts — a false positive is worse than the silence being
+  fixed. The probe now carries the user's `import` lines across.
+- **The probe is a real Lean file**, so it needs the same library resolution as user code. Bypassing
+  that failed with `unknown module prefix 'Lean'`, and then `'Std'` once Lean was loaded (Lean imports
+  Std), so both paths now share one `compileWithLibraries` helper.
+
+**What does *not* work: inferring parse errors from control flow.** Appending a probe command and
+checking whether the parser reaches it is free, and looked sufficient — an incomplete command ought to
+consume it. It does not work, because Lean's parser **recovers**: `#eval (1 + 1` still ran the appended
+command, and so did `def broken : Nat :=` (a `Syntax.missing` node plus resynchronisation). Both
+measured. So there is no cheap signal to read; the errors have to come from a parser, and the parser
+lives in the Lean library.
+
+**Cost, and the switch.** The probe needs `import Lean`, which pulls the Lean library (~261 MiB) and Std
+(~89 MiB) once per session — far too much to pay by default for a typo check, which is why the mode
+matters:
+
+| `?syntaxCheck=` | behaviour | extra payload |
+| --- | --- | --- |
+| `auto` (default) | parse, but only if the Lean library is already loaded this session | none |
+| `full` | always parse, loading the libraries if needed | ~350 MiB |
+| `0` | never | none |
+
+`auto` is what keeps the default page at ~127 MB. A session that only writes plain Lean pays nothing and
+a typo stays silent there; a session that imports Lean or Mathlib gets exact parse errors for free.
+Measured: a fresh session logged `Syntax check: skipped — it needs the Lean library`, then after one
+`import Lean` the same file failed with `syntax error at line 2, column 0` in 13 ms and 2 compiles. A run
+that already reports errors skips the check either way. Upstream's one-line fix makes all of this
+unnecessary.
+
+One implementation note worth keeping: "is the Lean library loaded?" is a property of the **session**,
+not of the run — the worker's filesystem outlives a run — and the first version tracked it per run, so
+the check silently never fired after the library was loaded.
 
 ## 7. Recommendation for LiveCodes
 

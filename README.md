@@ -97,6 +97,7 @@ Each row was run through the page in headless Chrome and the panes read back.
 | `#eval (List.range 5).map (fun n => n * n)` | `[0, 1, 4, 9, 16]` | 0 | 0.08 s |
 | `#check this_is_not_defined` | `error: Unknown identifier \`this_is_not_defined\` (line 1, col 6)` | 1 | 0.01 s |
 | `theorem t : (1 : Nat) = 2 := by rfl` | `error: Tactic \`rfl\` failed: … (line 1, col 32)` | 1 | 0.03 s |
+| `def broken : Nat :=` (a parse error, with the Lean library loaded) | `error: syntax error at line 2, column 0` | 1 | 0.01 s |
 | `import Std.Data.HashMap` + `#eval` a `HashMap` fold | `[(1, 1), (2, 2), (3, 3)]` | 0 | 0.20 s |
 | `import Lean` + `#eval (Name.mkSimple "hello").toString` | `"hello"`, `Lean.Expr : Type` | 0 | 0.02 s |
 | `import Batteries` | accepted | 0 | 5.5 s first time, then 0.1 s |
@@ -196,10 +197,12 @@ for Std/Lean/Batteries, `npm run assets:mathlib` for Mathlib. See [FINDINGS.md](
 
 ## Limitations
 
-- **Syntax errors are silently accepted.** `def broken : Nat :=` and `#eval (1 +` report nothing at
-  all — empty stdout, empty stderr — and the page says "accepted". Elaboration and kernel errors *are*
-  reported normally. This is a gap in the fork's compile entry, not in the page; it is worth
-  reporting upstream. See [FINDINGS.md](FINDINGS.md) §6.
+- **Syntax errors are caught only once the Lean library is loaded.** The runtime's compile entry
+  swallows parse errors entirely ([FINDINGS.md](FINDINGS.md) §6.1), so the page hands your source to
+  Lean's own parser — and that parser lives in the Lean library. By default the check therefore runs
+  only when the library is already loaded for another reason (`import Lean`, or Mathlib), which keeps
+  the default page at ~127 MB; in a session that never loads Lean, a typo still passes silently.
+  `?syntaxCheck=full` always checks (paying ~350 MB for the libraries), `?syntaxCheck=0` turns it off.
 - **Mathlib here is a 4,303-module closure, not Mathlib.** Some modules (`Mathlib.Analysis.SpecialFunctions.Sqrt`)
   are absent; the page says so when you hit one. There is no umbrella `Mathlib` module either.
 - **The Mathlib layer is heavy**: ~316 MB to mirror and 809.8 MiB installed once loaded, on top of the
@@ -263,6 +266,9 @@ There is no bundler and no `node_modules`.
 The page exposes `document.documentElement.dataset` (`status`, `stage`, `runs`, `isolated`,
 `exitCode`, `initMs`, `runMs`) and its element ids as globals, so a headless probe can drive it
 without string literals. `window.__raw` holds the last run's unclassified stdout/stderr.
+
+The only other query parameter is `?syntaxCheck=`, which controls the syntax check described under
+[Limitations](#limitations): `auto` (default), `full`, or `0`.
 
 ## Packaging and hosting
 
