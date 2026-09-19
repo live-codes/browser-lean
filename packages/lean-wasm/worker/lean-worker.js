@@ -123,6 +123,45 @@ async function gunzip(bytes) {
 }
 
 /**
+ * Fetch the wasm module here rather than leaving it to Emscripten, so a host can store it
+ * **compressed**. Cloudflare Pages refuses files over 25 MiB and this one is 96.2 MiB raw — 16.5 MiB
+ * gzipped, which is what makes a plain static host (Pages included) able to serve it at all.
+ *
+ * What comes back is a **blob URL**, not the bytes, and that is the point: this is a pthread build, so
+ * Emscripten's sub-workers each load the module for themselves through `locateFile`. Handing them the
+ * decompressed bytes as a same-origin blob means a compressed host stays a single download, without
+ * needing `wasmBinary` (which the main thread honours but the workers ignore, so they fall back to
+ * requesting `lean.wasm` — the one file a compressed host does not have).
+ *
+ * `type: 'application/wasm'` matters: it keeps `WebAssembly.compileStreaming` available, where a
+ * typeless blob falls back to ArrayBuffer instantiation.
+ *
+ * Both layouts work: a host with no size limit keeps serving `lean.wasm`, and pays one 404 for the probe.
+ */
+let wasmBlobUrl = null;
+
+async function loadWasmUrl() {
+  if (wasmBlobUrl) return wasmBlobUrl;
+
+  for (const candidate of [`${assetBase}/lean.wasm.gz`, `${assetBase}/lean.wasm`]) {
+    const response = await fetch(candidate);
+    if (response.status === 404) continue;
+    if (!response.ok) throw new Error(`${candidate}: HTTP ${response.status}`);
+
+    const name = candidate.slice(candidate.lastIndexOf('/') + 1);
+    const length = Number(response.headers.get('content-length')) || 0;
+    post({ type: 'status', data: `downloading the runtime (${name}${length ? `, ${(length / 1048576).toFixed(1)} MB` : ''})…` });
+
+    let bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
+    wasmBlobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/wasm' }));
+    return wasmBlobUrl;
+  }
+
+  throw new Error(`No lean.wasm (or lean.wasm.gz) at ${assetBase}`);
+}
+
+/**
  * Fetch the packed core layer and slice it into individual files.
  *
  * Each pack is a gzip'd concatenation; the manifest carries the offset and
@@ -164,13 +203,29 @@ async function loadLibrary() {
 
 let libraryIndex = null;
 const loadedRoots = new Set();
+// Whether the tree is stored as `<path>.gz`. The index decides for the whole directory, so this costs
+// one probe per session rather than one per file — which matters when a root is 1,449 files.
+let libCompressed = false;
 
 async function getLibraryIndex() {
   if (libraryIndex) return libraryIndex;
-  const response = await fetch(`${libBase}/lean-lib-files.json`);
-  if (!response.ok) throw new Error(`library index: HTTP ${response.status}`);
-  libraryIndex = await response.json();
-  return libraryIndex;
+
+  const candidates = [
+    [`${libBase}/lean-lib-files.json.gz`, true],
+    [`${libBase}/lean-lib-files.json`, false]
+  ];
+  for (const [url, compressed] of candidates) {
+    const response = await fetch(url);
+    if (response.status === 404) continue;
+    if (!response.ok) throw new Error(`library index: HTTP ${response.status}`);
+
+    let bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
+    libCompressed = compressed;
+    libraryIndex = JSON.parse(new TextDecoder().decode(bytes));
+    return libraryIndex;
+  }
+  throw new Error(`No lean-lib-files.json (or .gz) at ${libBase}`);
 }
 
 async function fetchIfPresent(url) {
@@ -203,27 +258,53 @@ async function loadRoot(root) {
 
   let files = 0;
   let bytes = 0;
+  let failed = 0;
   let next = 0;
   const CONCURRENCY = 8;
+  const urlOf = (rel) => `${libBase}/${rel}${libCompressed ? '.gz' : ''}`;
 
   async function worker() {
     for (;;) {
       const i = next++;
       if (i >= targets.length) return;
       const rel = targets[i];
-      let data;
-      try {
-        data = await fetchIfPresent(`${libBase}/${rel}`);
-      } catch {
-        continue; // one missing sibling is not fatal
+
+      // A transient failure used to be invisible — the file was skipped, and Lean only complained if
+      // something happened to import it. Retry once, then count it so the caller can say so.
+      let data = null;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const fetched = await fetchIfPresent(urlOf(rel));
+          if (!fetched) break; // a module simply has no such sibling
+          data = libCompressed ? await gunzip(fetched) : fetched;
+          break;
+        } catch (error) {
+          if (attempt >= 1) {
+            failed += 1;
+            break;
+          }
+        }
       }
       if (!data) continue;
+
+      // Every `.olean`, `.ir` and `.ir.sig` starts with the same header. Checking it here turns the
+      // two most common hosting mistakes into something actionable: a host with an SPA fallback
+      // answers `200` with HTML for a file that is not deployed, and Lean's own complaint about that
+      // arrives much later, from inside the kernel, as `failed to read file '…, invalid header`.
+      if (!(data.length > 8 && data[0] === 0x6f && data[1] === 0x6c && data[2] === 0x65 && data[3] === 0x61 && data[4] === 0x6e)) {
+        const looksLikeHtml = data.length > 2 && data[0] === 0x3c;
+        throw new Error(
+          `${rel} is not a Lean object file${looksLikeHtml ? ' — the host returned HTML for it, so the library' : ''}` +
+            `${looksLikeHtml ? ' tree is missing from baseUrl (an SPA fallback hides the 404).' : ` (${data.length} bytes).`}`
+        );
+      }
+
       try {
         writeLibEntry(Module.FS, rel, data);
         files += 1;
         bytes += data.length;
       } catch {
-        /* ignore an individual write failure */
+        failed += 1; // an individual write failure
       }
       if (files % 400 === 0) post({ type: 'modules', stage: 'progress', root, files, total: targets.length });
     }
@@ -231,8 +312,8 @@ async function loadRoot(root) {
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   loadedRoots.add(root);
-  post({ type: 'modules', stage: 'loaded', root, files, bytes });
-  return { root, files, bytes };
+  post({ type: 'modules', stage: 'loaded', root, files, bytes, failed, total: targets.length });
+  return { root, files, bytes, failed };
 }
 
 // ---- Packed layers -----------------------------------------------------
@@ -324,7 +405,8 @@ async function startLeanModule() {
   self.Module = {
     wasmMemory: picked.memory,
     INITIAL_MEMORY: picked.bytes,
-    locateFile: (path) => `${assetBase}/${path}${assetQ}`,
+    locateFile: (path) =>
+      path.endsWith('.wasm') && wasmBlobUrl ? wasmBlobUrl : `${assetBase}/${path}${assetQ}`,
     // Tell Emscripten where the runtime script is, so the pthread sub-workers the
     // runtime spawns can load lean.js (this file is the worker's own script).
     mainScriptUrlOrBlob: `${assetBase}/lean.js${assetQ}`,
@@ -414,6 +496,8 @@ async function startLeanModule() {
     // Kept for the lifetime of the runtime: pthread sub-workers load it lazily.
     mainScriptBlob = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     Module.mainScriptUrlOrBlob = mainScriptBlob;
+    // Emscripten and every pthread sub-worker instantiate from this same blob URL.
+    await loadWasmUrl();
     importScripts(mainScriptBlob);
   } catch (err) {
     post({ type: 'error', data: 'Failed to load lean.js: ' + ((err && err.message) || err) });

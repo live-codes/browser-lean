@@ -84,7 +84,7 @@ export async function createCompiler(options = {}) {
 	function noteLoadResult(entry, state) {
 		if (entry.files > 0) {
 			loadedRoots.add(entry.root);
-			state.loaded.push(`${entry.root} (${entry.files} files)`);
+			state.loaded.push(`${entry.root} (${entry.files} files${entry.failed ? `, ${entry.failed} failed` : ''})`);
 			return;
 		}
 		if (entry.alreadyLoaded) {

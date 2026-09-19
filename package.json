@@ -6,11 +6,12 @@
   "description": "Client-side Lean 4 playground: runs the real Lean 4 kernel in the browser via WebAssembly.",
   "license": "MIT",
   "scripts": {
-    "assets": "node scripts/fetch-assets.mjs",
-    "assets:libs": "node scripts/fetch-libs.mjs",
-    "assets:mathlib": "node scripts/fetch-mathlib.mjs",
     "start": "node serve.js",
     "start:no-isolation": "node serve.js 8129 public --no-isolation",
-    "check": "node --check serve.js && node --check public/main.js && node --check scripts/fetch-assets.mjs && node --check scripts/fetch-libs.mjs && node --check scripts/fetch-mathlib.mjs && node --check packages/lean-wasm/worker/lean-worker.js"
+    "assets": "node packages/lean-wasm/bin/fetch-assets.mjs public",
+    "assets:wasm": "node packages/lean-wasm/bin/fetch-assets.mjs public --only wasm",
+    "assets:libs": "node packages/lean-wasm/bin/fetch-assets.mjs public --only lib",
+    "assets:mathlib": "node packages/lean-wasm/bin/fetch-assets.mjs public --only mathlib",
+    "check": "node --check serve.js && node --check public/main.js && node --check packages/lean-wasm/bin/fetch-assets.mjs && node --check packages/lean-wasm/worker/lean-worker.js"
   }
 }

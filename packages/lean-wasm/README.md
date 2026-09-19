@@ -36,14 +36,59 @@ Fill that host with one command, which writes the layout `baseUrl` expects:
 npx --package @live-codes/lean-wasm lean-wasm-fetch-assets public/lean
 ```
 
-It is resumable, and `--only wasm`, `--only lib,mathlib` etc. fetch subsets (the core is ~127 MiB, the
-libraries ~377 MiB, Mathlib ~316 MiB compressed).
+It is resumable, and `--only wasm`, `--only lib,mathlib` etc. fetch subsets.
 
 ```
-<baseUrl>/lean-wasm/     lean.js, lean.wasm, core-layer.json, core-lib/*.pack
-<baseUrl>/lean-lib/      lean-lib-files.json, then Std/Lean/Batteries module by module
+<baseUrl>/lean-wasm/     lean.js, lean.wasm.gz, core-layer.json, core-lib/*.pack
+<baseUrl>/lean-lib/      lean-lib-files.json.gz, then Std/Lean/Batteries module by module (.gz)
 <baseUrl>/lean-mathlib/  real-analysis-layer.json, artifacts-*.pack
 ```
+
+### Compression, and why it is the default
+
+`lean.wasm` is 96.2 MiB, and **Cloudflare Pages refuses files over 25 MiB** (so do several other
+git-based hosts). Gzipped it is 16.5 MiB, and the runtime decompresses it in the browser — so the
+default build writes `.gz` files and nothing in the mirror exceeds the limit:
+
+| | raw | as served | how |
+| --- | --- | --- | --- |
+| `lean.wasm` | 96.2 MiB | **16.5 MiB** | gzipped, decompressed with `DecompressionStream` |
+| per-file library tree (Std, Lean, Batteries) | 376.8 MiB | **143.1 MiB** | same, one file at a time |
+| core layer, 5 packs | 76.1 MiB | 30.7 MiB | already gzip containers, read as they are |
+| Mathlib layer, 52 packs | 809.8 MiB | 316.3 MiB | already gzip containers |
+| **whole mirror** | **~823 MiB** | **~490 MiB** | 5,607 files, none over 25 MiB |
+
+Measured on the real artifacts: the wasm, the core layer and the library tree go from 5,662 files /
+503.7 MiB to 5,607 files / 190.8 MiB, with zero files over the Pages limit.
+
+**gzip, not brotli.** Brotli takes the wasm to 8.9 MiB, but `DecompressionStream` — which is what
+decompresses here, with no dependency — does not support it. 16.5 MiB clears the limit, and the
+browser's own transfer compression is a separate question the host answers anyway.
+
+### A wrong URL is worse than a broken one
+
+The upstream host — and any static host with an SPA fallback, Cloudflare Pages included — answers
+`200` with its `index.html` for a path it does not have. A mis-typed `baseUrl`, or a deploy where
+`lean-lib/` never made it into the repository, therefore looks like a successful download: the mirror
+fills with HTML, and Lean reports it much later, from inside the kernel, as
+`failed to read file '…', invalid header`.
+
+So both ends check. `lean-wasm-fetch-assets` validates every asset's magic number before writing it
+and refuses HTML, checks each `.olean` header against the `leanCommit` in `core-layer.json`, and
+`--check` re-validates a whole directory without downloading anything. The runtime checks the same
+header as it installs each file, and fails with a message naming the file and the likely cause rather
+than handing HTML to Lean.
+
+How the runtime picks a layout: it probes `<baseUrl>/lean-wasm/lean.wasm.gz` and
+`<baseUrl>/lean-lib/lean-lib-files.json.gz`, and falls back to the plain names. So both layouts work,
+and **the pair must not be mixed** — if the index is gzipped, every file in the tree must be too,
+because the index decides for the whole directory. Keep the uncompressed originals and the probe
+simply prefers the `.gz`; delete them and you host half as much. `--no-compress` writes the plain
+layout for a host with no size limit.
+
+For a **git** deploy, track the `.gz` files (and `lean.js`, the manifests and the packs) — that is the
+~510 MiB above. `.gitignore` in this repo ignores the mirrors, since it is the development repo rather
+than the asset host.
 
 **Serve it with both headers, and they are not interchangeable:**
 

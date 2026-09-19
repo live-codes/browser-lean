@@ -176,7 +176,8 @@ Two traps worth recording:
 
 - **The unversioned URLs are a different, older build.** `/lean-wasm/lean.wasm` is 131.08 MiB and
   `/lean-wasm/lean.js` is 85.34 MiB, and their `.olean` files are incompatible with the current
-  packed layer. `scripts/fetch-assets.mjs` pins `?v=` and refuses to mix builds, and reports the
+  packed layer. The fetch CLI (`lean-wasm-fetch-assets`, behind `npm run assets`) pins `?v=` and
+  refuses to mix builds, and reports the
   mismatch as `incompatible header` at runtime if you get it wrong. Upstream's own build script
   enforces the same pairing and aborts on a mismatch.
 - **The glue got ~580× smaller and that is not a typo.** The explicit export list replaces
@@ -219,7 +220,7 @@ replacing an earlier sampled estimate; the whole mirror is 5,598 files / 376.8 M
 
 #### What was implemented
 
-- `scripts/fetch-libs.mjs` (`npm run assets:libs`) mirrors the tree for Std / Lean / Batteries into
+- `npm run assets:libs` (the package's fetch CLI) mirrors the tree for Std / Lean / Batteries into
   `public/lean-lib/`, index included: **5,598 files, ~377 MiB** — `.olean` + `.ir` + `.ir.sig` for each
   of 1,866 modules.
 - The worker gained `load_modules`: it reads `lean-lib-files.json`, fetches every file under a root,
@@ -377,6 +378,47 @@ So a CDN mirroring `public/`'s three directories under one base is all that is n
 with `Access-Control-Allow-Origin` **and** `Cross-Origin-Resource-Policy: cross-origin` on all three.
 
 Hence the recommendation in §7: ship **code only** and treat every asset host as configuration.
+
+### Serving it compressed, and the 25 MiB host limit
+
+`lean.wasm` is 96.2 MiB, which Cloudflare Pages refuses outright — *"Pages only supports files up to
+25 MiB"*. One file blocks the whole deploy: of 5,662 files in the mirror, every other one is small.
+
+Gzip takes it to **16.5 MiB** (5.82×) and the per-file library tree from 376.8 to 143.1 MiB. Brotli
+would take the wasm to 8.9 MiB, but `DecompressionStream` — the browser's own decompressor, and the
+reason this needs no dependency — does not support brotli. So: gzip, ~823 MiB of mirror down to ~490
+MiB, and nothing over the limit.
+
+Three traps, all found by testing rather than reasoning:
+
+1. **`Module.wasmBinary` does not reach the pthread sub-workers.** Setting it made the main thread
+   instantiate from memory, and then a sub-worker tried `XMLHttpRequest` on `lean.wasm` — the one file a
+   compressed host does not have — and the boot died with `NetworkError: Failed to execute 'send' on
+   'XMLHttpRequest': Failed to load …/lean.wasm`. What works is a **blob URL** returned from
+   `locateFile`: it is same-origin, every thread resolves it, and `type: 'application/wasm'` keeps
+   streaming compilation. The blob is built from the decompressed bytes, so the download stays single.
+2. **The per-file tree's layout is decided by its index**, which is also the only place worth probing:
+   if `<libBase>/lean-lib-files.json.gz` exists, every module is `<path>.gz`. Probing per file would add
+   5,598 round trips, and mixing the two layouts breaks the tree rather than degrading it.
+3. **A wrong URL is worse than a broken one, because these hosts answer `200` with HTML.**
+   `https://lean.cau.li/lean.js` returns the SPA shell with a `200`, and so does `/lean-lib/Std.olean` —
+   only `/lean-wasm/…` has the assets. A shape probe that trusted the status code therefore accepted the
+   site root as an asset host, wrote 1,576 bytes of `index.html` into every one of 5,598 `.olean.gz`
+   files, and the whole thing surfaced much later as
+   `error: uncaught exception: failed to read file '/lib/lean/Lean.olean', invalid header`. Cloudflare
+   Pages does the same thing wherever an SPA fallback is configured, so a deploy missing `lean-lib/`
+   looks exactly like a successful one.
+
+   Both ends now check instead of trusting: the CLI validates each asset's magic number before writing
+   it (HTML rejected outright, `.olean` headers matched against `core-layer.json`'s `leanCommit`,
+   `--check` re-validates a directory without downloading), and the runtime checks the same header as it
+   installs each file, naming the file and the likely cause instead of handing HTML to Lean. A gzip
+   source is also never gzipped twice, since that decompresses to something Lean calls an invalid
+   header for the same reason.
+
+Verified by pointing the demo at a compressed mirror on another origin: the proof example ran (wasm
+from `lean.wasm.gz`, `Lean ready in 4.6s`) and `import Std` loaded all 1,449 files from `.gz` sources.
+The plain layout was re-verified after the change — the probe 404s and falls back.
 
 ## 6. Limitations
 

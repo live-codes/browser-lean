@@ -129,6 +129,15 @@ Capability handling was checked in all three configurations a host can present:
 Over the wire it is far less: the wasm is brotli-compressed in transit (96.17 MiB → **16.1 MB**), and
 the packs are already gzip, so a first load transfers roughly **47 MB**.
 
+**Storing it is the other problem, and it is one file.** Cloudflare Pages refuses anything over 25 MiB,
+and `lean.wasm` is 96.2 MiB — every other file in the mirror is small. `npm run assets` therefore has a
+compressed variant: gzipped the wasm is **16.5 MiB** (5.82×; brotli reaches 8.9 MiB but
+`DecompressionStream` cannot read it), and the per-file library tree falls from 376.8 to 143.1 MiB,
+taking the whole mirror from ~823 MiB to ~490 MiB with nothing over the limit. The runtime decompresses
+in the browser, so the host needs no special headers beyond the two below. It also *checks* what it
+fetches: these hosts answer `200` with an HTML shell for files they do not have, which surfaces much
+later as `failed to read file '…', invalid header` (FINDINGS §5).
+
 `npm run assets` mirrors the pinned build. The artifacts are **not committed**; they are fetched from
 a third-party deploy because they cannot be hotlinked — see [FINDINGS.md](FINDINGS.md) §5, which also
 explains why the version must be pinned (`?v=`) and how a mismatch shows up.
@@ -258,8 +267,8 @@ public/main.js         the demo's UI only — it imports the package below, and 
 packages/lean-wasm/    the published package, `@live-codes/lean-wasm`
   worker/lean-worker.js    the Lean runtime host (adapted from upstream, Apache-2.0) — a build input
   src/                     the compiler, asset resolution, message classification, syntax probe
+  bin/fetch-assets.mjs     the asset CLI (`npm run assets`), which also writes compressed layouts
   dist/lean-wasm.global.js the IIFE build, committed
-scripts/fetch-assets.mjs  mirrors the pinned artifacts into public/lean-wasm/
 serve.js               static server: COOP/COEP on by default, and mounts the package at /vendor/
 FINDINGS.md            the spike log: what was measured, what breaks, what it means
 lean-run.png           screenshot of a verified run

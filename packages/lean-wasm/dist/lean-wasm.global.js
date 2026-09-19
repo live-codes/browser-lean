@@ -2,11 +2,11 @@
  *  importScripts('lean-wasm.global.js') then self.leanWasm.createCompiler({ baseUrl }).
  *  Runs Lean 4 (Apache-2.0) compiled to WebAssembly by cauli/lean4-wasm-in-browser (Apache-2.0);
  *  no third-party JavaScript is bundled. */
-var leanWasm=(()=>{var B=Object.defineProperty;var Q=Object.getOwnPropertyDescriptor;var V=Object.getOwnPropertyNames;var J=Object.prototype.hasOwnProperty;var Z=(t,e)=>{for(var s in e)B(t,s,{get:e[s],enumerable:!0})},ee=(t,e,s,o)=>{if(e&&typeof e=="object"||typeof e=="function")for(let n of V(e))!J.call(t,n)&&n!==s&&B(t,n,{get:()=>e[n],enumerable:!(o=Q(e,n))||o.enumerable});return t};var te=t=>ee(B({},"__esModule",{value:!0}),t);var he={};Z(he,{DEFAULT_BASE_URL:()=>O,LANGUAGES:()=>de,SYNTAX_MODES:()=>pe,availableRoots:()=>fe,createCompiler:()=>K,layers:()=>me,requiredAssetPaths:()=>I,resolveAssets:()=>S});var O=void 0,k={wasm:"lean-wasm",lib:"lean-lib",mathlib:"lean-mathlib"};function ne(t,e){let s;try{s=new URL(t,globalThis.location?.href)}catch{throw new Error(`${e} must be an absolute http(s) URL, or relative to the page: ${t}`)}if(s.protocol!=="http:"&&s.protocol!=="https:")throw new Error(`${e} must be http or https, not ${s.protocol}//`);return s}function S(t){let e=t??void 0;if(e==null||e==="")throw new Error("baseUrl is required: this package ships no assets (Lean\u2019s wasm is 96.2 MiB, past the 20 MB per-file limit on jsDelivr), so the runtime is fetched from a host you control. Run `npx --package @live-codes/lean-wasm lean-wasm-fetch-assets <dir>` to materialise them, then pass that directory as baseUrl.");let s=ne(e,"baseUrl").href.replace(/\/+$/,""),o=n=>`${s}/${n}`;return{baseUrl:`${s}/`,assetBase:o(k.wasm),libBase:o(k.lib),layerBase:o(k.mathlib)}}function I(){return[`${k.wasm}/lean.js`,`${k.wasm}/lean.wasm`,`${k.wasm}/core-layer.json`,`${k.wasm}/core-lib/artifacts-*.pack`,`${k.lib}/lean-lib-files.json`,`${k.lib}/**`,`${k.mathlib}/real-analysis-layer.json`,`${k.mathlib}/artifacts-*.pack`]}function re(t){return t.startsWith("[DEBUG:")||t.startsWith("mainModule? =")||t.startsWith("- /lib/lean/")||t.startsWith("wasm streaming compile failed:")||t==="falling back to ArrayBuffer instantiation"}function se(t){let e=t.data;return typeof e=="string"?e:e&&typeof e=="object"?e.msg??e.message??JSON.stringify(e):String(e??"")}function A(t,e){let s=[],o=[],n=0;for(let[i,h]of[["stdout",t],["stderr",e]])for(let _ of(h??"").split(`
-`)){let b=_.trim();if(!b)continue;if(re(b)){n+=1;continue}let d=null;if(b.startsWith("{"))try{d=JSON.parse(b)}catch{d=null}if(d&&typeof d=="object"&&d.severity){let w={severity:d.severity,text:se(d),pos:d.pos??null};(d.severity==="information"?s:o).push(w)}else{let w={severity:i==="stdout"?"output":"error",text:b,pos:null};(i==="stdout"?s:o).push(w)}}return{info:s,problems:o,noise:n}}function T(t){let e=/\(line \d+, col \d+\)|at line \d+, column \d+/;return t.map(({severity:s,text:o,pos:n})=>{let i=String(o).replace(/\u001b\[[0-9;]*m/g,""),h=n?.line!=null&&!e.test(i)?`  (line ${n.line}${n.column!=null?`, col ${n.column}`:""})`:"";return s==="output"?i:`${s}: ${i}${h}`})}var R=["Std","Lean","Batteries"];function E(t){return[{label:"Mathlib",manifestUrl:`${t.layerBase}/real-analysis-layer.json`,packBase:t.layerBase,roots:["Mathlib","Aesop","Qq","Plausible","ProofWidgets","ImportGraph","LeanSearchClient","Game"]}]}var j={Lake:"Lake is a build tool, and there is no build step here."};function C(t){return t.replace(/\/-[\s\S]*?-\//g,"").replace(/--[^\n]*/g,"")}function v(t){let e=[];for(let s of C(t).split(`
-`)){let o=/^\s*import\s+([A-Za-z0-9_'.]+)/.exec(s);if(!o)continue;let n=o[1].replace(/^'/,"").split(".")[0];n&&!e.includes(n)&&e.push(n)}return e}function N(t){return C(t).split(`
+var leanWasm=(()=>{var M=Object.defineProperty;var Q=Object.getOwnPropertyDescriptor;var J=Object.getOwnPropertyNames;var V=Object.prototype.hasOwnProperty;var Z=(t,e)=>{for(var s in e)M(t,s,{get:e[s],enumerable:!0})},ee=(t,e,s,a)=>{if(e&&typeof e=="object"||typeof e=="function")for(let n of J(e))!V.call(t,n)&&n!==s&&M(t,n,{get:()=>e[n],enumerable:!(a=Q(e,n))||a.enumerable});return t};var te=t=>ee(M({},"__esModule",{value:!0}),t);var he={};Z(he,{DEFAULT_BASE_URL:()=>O,LANGUAGES:()=>ue,SYNTAX_MODES:()=>pe,availableRoots:()=>fe,createCompiler:()=>K,layers:()=>me,requiredAssetPaths:()=>T,resolveAssets:()=>$});var O=void 0,k={wasm:"lean-wasm",lib:"lean-lib",mathlib:"lean-mathlib"};function ne(t,e){let s;try{s=new URL(t,globalThis.location?.href)}catch{throw new Error(`${e} must be an absolute http(s) URL, or relative to the page: ${t}`)}if(s.protocol!=="http:"&&s.protocol!=="https:")throw new Error(`${e} must be http or https, not ${s.protocol}//`);return s}function $(t){let e=t??void 0;if(e==null||e==="")throw new Error("baseUrl is required: this package ships no assets (Lean\u2019s wasm is 96.2 MiB, past the 20 MB per-file limit on jsDelivr), so the runtime is fetched from a host you control. Run `npx --package @live-codes/lean-wasm lean-wasm-fetch-assets <dir>` to materialise them, then pass that directory as baseUrl.");let s=ne(e,"baseUrl").href.replace(/\/+$/,""),a=n=>`${s}/${n}`;return{baseUrl:`${s}/`,assetBase:a(k.wasm),libBase:a(k.lib),layerBase:a(k.mathlib)}}function T(){return[`${k.wasm}/lean.js`,`${k.wasm}/lean.wasm`,`${k.wasm}/core-layer.json`,`${k.wasm}/core-lib/artifacts-*.pack`,`${k.lib}/lean-lib-files.json`,`${k.lib}/**`,`${k.mathlib}/real-analysis-layer.json`,`${k.mathlib}/artifacts-*.pack`]}function re(t){return t.startsWith("[DEBUG:")||t.startsWith("mainModule? =")||t.startsWith("- /lib/lean/")||t.startsWith("wasm streaming compile failed:")||t==="falling back to ArrayBuffer instantiation"}function se(t){let e=t.data;return typeof e=="string"?e:e&&typeof e=="object"?e.msg??e.message??JSON.stringify(e):String(e??"")}function B(t,e){let s=[],a=[],n=0;for(let[l,h]of[["stdout",t],["stderr",e]])for(let _ of(h??"").split(`
+`)){let b=_.trim();if(!b)continue;if(re(b)){n+=1;continue}let u=null;if(b.startsWith("{"))try{u=JSON.parse(b)}catch{u=null}if(u&&typeof u=="object"&&u.severity){let g={severity:u.severity,text:se(u),pos:u.pos??null};(u.severity==="information"?s:a).push(g)}else{let g={severity:l==="stdout"?"output":"error",text:b,pos:null};(l==="stdout"?s:a).push(g)}}return{info:s,problems:a,noise:n}}function I(t){let e=/\(line \d+, col \d+\)|at line \d+, column \d+/;return t.map(({severity:s,text:a,pos:n})=>{let l=String(a).replace(/\u001b\[[0-9;]*m/g,""),h=n?.line!=null&&!e.test(l)?`  (line ${n.line}${n.column!=null?`, col ${n.column}`:""})`:"";return s==="output"?l:`${s}: ${l}${h}`})}var A=["Std","Lean","Batteries"];function E(t){return[{label:"Mathlib",manifestUrl:`${t.layerBase}/real-analysis-layer.json`,packBase:t.layerBase,roots:["Mathlib","Aesop","Qq","Plausible","ProofWidgets","ImportGraph","LeanSearchClient","Game"]}]}var C={Lake:"Lake is a build tool, and there is no build step here."};function j(t){return t.replace(/\/-[\s\S]*?-\//g,"").replace(/--[^\n]*/g,"")}function v(t){let e=[];for(let s of j(t).split(`
+`)){let a=/^\s*import\s+([A-Za-z0-9_'.]+)/.exec(s);if(!a)continue;let n=a[1].replace(/^'/,"").split(".")[0];n&&!e.includes(n)&&e.push(n)}return e}function N(t){return j(t).split(`
 `).filter(e=>/^\s*import\s+\S/.test(e)).map(e=>e.trim()).join(`
-`)}function F(t){let e=[];for(let s of t){let o=/unknown module prefix '([^']+)'/.exec(s.text);o&&!e.includes(o[1])&&e.push(o[1])}return e}function W(t){return[...R,...E(t).flatMap(e=>e.roots)]}function oe(t,e){return R.includes(t)||E(e).some(s=>s.roots.includes(t))?"lean-wasm-fetch-assets":null}function D(t,e,s){let o=[],n=i=>{o.includes(i)||o.push(i)};for(let i of v(t))if(e.includes(i)){let h=oe(i,s);n(h?`${i} is not on the asset host. Mirror it with \`${h}\`.`:`${i} is not available here.`)}else j[i]&&n(j[i]);return o}function G(t){let e=[];for(let s of t){let o=/object file '[^']*' of module (\S+)/.exec(s.text);if(!o)continue;let n=`${o[1]} is not in the published Mathlib closure. Upstream ships only the 4,303 modules its Real Analysis course needs, so some of Mathlib is available here and some is not.`;e.includes(n)||e.push(n)}return e}var z=`/**
+`)}function W(t){let e=[];for(let s of t){let a=/unknown module prefix '([^']+)'/.exec(s.text);a&&!e.includes(a[1])&&e.push(a[1])}return e}function F(t){return[...A,...E(t).flatMap(e=>e.roots)]}function ae(t,e){return A.includes(t)||E(e).some(s=>s.roots.includes(t))?"lean-wasm-fetch-assets":null}function z(t,e,s){let a=[],n=l=>{a.includes(l)||a.push(l)};for(let l of v(t))if(e.includes(l)){let h=ae(l,s);n(h?`${l} is not on the asset host. Mirror it with \`${h}\`.`:`${l} is not available here.`)}else C[l]&&n(C[l]);return a}function D(t){let e=[];for(let s of t){let a=/object file '[^']*' of module (\S+)/.exec(s.text);if(!a)continue;let n=`${a[1]} is not in the published Mathlib closure. Upstream ships only the 4,303 modules its Real Analysis course needs, so some of Mathlib is available here and some is not.`;e.includes(n)||e.push(n)}return e}var G=`/**
  * Persistent Lean 4 WASM host \u2014 Web Worker.
  *
  * Adapted from cauli/lean4-wasm-in-browser's \`lean-worker-persistent.worker.js\`
@@ -131,6 +131,45 @@ async function gunzip(bytes) {
 }
 
 /**
+ * Fetch the wasm module here rather than leaving it to Emscripten, so a host can store it
+ * **compressed**. Cloudflare Pages refuses files over 25 MiB and this one is 96.2 MiB raw \u2014 16.5 MiB
+ * gzipped, which is what makes a plain static host (Pages included) able to serve it at all.
+ *
+ * What comes back is a **blob URL**, not the bytes, and that is the point: this is a pthread build, so
+ * Emscripten's sub-workers each load the module for themselves through \`locateFile\`. Handing them the
+ * decompressed bytes as a same-origin blob means a compressed host stays a single download, without
+ * needing \`wasmBinary\` (which the main thread honours but the workers ignore, so they fall back to
+ * requesting \`lean.wasm\` \u2014 the one file a compressed host does not have).
+ *
+ * \`type: 'application/wasm'\` matters: it keeps \`WebAssembly.compileStreaming\` available, where a
+ * typeless blob falls back to ArrayBuffer instantiation.
+ *
+ * Both layouts work: a host with no size limit keeps serving \`lean.wasm\`, and pays one 404 for the probe.
+ */
+let wasmBlobUrl = null;
+
+async function loadWasmUrl() {
+  if (wasmBlobUrl) return wasmBlobUrl;
+
+  for (const candidate of [\`\${assetBase}/lean.wasm.gz\`, \`\${assetBase}/lean.wasm\`]) {
+    const response = await fetch(candidate);
+    if (response.status === 404) continue;
+    if (!response.ok) throw new Error(\`\${candidate}: HTTP \${response.status}\`);
+
+    const name = candidate.slice(candidate.lastIndexOf('/') + 1);
+    const length = Number(response.headers.get('content-length')) || 0;
+    post({ type: 'status', data: \`downloading the runtime (\${name}\${length ? \`, \${(length / 1048576).toFixed(1)} MB\` : ''})\u2026\` });
+
+    let bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
+    wasmBlobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/wasm' }));
+    return wasmBlobUrl;
+  }
+
+  throw new Error(\`No lean.wasm (or lean.wasm.gz) at \${assetBase}\`);
+}
+
+/**
  * Fetch the packed core layer and slice it into individual files.
  *
  * Each pack is a gzip'd concatenation; the manifest carries the offset and
@@ -172,13 +211,29 @@ async function loadLibrary() {
 
 let libraryIndex = null;
 const loadedRoots = new Set();
+// Whether the tree is stored as \`<path>.gz\`. The index decides for the whole directory, so this costs
+// one probe per session rather than one per file \u2014 which matters when a root is 1,449 files.
+let libCompressed = false;
 
 async function getLibraryIndex() {
   if (libraryIndex) return libraryIndex;
-  const response = await fetch(\`\${libBase}/lean-lib-files.json\`);
-  if (!response.ok) throw new Error(\`library index: HTTP \${response.status}\`);
-  libraryIndex = await response.json();
-  return libraryIndex;
+
+  const candidates = [
+    [\`\${libBase}/lean-lib-files.json.gz\`, true],
+    [\`\${libBase}/lean-lib-files.json\`, false]
+  ];
+  for (const [url, compressed] of candidates) {
+    const response = await fetch(url);
+    if (response.status === 404) continue;
+    if (!response.ok) throw new Error(\`library index: HTTP \${response.status}\`);
+
+    let bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
+    libCompressed = compressed;
+    libraryIndex = JSON.parse(new TextDecoder().decode(bytes));
+    return libraryIndex;
+  }
+  throw new Error(\`No lean-lib-files.json (or .gz) at \${libBase}\`);
 }
 
 async function fetchIfPresent(url) {
@@ -211,27 +266,53 @@ async function loadRoot(root) {
 
   let files = 0;
   let bytes = 0;
+  let failed = 0;
   let next = 0;
   const CONCURRENCY = 8;
+  const urlOf = (rel) => \`\${libBase}/\${rel}\${libCompressed ? '.gz' : ''}\`;
 
   async function worker() {
     for (;;) {
       const i = next++;
       if (i >= targets.length) return;
       const rel = targets[i];
-      let data;
-      try {
-        data = await fetchIfPresent(\`\${libBase}/\${rel}\`);
-      } catch {
-        continue; // one missing sibling is not fatal
+
+      // A transient failure used to be invisible \u2014 the file was skipped, and Lean only complained if
+      // something happened to import it. Retry once, then count it so the caller can say so.
+      let data = null;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const fetched = await fetchIfPresent(urlOf(rel));
+          if (!fetched) break; // a module simply has no such sibling
+          data = libCompressed ? await gunzip(fetched) : fetched;
+          break;
+        } catch (error) {
+          if (attempt >= 1) {
+            failed += 1;
+            break;
+          }
+        }
       }
       if (!data) continue;
+
+      // Every \`.olean\`, \`.ir\` and \`.ir.sig\` starts with the same header. Checking it here turns the
+      // two most common hosting mistakes into something actionable: a host with an SPA fallback
+      // answers \`200\` with HTML for a file that is not deployed, and Lean's own complaint about that
+      // arrives much later, from inside the kernel, as \`failed to read file '\u2026, invalid header\`.
+      if (!(data.length > 8 && data[0] === 0x6f && data[1] === 0x6c && data[2] === 0x65 && data[3] === 0x61 && data[4] === 0x6e)) {
+        const looksLikeHtml = data.length > 2 && data[0] === 0x3c;
+        throw new Error(
+          \`\${rel} is not a Lean object file\${looksLikeHtml ? ' \u2014 the host returned HTML for it, so the library' : ''}\` +
+            \`\${looksLikeHtml ? ' tree is missing from baseUrl (an SPA fallback hides the 404).' : \` (\${data.length} bytes).\`}\`
+        );
+      }
+
       try {
         writeLibEntry(Module.FS, rel, data);
         files += 1;
         bytes += data.length;
       } catch {
-        /* ignore an individual write failure */
+        failed += 1; // an individual write failure
       }
       if (files % 400 === 0) post({ type: 'modules', stage: 'progress', root, files, total: targets.length });
     }
@@ -239,8 +320,8 @@ async function loadRoot(root) {
 
   await Promise.all(Array.from({ length: CONCURRENCY }, worker));
   loadedRoots.add(root);
-  post({ type: 'modules', stage: 'loaded', root, files, bytes });
-  return { root, files, bytes };
+  post({ type: 'modules', stage: 'loaded', root, files, bytes, failed, total: targets.length });
+  return { root, files, bytes, failed };
 }
 
 // ---- Packed layers -----------------------------------------------------
@@ -332,7 +413,8 @@ async function startLeanModule() {
   self.Module = {
     wasmMemory: picked.memory,
     INITIAL_MEMORY: picked.bytes,
-    locateFile: (path) => \`\${assetBase}/\${path}\${assetQ}\`,
+    locateFile: (path) =>
+      path.endsWith('.wasm') && wasmBlobUrl ? wasmBlobUrl : \`\${assetBase}/\${path}\${assetQ}\`,
     // Tell Emscripten where the runtime script is, so the pthread sub-workers the
     // runtime spawns can load lean.js (this file is the worker's own script).
     mainScriptUrlOrBlob: \`\${assetBase}/lean.js\${assetQ}\`,
@@ -422,6 +504,8 @@ async function startLeanModule() {
     // Kept for the lifetime of the runtime: pthread sub-workers load it lazily.
     mainScriptBlob = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     Module.mainScriptUrlOrBlob = mainScriptBlob;
+    // Emscripten and every pthread sub-worker instantiate from this same blob URL.
+    await loadWasmUrl();
     importScripts(mainScriptBlob);
   } catch (err) {
     post({ type: 'error', data: 'Failed to load lean.js: ' + ((err && err.message) || err) });
@@ -458,10 +542,10 @@ self.onmessage = async (event) => {
     }
   }
 };
-`;var ae="/workspace/input.lean";function ie(t){return`self.__LEAN_WASM_CONFIG__ = ${JSON.stringify(t)};
-${z}`}function q({assetBase:t,libBase:e,onProgress:s,onStatus:o}){let n=null,i=null,h="",_="",b=1,d=[],w=a=>{a&&s?.(a)};function l(a){let r=a.data||{};switch(r.type){case"stdout":h+=r.data+`
+`;var oe="/workspace/input.lean";function ie(t){return`self.__LEAN_WASM_CONFIG__ = ${JSON.stringify(t)};
+${G}`}function H({assetBase:t,libBase:e,onProgress:s,onStatus:a}){let n=null,l=null,h="",_="",b=1,u=[],g=o=>{o&&s?.(o)};function i(o){let r=o.data||{};switch(r.type){case"stdout":h+=r.data+`
 `;return;case"stderr":_+=r.data+`
-`;return;case"status":o?.(r.data);return;case"memory":return;case"library":r.stage==="manifest"?w(`core layer: ${r.modules} modules in ${r.packs} packs`):r.stage==="pack"?w(`core pack ${r.loaded}/${r.total}`):r.stage==="written"&&w(`${r.files} library files installed`);return;case"modules":r.stage==="progress"&&w(`loading ${r.root}: ${r.files}/${r.total} files`);return;case"layer":r.stage==="progress"&&w(`loading ${r.label}: pack ${r.pack}/${r.packs}`);return;default:break}for(let g of[...d])g.match(r)&&(d.splice(d.indexOf(g),1),clearTimeout(g.timer),g.resolve(r));r.type==="error"&&c(new Error(r.data))}function c(a){for(let r of d.splice(0))clearTimeout(r.timer),r.reject(a)}function f(a,r,g){return new Promise((p,P)=>{let M={match:a,resolve:p,reject:P,timer:null};M.timer=setTimeout(()=>{let U=d.indexOf(M);U>=0&&d.splice(U,1),P(new Error(`${r} timed out after ${Math.round(g/1e3)}s`))},g),d.push(M)})}function m(a){if(!n)throw new Error("The Lean runtime is not running.");n.postMessage(a)}async function y(){n=new Worker(URL.createObjectURL(new Blob([ie({assetBase:t,libBase:e})],{type:"text/javascript"}))),n.onmessage=l,n.onerror=a=>c(new Error(a.message||"Lean runtime error")),m({type:"start"}),await f(a=>a.type==="ready","Starting the Lean runtime",12e4)}async function u(a){let r=b++;return m({type:"load_modules",id:r,roots:a}),(await f(p=>p.type==="modules_loaded"&&p.id===r,`Loading ${a.join(", ")}`,3e5)).results??[]}async function x(a){let r=b++;return m({type:"load_layer",id:r,label:a.label,manifestUrl:a.manifestUrl,packBase:a.packBase}),await f(p=>p.type==="layer_loaded"&&p.label===a.label,`Loading ${a.label}`,6e5)}async function $(a){let r=b++;return h="",_="",m({type:"compile",id:r,code:a,path:ae}),{...await f(p=>p.type==="result"&&p.id===r,"Compiling",6e5),stdout:h,stderr:_}}function L(){c(new Error("The compiler was disposed.")),n?.terminate(),n=null,i&&(URL.revokeObjectURL(i),i=null)}return{start:y,loadModules:u,loadLayer:x,compile:$,dispose:L}}function le(t){return`"${String(t).replace(/\\/g,"\\\\").replace(/"/g,'\\"').replace(/\n/g,"\\n").replace(/\r/g,"\\r").replace(/\t/g,"\\t").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g,"").replace(/\u2028|\u2029/g," ")}"`}var X=/syntax error at line \d+, column \d+/;function H(t){let e=N(t);return`${e?e+`
+`;return;case"status":a?.(r.data);return;case"memory":return;case"library":r.stage==="manifest"?g(`core layer: ${r.modules} modules in ${r.packs} packs`):r.stage==="pack"?g(`core pack ${r.loaded}/${r.total}`):r.stage==="written"&&g(`${r.files} library files installed`);return;case"modules":r.stage==="progress"&&g(`loading ${r.root}: ${r.files}/${r.total} files`);return;case"layer":r.stage==="progress"&&g(`loading ${r.label}: pack ${r.pack}/${r.packs}`);return;default:break}for(let w of[...u])w.match(r)&&(u.splice(u.indexOf(w),1),clearTimeout(w.timer),w.resolve(r));r.type==="error"&&c(new Error(r.data))}function c(o){for(let r of u.splice(0))clearTimeout(r.timer),r.reject(o)}function f(o,r,w){return new Promise((p,U)=>{let R={match:o,resolve:p,reject:U,timer:null};R.timer=setTimeout(()=>{let P=u.indexOf(R);P>=0&&u.splice(P,1),U(new Error(`${r} timed out after ${Math.round(w/1e3)}s`))},w),u.push(R)})}function m(o){if(!n)throw new Error("The Lean runtime is not running.");n.postMessage(o)}async function y(){n=new Worker(URL.createObjectURL(new Blob([ie({assetBase:t,libBase:e})],{type:"text/javascript"}))),n.onmessage=i,n.onerror=o=>c(new Error(o.message||"Lean runtime error")),m({type:"start"}),await f(o=>o.type==="ready","Starting the Lean runtime",12e4)}async function d(o){let r=b++;return m({type:"load_modules",id:r,roots:o}),(await f(p=>p.type==="modules_loaded"&&p.id===r,`Loading ${o.join(", ")}`,3e5)).results??[]}async function x(o){let r=b++;return m({type:"load_layer",id:r,label:o.label,manifestUrl:o.manifestUrl,packBase:o.packBase}),await f(p=>p.type==="layer_loaded"&&p.label===o.label,`Loading ${o.label}`,6e5)}async function S(o){let r=b++;return h="",_="",m({type:"compile",id:r,code:o,path:oe}),{...await f(p=>p.type==="result"&&p.id===r,"Compiling",6e5),stdout:h,stderr:_}}function L(){c(new Error("The compiler was disposed.")),n?.terminate(),n=null,l&&(URL.revokeObjectURL(l),l=null)}return{start:y,loadModules:d,loadLayer:x,compile:S,dispose:L}}function le(t){return`"${String(t).replace(/\\/g,"\\\\").replace(/"/g,'\\"').replace(/\n/g,"\\n").replace(/\r/g,"\\r").replace(/\t/g,"\\t").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g,"").replace(/\u2028|\u2029/g," ")}"`}var q=/syntax error at line \d+, column \d+/;function X(t){let e=N(t);return`${e?e+`
 `:""}import Lean
 open Lean
 
@@ -484,5 +568,5 @@ run_cmd do
     for m in errs do
       out := out ++ s!"syntax error at line {m.pos.line}, column {m.pos.column}\\n"
     throwError "{out}"
-`}var ce=8,Y=["auto","full","off"];function ue(){if(typeof Worker!="function"||typeof Blob!="function")throw new Error("@live-codes/lean-wasm runs in a browser: the Lean runtime is a Web Worker, and it is handed over as a blob so that it stays same-origin.");if(typeof SharedArrayBuffer>"u")throw new Error("Lean\u2019s runtime imports a WebAssembly memory with `shared: true`, so it needs SharedArrayBuffer \u2014 which a document only has when it is cross-origin isolated. Serve the page with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (or `credentialless`). This is a hard requirement, not a header this library can work around.")}async function K(t={}){ue();let e=S(t.baseUrl),s=t.syntaxCheck??"auto";if(!Y.includes(s))throw new Error(`syntaxCheck must be one of ${Y.join(", ")}, not ${s}`);let o=E(e),n=q({assetBase:e.assetBase,libBase:e.libBase,onProgress:t.onProgress,onStatus:t.onStatus}),i=new Set,h=new Set;await n.start();function _(l,c){if(l.files>0){i.add(l.root),c.loaded.push(`${l.root} (${l.files} files)`);return}if(l.alreadyLoaded){i.add(l.root);return}c.notMirrored.includes(l.root)||c.notMirrored.push(l.root)}async function b(l,c){let f=l.filter(u=>!c.attempted.has(u));if(f.length===0)return!1;f.forEach(u=>c.attempted.add(u));let m=!1;for(let u of o){if(!f.some($=>u.roots.includes($))||c.layers.has(u.label))continue;c.layers.add(u.label);let x=await n.loadLayer(u);x.ok?(h.add(u.label),x.alreadyLoaded||(c.loaded.push(`${u.label} layer (${x.files} files)`),m=!0)):c.notMirrored.includes(u.label)||c.notMirrored.push(u.label)}let y=f.filter(u=>R.includes(u));if(y.length>0)for(let u of await n.loadModules(y))_(u,c),u.files>0&&(m=!0);return m}async function d(l,c){await b(v(l),c);let f=await n.compile(l);for(let m=0;m<ce;m++){let{problems:y}=A(f.stdout,f.stderr);if(!await b(F(y),c))break;f=await n.compile(l)}return f}async function w(l,c){let f=await d(H(l),c),{problems:m}=A(f.stdout,f.stderr);return m.filter(y=>X.test(y.text))}return{language:"lean",assets:e,async run(l,c,f={}){if(typeof l!="string")throw new Error("run() needs the program source as its first argument.");let m=f.syntaxCheck??s,y={attempted:new Set,layers:new Set,loaded:[],notMirrored:[]},u=performance.now(),x=await d(l,y),{info:$,problems:L,noise:a}=A(x.stdout,x.stderr);if(m!=="off"&&l.trim()!==""&&!L.some(p=>p.severity==="error")){let p=i.has("Lean")||h.size>0;(m==="full"||p)&&L.push(...await w(l,y))}let r=L.some(p=>p.severity==="error")||x.success===!1,g=r?[...D(l,y.notMirrored,e),...G(L)]:[];return{output:$.map(p=>p.text).join(`
-`),errors:[...T(L),...g.map(p=>`note: ${p}`)],exitCode:r?1:0,noise:a,libraries:y.loaded,compileMs:Math.round(performance.now()-u)}},dispose(){n.dispose()}}}var de=["lean"],pe=["auto","full","off"];function fe(t){return W(t??S())}function me(t){return E(t??S())}return te(he);})();
+`}var ce=8,Y=["auto","full","off"];function de(){if(typeof Worker!="function"||typeof Blob!="function")throw new Error("@live-codes/lean-wasm runs in a browser: the Lean runtime is a Web Worker, and it is handed over as a blob so that it stays same-origin.");if(typeof SharedArrayBuffer>"u")throw new Error("Lean\u2019s runtime imports a WebAssembly memory with `shared: true`, so it needs SharedArrayBuffer \u2014 which a document only has when it is cross-origin isolated. Serve the page with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` (or `credentialless`). This is a hard requirement, not a header this library can work around.")}async function K(t={}){de();let e=$(t.baseUrl),s=t.syntaxCheck??"auto";if(!Y.includes(s))throw new Error(`syntaxCheck must be one of ${Y.join(", ")}, not ${s}`);let a=E(e),n=H({assetBase:e.assetBase,libBase:e.libBase,onProgress:t.onProgress,onStatus:t.onStatus}),l=new Set,h=new Set;await n.start();function _(i,c){if(i.files>0){l.add(i.root),c.loaded.push(`${i.root} (${i.files} files${i.failed?`, ${i.failed} failed`:""})`);return}if(i.alreadyLoaded){l.add(i.root);return}c.notMirrored.includes(i.root)||c.notMirrored.push(i.root)}async function b(i,c){let f=i.filter(d=>!c.attempted.has(d));if(f.length===0)return!1;f.forEach(d=>c.attempted.add(d));let m=!1;for(let d of a){if(!f.some(S=>d.roots.includes(S))||c.layers.has(d.label))continue;c.layers.add(d.label);let x=await n.loadLayer(d);x.ok?(h.add(d.label),x.alreadyLoaded||(c.loaded.push(`${d.label} layer (${x.files} files)`),m=!0)):c.notMirrored.includes(d.label)||c.notMirrored.push(d.label)}let y=f.filter(d=>A.includes(d));if(y.length>0)for(let d of await n.loadModules(y))_(d,c),d.files>0&&(m=!0);return m}async function u(i,c){await b(v(i),c);let f=await n.compile(i);for(let m=0;m<ce;m++){let{problems:y}=B(f.stdout,f.stderr);if(!await b(W(y),c))break;f=await n.compile(i)}return f}async function g(i,c){let f=await u(X(i),c),{problems:m}=B(f.stdout,f.stderr);return m.filter(y=>q.test(y.text))}return{language:"lean",assets:e,async run(i,c,f={}){if(typeof i!="string")throw new Error("run() needs the program source as its first argument.");let m=f.syntaxCheck??s,y={attempted:new Set,layers:new Set,loaded:[],notMirrored:[]},d=performance.now(),x=await u(i,y),{info:S,problems:L,noise:o}=B(x.stdout,x.stderr);if(m!=="off"&&i.trim()!==""&&!L.some(p=>p.severity==="error")){let p=l.has("Lean")||h.size>0;(m==="full"||p)&&L.push(...await g(i,y))}let r=L.some(p=>p.severity==="error")||x.success===!1,w=r?[...z(i,y.notMirrored,e),...D(L)]:[];return{output:S.map(p=>p.text).join(`
+`),errors:[...I(L),...w.map(p=>`note: ${p}`)],exitCode:r?1:0,noise:o,libraries:y.loaded,compileMs:Math.round(performance.now()-d)}},dispose(){n.dispose()}}}var ue=["lean"],pe=["auto","full","off"];function fe(t){return F(t??$())}function me(t){return E(t??$())}return te(he);})();
