@@ -9,7 +9,7 @@ import { createReadStream, existsSync, readFileSync } from 'node:fs';
 import { createGunzip, gunzipSync } from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
-import { MEMORY_PROBE_BYTES, memoryMode, readMemoryImport } from '../src/wasm-memory.js';
+import { MEMORY_PROBE_BYTES, memoryMode, readDefinedMemory, readMemory, readMemoryImport } from '../src/wasm-memory.js';
 
 const PINNED = { module: 'env', field: 'memory', shared: true, initial: 1024, maximum: 65536 };
 
@@ -39,6 +39,63 @@ function moduleWithMemory({ shared, initial = 1024, maximum = 65536, module = 'e
 		...section(10, [0x01, 0x04, 0x00, 0x41, 0x00, 0x0b]) // code: i32.const 0; end
 	]);
 }
+
+/** A module that *defines* its memory, which is the shape a `-sMAIN_MODULE=2` build has. */
+function moduleWithDefinedMemory({ shared, initial = 1024, maximum = 65536 }) {
+	const flags = (shared ? 0x02 : 0x00) | (maximum === null ? 0x00 : 0x01);
+	const limits = [...leb(flags), ...leb(initial), ...(maximum === null ? [] : leb(maximum))];
+	return Uint8Array.from([
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+		...section(1, [0x01, 0x60, 0x00, 0x00]), // type: () -> ()
+		...section(3, [0x01, 0x00]), // function: type 0
+		...section(5, [0x01, ...limits]), // memory: DEFINED, not imported
+		...section(10, [0x01, 0x04, 0x00, 0x41, 0x00, 0x0b])
+	]);
+}
+
+test('reads a memory the module defines — the single-threaded build shape', () => {
+	// A -sMAIN_MODULE=2 wasm defines its memory and imports only functions. Reading only the import
+	// section reports nothing for this, and "nothing" is treated as shared, so the runtime would have
+	// refused to run exactly the artifact it was changed to support.
+	const bytes = moduleWithDefinedMemory({ shared: false, initial: 1024, maximum: 65536 });
+
+	const defined = readDefinedMemory(bytes);
+	assert.deepEqual(defined, { shared: false, initial: 1024, maximum: 65536 });
+
+	const memory = readMemory(bytes);
+	assert.deepEqual(memory, { source: 'defined', shared: false, initial: 1024, maximum: 65536 });
+	assert.equal(memoryMode(memory), 'unshared');
+
+	// The import-only reader must still say "no" here, so nothing downstream confuses the two shapes.
+	assert.equal(readMemoryImport(bytes), null);
+});
+
+test('a defined memory that is shared is reported as shared', () => {
+	const bytes = moduleWithDefinedMemory({ shared: true, initial: 256, maximum: 512 });
+	const memory = readMemory(bytes);
+	assert.equal(memory.source, 'defined');
+	assert.equal(memory.shared, true);
+	assert.equal(memoryMode(memory), 'shared');
+});
+
+test('an imported memory wins over a defined one, whatever else the module carries', () => {
+	// Sections are ordered, so an import (section 2) precedes a memory definition (section 5) — and an
+	// import is the one the embedder must supply, so it is the one the runtime has to construct.
+	const imported = moduleWithMemory({ shared: true, initial: 1024, maximum: 65536 });
+	const memory = readMemory(imported);
+	assert.equal(memory.source, 'import');
+	assert.equal(memory.module, 'env');
+});
+
+test('a module with neither reads as unknown', () => {
+	const noMemory = Uint8Array.from([
+		0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+		...section(1, [0x01, 0x60, 0x00, 0x00]),
+		...section(3, [0x01, 0x00])
+	]);
+	assert.equal(readMemory(noMemory), null);
+	assert.equal(readDefinedMemory(noMemory), null);
+});
 
 test('reads a shared memory import and its declared bounds', () => {
 	const memory = readMemoryImport(moduleWithMemory({ shared: true }));
@@ -129,6 +186,23 @@ test('the pinned artifact declares a shared memory, and its import fits in the p
 	const prefix = new Uint8Array(Buffer.concat(chunks).subarray(0, MEMORY_PROBE_BYTES));
 	assert.equal(prefix.length, MEMORY_PROBE_BYTES);
 	assert.deepEqual(readMemoryImport(prefix), PINNED);
+});
+
+test('the single-threaded build declares a defined, unshared memory', async (t) => {
+	// The artifact wasm-build produced. Skipped unless it has been built (`wasm-build/README.md`), because
+	// it is 97 MiB and lives outside git — but when it is there, this is the measurement that decides
+	// whether the whole exercise worked.
+	const wasm = fileURLToPath(new URL('../../../wasm-build/out/variant-2/lean.wasm', import.meta.url));
+	if (!existsSync(wasm)) {
+		t.skip('no built artifact — run the build in wasm-build/ to check this');
+		return;
+	}
+	const memory = readMemory(new Uint8Array(readFileSync(wasm)));
+	assert.equal(memory.source, 'defined', 'a -sMAIN_MODULE=2 build defines its memory rather than importing it');
+	assert.equal(memory.shared, false);
+	assert.equal(memory.initial, 1024);
+	assert.equal(memory.maximum, 65536);
+	assert.equal(memoryMode(memory), 'unshared');
 });
 
 test('the whole artifact reads the same way as its prefix', async (t) => {

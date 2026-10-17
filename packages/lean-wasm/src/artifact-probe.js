@@ -18,7 +18,7 @@
 // fall back to the behaviour of assuming a shared memory, which is what the pthread build needs and what
 // this project did before it could ask.
 
-import { MEMORY_PROBE_BYTES, readMemoryImport } from './wasm-memory.js';
+import { MEMORY_PROBE_BYTES, readMemory } from './wasm-memory.js';
 
 /**
  * How much *compressed* input to accept.
@@ -125,7 +125,7 @@ export async function probeArtifactMemory(assetBase) {
 		try {
 			const raw = await readPrefix(response, COMPRESSED_PREFIX_BYTES);
 			const bytes = looksGzipped(raw) ? await inflatePrefix(raw, MEMORY_PROBE_BYTES) : raw;
-			const memory = readMemoryImport(bytes);
+			const memory = readMemory(bytes);
 			if (!memory) continue;
 			return {
 				mode: memory.shared ? 'shared' : 'unshared',

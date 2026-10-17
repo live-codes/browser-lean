@@ -61,7 +61,14 @@ test('reads a shared artifact from the compressed layout', async () => {
 		const result = await probeArtifactMemory(`${base}/lean-wasm`);
 		assert.equal(result.mode, 'shared');
 		assert.equal(result.url, `${base}/lean-wasm/lean.wasm.gz`);
-		assert.deepEqual(result.memory, { module: 'env', field: 'memory', shared: true, initial: 1024, maximum: 65536 });
+		assert.deepEqual(result.memory, {
+			source: 'import',
+			module: 'env',
+			field: 'memory',
+			shared: true,
+			initial: 1024,
+			maximum: 65536
+		});
 		// The whole point: a fraction of the artifact, not the artifact.
 		assert.ok(result.bytesRead <= MEMORY_PROBE_BYTES / 4, `read ${result.bytesRead} bytes`);
 	});
