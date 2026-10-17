@@ -81,20 +81,32 @@ explanations were tested and **eliminated**, each by measurement rather than arg
   — count-based reporting had been inconclusive, because a few thousand tasks at 3 ms each is the same
   90 s as a million cheap ones. Across an 81 s compile it printed **nothing**, so the drain accumulates
   under 5 s. Not it.
+- **Leaving the task manager out altogether — variant 3.** §9.2's original direction: `MULTI_THREAD=OFF`
+  (no manager at all, so tasks take the pre-existing inline path), plus
+  `patches/0003-unthreaded-promise-shim.patch` for the seven promise/IO functions that assume a manager —
+  `lean_promise_new` panics by design, six more dereference `g_task_manager`. It compiles, boots, declares
+  `flags=1 shared=false`, and the flags are right: `-O3 -DNDEBUG`, `-DLEAN_MULTI_THREAD` absent. It then
+  reaches the **same ~100 s import** and stops on a panic this harness added on purpose — `Task.get` on a
+  task nothing will run. Which is the other half of the answer: with no manager there is no queue for the
+  waiter to drain, and the realization really does await promises that something has to resolve. So the
+  manager is not the cost, *and* the manager-less model is not viable — something must run pending work
+  during a wait, which is exactly what variant 2's drain does.
 
-The warm column matters as much as the first: **1.83 s against 0.37 s, about 5×**, on work with no import
-and no tasks in it. So the build is slower in steady state too, and the four explanations above do not
-cover that either — which together point at Lean's own execution under `LEAN_MULTI_THREAD` with no threads
-behind it, not at anything in this harness. Settling that needs wasm-level profiling rather than more flag
-experiments.
+The five negative results together, with the fork's own comment, point at one thing. Its
+`src/CMakeLists.txt` says the single-threaded build "**OOMs during the `Init` olean import … upstream's
+async-const realization accumulates unboundedly with no worker threads to drain it**". That description is
+of *this* cost — ours is the same realization, and it is a time cost as well as the memory one that makes
+their flags-only build die. Our patches make the runtime **survive** it; nothing at the flag level changes
+how much work the realization does. So the answer is not a flag:
 
-Which leaves the lever that does not depend on the diagnosis: **bake an `Init` environment snapshot and
-load it at boot.** `lean_wasm_load_snapshot` is exported by this artifact, upstream ships
-`snapshots/init.snap` for exactly this, and its `Shell.lean` says a snapshot "skips the multi-minute
-`loadExts` import entirely" — it takes the import out of the first Run rather than making it cheaper.
-After that, warming `Init` at page load, which is upstream's other half and spends the time while the
-reader is reading. And if the target is Chrome, the pthread build already boots without isolation
-(measured, §9.7), at 1.22 s.
+- **Bake an `Init` environment snapshot and load it at boot** — skip the realization entirely.
+  `lean_wasm_load_snapshot` is exported by this artifact, upstream ships `snapshots/init.snap` for exactly
+  this, and its `Shell.lean` says a snapshot "skips the multi-minute `loadExts` import entirely". This is
+  the lever, and it is upstream's own.
+- **Or let threads do it**: the pthread build imports in 1.22 s, and on Chrome it already boots without
+  cross-origin isolation (measured, §9.7).
+- Warming `Init` at page load remains worth doing either way: it spends the time while the reader reads
+  instead of after they click Run.
 
 ## Prerequisites
 

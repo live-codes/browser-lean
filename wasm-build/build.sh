@@ -61,7 +61,11 @@ if [ "${RESET:-0}" = "1" ] || [ ! -f "$SRC/.applied-variant-$VARIANT" ]; then
   # on having applied nothing, which then looks like a flags problem hours later.
   patch --batch -d "$SRC" -p1 < /patches/0001-cmake-single-threaded.patch
   if [ "$VARIANT" = "2" ]; then
+    # Keep the macro; create the manager with zero workers and drain on whoever waits.
     patch --batch -d "$SRC" -p1 < /patches/0002-sequential-task-manager.patch
+  elif [ "$VARIANT" = "3" ]; then
+    # No macro at all: no manager, tasks run inline — plus the promise/IO paths that assume a manager.
+    patch --batch -d "$SRC" -p1 < /patches/0003-unthreaded-promise-shim.patch
   fi
   touch "$SRC/.applied-variant-$VARIANT"
 else
@@ -82,10 +86,10 @@ EMSCRIPTEN_DEBUG="${EMSCRIPTEN_DEBUG:-OFF}"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 
-MULTI_THREAD_FLAG="-DMULTI_THREAD=ON"
-if [ "$VARIANT" = "1" ]; then
-  # The fork's stated direction: drop the macro, so the task manager is compiled out entirely.
-  # Expect `IO.Promise.new` to panic during the Init import (FINDINGS.md §9.2).
+# 1 and 3 drop the macro. 1 is the flags-only measurement — the fork's stated direction, where the task
+# manager is compiled out and `IO.Promise.new` panics during the `Init` import. 3 adds the promise/IO shim
+# that makes a manager-less runtime work, so the same configuration can actually be measured.
+if [ "$VARIANT" = "1" ] || [ "$VARIANT" = "3" ]; then
   MULTI_THREAD_FLAG="-DMULTI_THREAD=OFF"
 fi
 

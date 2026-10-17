@@ -1,0 +1,146 @@
+Make a build with no task manager work at all.
+
+Variant 2 answers FINDINGS.md §9.2 with the smallest possible change: keep `LEAN_MULTI_THREAD`, create the
+manager with zero workers, and drain its queue on whoever waits. It runs — the demo accepts proofs on it with
+no cross-origin isolation — but it leaves the macro's code paths standing, and one of them is measurable: the
+same page, same example, same machine compiles a warm `#eval` example in 1.83 s where the pthread build takes
+0.37 s, and none of the four flag-level explanations tried (optimization, exports, memory growth, the drain
+itself) accounts for that.
+
+Variant 3 takes the direction §9.2 originally described. Configure with `MULTI_THREAD=OFF`, so:
+
+  - `g_task_manager` is null (the manager's construction is inside `#if defined(LEAN_MULTI_THREAD)`),
+  - tasks take the **pre-existing** inline path — `lean_task_spawn_core`, `lean_task_map_core` and
+    `lean_task_bind_core` all have a `!g_task_manager` branch that runs the continuation immediately as
+    `lean_task_pure(apply_1(c, box(0)))`, so there is no queue, no drain, and no task allocation,
+  - `LEAN_THREAD_LOCAL` expands to nothing (thread.h:73) and `lean_mark_mt` returns immediately
+    (object.cpp:634), so the thread-local accesses and the object-graph marking go too.
+
+What has to be fixed is upstream's seven promise and IO functions, which assume a manager exists:
+`lean_promise_new` panics *by design* when one does not ("`IO.Promise.new` called before the task manager is
+running"), and `lean_promise_resolve`, `deactivate_promise`, `lean_io_wait_any_core`,
+`lean_io_get_task_state_core`, `lean_io_cancel_core` and `lean_task_get` dereference `g_task_manager`
+unchecked. Six of the seven become a direct equivalent that skips the lock and the dependency walk, both of
+which mean nothing without a queue; the two that genuinely cannot make progress — waiting for a task that
+nothing will run — panic with an explanation instead of dereferencing null.
+
+Apply with 0001 (the flags), and configure with `-DMULTI_THREAD=OFF`. Variant 3 in build.sh does both.
+
+diff --git a/src/runtime/object.cpp b/src/runtime/object.cpp
+index a83cbcf..026c026 100644
+--- a/src/runtime/object.cpp
++++ b/src/runtime/object.cpp
+@@ -1197,6 +1197,12 @@ LEAN_EXPORT void (*g_lean_report_task_get_blocked_time)(std::chrono::nanoseconds
+ extern "C" LEAN_EXPORT b_obj_res lean_task_get(b_obj_arg t) {
+     if (object * v = lean_to_task(t)->m_value)
+         return v;
++    if (!g_task_manager)
++        // wasm-build: an unresolved task with no manager can never be resolved by anyone, so this is a
++        // deadlock rather than a wait. Naming it beats dereferencing a null manager.
++        lean_internal_panic(
++            "`Task.get` cannot make progress: this build has no task manager (`LEAN_MULTI_THREAD` is "
++            "off) and the task had not finished. See wasm-build/README.md.");
+     if (g_lean_report_task_get_blocked_time) {
+         std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+         g_task_manager->wait_for(lean_to_task(t));
+@@ -1264,6 +1270,8 @@ extern "C" LEAN_EXPORT bool lean_io_check_canceled_core() {
+ extern "C" LEAN_EXPORT void lean_io_cancel_core(b_obj_arg t) {
+     if (lean_to_task(t)->m_value)
+         return;
++    if (!g_task_manager)
++        return; // wasm-build: no manager, no queue, so there is nothing to cancel
+     g_task_manager->cancel(lean_to_task(t));
+ }
+ 
+@@ -1271,21 +1279,39 @@ extern "C" LEAN_EXPORT uint8_t lean_io_get_task_state_core(b_obj_arg t) {
+     lean_task_object * o = lean_to_task(t);
+     if (!o->m_imp.load(std::memory_order::relaxed))
+         return 2; // finished
++    if (!g_task_manager)
++        // wasm-build: waiting (0) and running (1) both mean "not finished", and with no manager nothing
++        // will advance it except the inline path that has already run.
++        return 1;
+     return g_task_manager->get_task_state(o);
+ }
+ 
+ extern "C" LEAN_EXPORT b_obj_res lean_io_wait_any_core(b_obj_arg task_list) {
+-    return g_task_manager->wait_any(task_list);
+-}
+-
+-obj_res lean_promise_new() {
+     if (!g_task_manager) {
++        // wasm-build: with tasks running inline, anything that *can* finish already has. Nothing in the
++        // list finishing means nothing will without another thread, and saying so beats a null
++        // dereference. Mirrors the member `wait_any_check`, which this cannot call.
++        object * it = task_list;
++        while (!is_scalar(it)) {
++            object * head = lean_ctor_get(it, 0);
++            if (lean_to_task(head)->m_value) return head;
++            it = cnstr_get(it, 1);
++        }
+         lean_internal_panic(
+-            "`IO.Promise.new` called before the task manager is running; this typically "
+-            "happens when called (directly or transitively, e.g. via `IO.CancelToken.new`) "
+-            "from an `initialize` block. Construct lazily on first use instead.");
++            "`IO.waitAny` cannot make progress: this build has no task manager (`LEAN_MULTI_THREAD` is "
++            "off, so no worker threads exist) and none of the tasks it was given had finished. See "
++            "wasm-build/README.md.");
+     }
++    return g_task_manager->wait_any(task_list);
++}
+ 
++obj_res lean_promise_new() {
++    // wasm-build: the manager is compiled out entirely without LEAN_MULTI_THREAD, and upstream's answer
++    // here is to panic — but the `Init` import creates `IO.Promise`s during env realization, so
++    // panicking means the import cannot run at all. Constructing the promise anyway is the honest
++    // move: with no manager, tasks run inline (`lean_task_spawn_core`'s existing `!g_task_manager`
++    // branch), so a promise resolved by an inline task is resolved before anyone awaits it, and one
++    // that is awaited unresolved is a deadlock that `lean_task_get` reports rather than a crash here.
+     bool keep_alive = false;
+     unsigned prio = 0;
+     object * closure = nullptr;
+@@ -1301,7 +1327,25 @@ obj_res lean_promise_new() {
+     return (lean_object *) o;
+ }
+ 
++// wasm-build: `resolve_core` minus the lock and the dependency walk, neither of which means anything
++// with no manager: nothing is queued, and `add_dep` has no manager to enqueue through, so a resolved
++// task has no dependents to propagate to. `mark_mt` is also a no-op without the macro.
++static void lean_promise_resolve_direct(obj_arg value, b_obj_arg promise) {
++    lean_task_object * t = lean_to_promise(promise)->m_result;
++    if (t->m_value) {
++        lean_dec(value);
++        return;
++    }
++    t->m_value = mk_option_some(value);
++    lean_task_imp * imp = t->m_imp.exchange(nullptr, std::memory_order_relaxed);
++    if (imp) free_task_imp(imp);
++}
++
+ void lean_promise_resolve(obj_arg value, b_obj_arg promise) {
++    if (!g_task_manager) {
++        lean_promise_resolve_direct(value, promise);
++        return;
++    }
+     g_task_manager->resolve(lean_to_promise(promise)->m_result, mk_option_some(value));
+ }
+ 
+@@ -1322,7 +1366,17 @@ extern "C" LEAN_EXPORT obj_res lean_io_promise_result_opt(b_obj_arg promise) {
+ }
+ 
+ void deactivate_promise(lean_promise_object * promise) {
+-    g_task_manager->resolve(promise->m_result, mk_option_none());
++    if (!g_task_manager) {
++        // wasm-build: see `lean_promise_resolve_direct`.
++        lean_task_object * t = promise->m_result;
++        if (!t->m_value) {
++            t->m_value = mk_option_none();
++            lean_task_imp * imp = t->m_imp.exchange(nullptr, std::memory_order_relaxed);
++            if (imp) free_task_imp(imp);
++        }
++    } else {
++        g_task_manager->resolve(promise->m_result, mk_option_none());
++    }
+     lean_dec_ref((lean_object *)promise->m_result);
+     lean_free_small_object((lean_object *)promise);
+ }
