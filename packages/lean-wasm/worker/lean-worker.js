@@ -454,10 +454,18 @@ function compileCode(code, fileName) {
  */
 async function finishStartup() {
   if (typeof Module._lean_wasm_load_snapshot === 'function') {
+    let bytes = null;
     try {
       const response = await fetchOrThrow(`${assetBase}/snapshots/init.snap`);
-      if (response.ok) {
-        const bytes = new Uint8Array(await response.arrayBuffer());
+      if (response.ok) bytes = new Uint8Array(await response.arrayBuffer());
+    } catch (error) {
+      post({ type: 'status', data: `no Init snapshot fetchable here (${(error && error.message) || error}); the first run will import` });
+      bytes = null;
+    }
+    if (bytes) {
+      // Writing is separate from fetching, and reporting them together hid which one failed — a 230 MB
+      // snapshot into a 1 GiB heap is its own kind of mistake.
+      try {
         Module.FS.writeFile(SNAPSHOT_PATH, bytes);
         // The loader reads a dependency sidecar beside the snapshot. A self-contained snapshot's list is
         // empty, which is why upstream ships only the snapshot itself and writes the sidecar in the worker —
@@ -471,11 +479,12 @@ async function finishStartup() {
               ? `loaded the Init snapshot (${(bytes.length / 1048576).toFixed(1)} MB) — the first run will not import`
               : `the Init snapshot was refused (code ${code}); the first run will import instead`,
         });
+      } catch (error) {
+        post({
+          type: 'status',
+          data: `could not install the Init snapshot (${(error && error.message) || error}); the first run will import`,
+        });
       }
-    } catch {
-      // Absent is the normal case for a host that never baked one, and a host that answers 200 with an
-      // HTML shell for a missing file is caught by the loader, which returns a failure code.
-      post({ type: 'status', data: 'no Init snapshot at this host; the first run will import' });
     }
   }
   moduleReady = true;

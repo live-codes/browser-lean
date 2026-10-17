@@ -89,6 +89,9 @@ cd "$BUILD_DIR"
 # 1 and 3 drop the macro. 1 is the flags-only measurement — the fork's stated direction, where the task
 # manager is compiled out and `IO.Promise.new` panics during the `Init` import. 3 adds the promise/IO shim
 # that makes a manager-less runtime work, so the same configuration can actually be measured.
+# Initialised empty for the variants that keep the macro: passing it empty is fine, leaving it unset is not,
+# since this script runs under `set -u`.
+MULTI_THREAD_FLAG=""
 if [ "$VARIANT" = "1" ] || [ "$VARIANT" = "3" ]; then
   MULTI_THREAD_FLAG="-DMULTI_THREAD=OFF"
 fi
