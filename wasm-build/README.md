@@ -13,21 +13,39 @@ artifact: it reads the mode off the wasm before booting
 ([`packages/lean-wasm/src/artifact-probe.js`](../packages/lean-wasm/src/artifact-probe.js)), so it needs
 no changes to consume what this builds.
 
-## Status: the harness is checked, the build is not
+![A proof accepted with no cross-origin isolation](single-threaded-run.png)
 
-**No artifact has been produced yet.** What is known so far is from attempting it: the image builds, the
-patches apply, and the first `make stage1` fails in stage0 — for a reason that turned out to be upstream's
-recipe and not this one (`## What the fork's own Docker recipe gets wrong`, below). The build is expected
-to take hours once it gets past that, so this README is explicit about what is verified and what is not.
+The run above is the whole point, in one screenshot: `crossOriginIsolated: false`, no
+`SharedArrayBuffer` anywhere, the pill reading **no SharedArrayBuffer · unshared memory**, and a proof the
+kernel accepted. The log tells the rest — the artifact declares an unshared memory, the 629-module core
+layer arrives in 5 packs, 1,887 files are installed, and then two compiles: **109.4 s cold** (the `Init`
+import on one thread) and **1.83 s warm** (the environment is reused).
 
-The two blockers below are quoted from the fork's own source, which is the strongest evidence available
-without a completed build; the *ordering* of them is a prediction, and variant 1 exists to test it.
+## Status: it builds, and it runs Lean
 
-What has been checked, because each is cheap and each would otherwise waste hours: the patches apply
-cleanly to the pinned revision (generated from the real files, after hand-counted hunks turned out to be
-miscounted, and verified with `git apply --check`), and `verify-memory.mjs` correctly *rejects* the
-artifact this project ships today — `shared`, min 1024 / max 65536, exit 1 — while counting the 429,614
-atomic-prefix bytes a single-threaded build has to beat.
+**The artifact exists and works.** `docker run … 2` produces a `lean.wasm` that declares
+`flags=1, shared=false`, and the demo in this repo accepts proofs on it in a document with no isolation at
+all — measured in headless Chrome 155, page and assets on different origins (`FINDINGS.md` §9.7). Both
+blockers the fork's source names as needing upstream work are answered by
+`patches/0002-sequential-task-manager.patch`, in the smallest form they can be: keep `-D LEAN_MULTI_THREAD`,
+create the manager with zero workers so `g_task_manager` is never null, and let `wait_for`/`wait_any` drain
+the task queue on the thread that is waiting. The waiter becomes the worker, which is also what stops the
+async-const realization accumulating — one change, both blockers.
+
+Four traps were found by building rather than reading, and all four are fixed here with the reasoning
+recorded: the CMake 4 pin, the emsdk `EMSDK_NODE` path, the `-DUSE_MIMALLOC=OFF` the CI passes and
+`docker-wasm/` does not, and — the expensive one — the bind-mounted work tree whose inode numbers do not fit
+in 32 bits (`## What the fork's own Docker recipe gets wrong`, below).
+
+Two things about the result are worth keeping in view rather than buried:
+
+- **The first compile is slow: 109 s in the screenshot, 54 s in an earlier run.** Boot is *faster* than the
+  pthread build (3.4–19 s against 5.1–5.8 s, with no worker pool to pre-spawn), but the first `Run` pays the
+  `Init` import on a single thread. Warm compiles are ~1.8 s.
+- **The atomic-instruction question is unresolved.** `verify-memory.mjs` reports a 30× fall in
+  atomic-prefix bytes (429,614 → 14,390) and is explicit that this is evidence, not proof — and V8 does not
+  enforce the spec rule either way, so Chrome accepting the module proves nothing. Firefox and Safari
+  remain the check.
 
 ## Prerequisites
 
@@ -149,27 +167,48 @@ runtime every wait is effectively synchronous, so that guard's intent has to be 
 trigger is re-examined; if `Init` import trips it, that is the line to look at. The patch keeps the guard
 and adds the drain ahead of it, which is the conservative choice.
 
-## What the artifact must satisfy
+## What it had to satisfy — and where each one landed
 
-1. **It builds**, and `verify-memory.mjs` says `unshared`, min/max printed.
-2. **No atomic instructions.** Removing `-pthread` should be what guarantees this, and it must hold: the
-   threads proposal says atomic instructions are invalid against an unshared memory, so a conformant
-   engine rejects the module rather than running it. V8 is lenient here — measured in §9.5 — which is
-   exactly why this cannot be checked on Chrome alone.
+1. **It builds, and declares an unshared memory.** Met: `verify-memory.mjs` on the built 97.52 MiB artifact
+   reports `memory: defined`, `shared: false`, `verdict: unshared`, min 1024 / max 65536.
+2. **No atomic instructions.** **Open.** Removing `-pthread` should be what guarantees it, and the prefix
+   count falls 30×, but that is not proof and V8 does not enforce the rule — see the status note above. A
+   conformant engine is the check.
+3. **It runs the §4 table with no isolation.** Met: `crossOriginIsolated === false`,
+   `typeof SharedArrayBuffer === 'undefined'`, a proof accepted (`exitCode 0`), and library `#eval` working
+   — `#eval (List.range 5).map (fun n => n * n)` printing `[0, 1, 4, 9, 16]`, which only works because the
+   packed layer carries `.ir` beside `.olean`.
+4. **It matches the pinned build's shape.** Met for the layer — the `Init` closure packs to the same 629
+   modules / 1,887 files / 76.1 MB raw / 5 packs / 30.7 MB as upstream ships. **Not yet done** for the rest:
+   the `Std`/`Lean`/`Batteries` trees and the Mathlib layer the demo's other examples use have not been
+   packed from this build, so those examples would need their own mirrors.
 
-   There is a number to beat: the pinned pthread artifact has **429,614** bytes in its code section that
-   look like the atomic instruction prefix, and a single-threaded build should have none.
-   `verify-memory.mjs` counts them as a first pass and says plainly that it is only that — 0xFE can occur
-   inside an operand, so a non-zero count means "disassemble it", while zero is strong evidence. The real
-   check is Firefox and Safari.
-3. **It runs the §4 table** in the demo, served with `npm run start:no-isolation`, with
-   `crossOriginIsolated === false` and `typeof SharedArrayBuffer === 'undefined'`.
-4. **It matches the pinned build's behaviour otherwise**: same compiles, same `.olean`/`.ir` layout, same
-   message format, so the runtime and the mirrors need no special cases.
+## Serving what it built
 
-Then mirror it the usual way (`npm run assets` against the new host), re-run
-`packages/lean-wasm/test/*` and `test/page.html`, and record the result in `FINDINGS.md` §9 — including
-the parts that turned out to be wrong, which is how §0 and §6.1 got written.
+The build writes `lean.js`, `lean.wasm` and the `olean/` tree into `out/<variant>/`. To run the demo on it —
+which is what the screenshot above is:
+
+```bash
+# pack the Init closure into the layer the runtime boots from (629 modules, 5 packs, ~31 MB)
+node wasm-build/pack-core-layer.mjs wasm-build/out/variant-2/olean wasm-build/out/mirror/lean-wasm Init
+cp wasm-build/out/variant-2/lean.js wasm-build/out/variant-2/lean.wasm wasm-build/out/mirror/lean-wasm/
+
+# two servers: the page with NO isolation headers, and the assets it fetches
+node serve.js 8129 public --no-isolation
+node serve.js 8127 wasm-build/out/mirror
+
+# → http://localhost:8129/?baseUrl=http://localhost:8127
+```
+
+The page and the assets are on **different origins on purpose**: that is the shape a LiveCodes result page
+has, and it is the case the CORS and CORP headers exist for. `?baseUrl=` is the only configuration needed —
+the runtime reads the requirement off the wasm before it boots — and the outcome is in the log: the artifact
+declares an unshared memory, the core layer arrives in 5 packs, and the first compile pays the `Init` import.
+Expect that first Run to take a minute or two.
+
+`pack-core-layer.mjs` is also how the tree packs at all: it is upstream's job in the deployed pipeline
+(`scripts/package-core-layer.mjs` in `cauli/lean4-wasm-in-browser`), and without it a fresh build has no
+layer and the runtime cannot boot — it fetches `core-layer.json` unconditionally.
 
 ## What the fork's own Docker recipe gets wrong
 
@@ -209,8 +248,10 @@ the two of them disagree about whether the result is pthread-linked, the artifac
 Dockerfile                              emsdk 4.0.22, 32-bit stage0, cmake >= 3.28, < 4 — see above
 build.sh                                clone the fork at the pinned commit, patch, configure, build, report
 patches/0001-cmake-single-threaded.patch     the flags
-patches/0002-sequential-task-manager.patch   the runtime change (unvalidated — see above)
-verify-memory.mjs                       reads the memory import out of a built wasm, using the package's parser
+patches/0002-sequential-task-manager.patch   the runtime change that makes the flags work
+verify-memory.mjs                       reads the memory off a built wasm, using the package's parser
+pack-core-layer.mjs                     packs a build's library tree into the layer the runtime boots from
+single-threaded-run.png                 a proof accepted with no cross-origin isolation
 ```
 
 Pinned: `cauli/lean4` @ `reinstate-wasm` `dfe49531687435bcb38516a73a7c7ff55e3ef25e` (2026-09-06). The
