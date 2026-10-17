@@ -42,26 +42,46 @@ cd wasm-build
 docker build -t lean4-wasm-single-threaded .
 
 # Variant 1: the flags only. This is expected to FAIL, and how it fails is the point.
-docker run --rm -v "$PWD/out:/out" -v "$PWD/cache:/cache" lean4-wasm-single-threaded 1
+docker run --rm -v lean-build-cache:/cache -v "$PWD/out:/out" lean4-wasm-single-threaded 1
 
 # Variant 2: flags plus the sequential task manager. This is the one that should work.
-docker run --rm -v "$PWD/out:/out" -v "$PWD/cache:/cache" lean4-wasm-single-threaded 2
+docker run --rm -v lean-build-cache:/cache -v "$PWD/out:/out" lean4-wasm-single-threaded 2
 ```
 
-On Windows, give both mounts absolute paths and use `--mount` if the drive letter confuses the parser:
+On Windows, the `out` bind mount wants an absolute path and `--mount` if the drive letter confuses the
+parser — and **`cache` must be a named volume, not a bind mount**:
 
 ```powershell
-docker run --rm --mount type=bind,source=D:/repo/wasm-build/out,target=/out `
-                --mount type=bind,source=D:/repo/wasm-build/cache,target=/cache `
-                lean4-wasm-single-threaded 2
+docker run --rm -v lean-build-cache:/cache `
+              --mount type=bind,source=D:/repo/wasm-build/out,target=/out `
+              lean4-wasm-single-threaded 2
 ```
 
-**Mount `cache` — it is not optional in practice.** It holds the pinned fork and the cmake build tree, so
-a relink after a change to patch 0002 is minutes instead of another full build:
+**`cache` must be a Docker volume — this is not a preference.** It holds the pinned fork and the cmake
+build tree, and on Docker Desktop a bind mount from the host filesystem hands out inode numbers that do
+not fit in 32 bits:
 
-```bash
-docker run --rm -v "$PWD/out:/out" -v "$PWD/cache:/cache" -e MAKE_TARGET=lean lean4-wasm-single-threaded 2
 ```
+bind mount (Windows):     inode=4503599631510846   ← does not fit in 32 bits
+named volume (VM ext4):   inode=1696160            ← does
+```
+
+stage0 is a **native 32-bit** binary by design, so every `stat()` it makes on the bind mount returns
+`EOVERFLOW`, and the build dies in stage1 with
+
+```
+error: Init/MethodSpecsSimp.lean:7:0: failed to stat file '…/Init/Prelude.olean':
+       Value too large for defined data type
+```
+
+which reads like a corrupt object file and is an inode number. The fork's own instructions tell you to
+bind-mount the source (`docker run -v "$(pwd):/lean4" …`), which is correct on native Linux and breaks
+exactly here.
+
+Resuming is cheap: everything lives on the volume, and `build.sh` skips re-applying the patches when the
+tree already carries them (re-applying rewrites those files, and `make` answers by rebuilding stage0 —
+tens of minutes to change nothing). Use `-e RESET=1` when you want a clean tree, which switching variants
+needs. For a relink after a change to patch 0002, add `-e MAKE_TARGET=lean`.
 
 Each variant gets its own build directory (`build/wasm-1`, `build/wasm-2`), so switching between them does
 not reconfigure a tree the other one built. `-e EMSCRIPTEN_DEBUG=ON` adds a name section and assertions,
@@ -173,6 +193,10 @@ each is worth knowing before trusting anything else in it:
 4. **`-DUSE_MIMALLOC=OFF` is in the CI but not in that build.sh**, so it configures and builds mimalloc
    for wasm — which `src/CMakeLists.txt` says cannot work under Emscripten ("mimalloc's OS layer can't
    grow memory under Emscripten"). Passed here, matching the CI.
+5. **Its README tells you to bind-mount the source** (`docker run -v "$(pwd):/lean4" …`). Correct on
+   native Linux, broken on Docker Desktop: the host filesystem's inode numbers do not fit in 32 bits and
+   stage0 *is* a 32-bit binary, so its `stat()` calls return `EOVERFLOW` — see `## Running it` for the
+   volume that fixes it and the exact misleading error it produces.
 
 The authoritative reference is the CI, not `docker-wasm/`: `.github/workflows/ci.yml` has the wasm job's
 `CMAKE_OPTIONS`, and `build-template.yml` has its emsdk version (4.0.22) and the `--preset release` the

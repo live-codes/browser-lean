@@ -1,30 +1,39 @@
 # A build environment for Lean 4 on wasm32, single-threaded.
 #
-# Adapted from the fork's own `docker-wasm/Dockerfile` (cauli/lean4, Apache-2.0), which is the
-# environment its CI uses. The details that are not guessable are kept exactly: emsdk 4.0.22 (the version
-# the pinned build was made with), and the 32-bit multilib toolchain that stage0 needs — stage0 is a
-# native i386 `lean` used to compile the oleans and drive the cross-build, and `-m32 -msse2 -mfpmath=sse`
-# is not optional there (lean.h rejects x87's FLT_EVAL_METHOD=2).
-#
-# Layer order matters here. The emsdk layer is the expensive one (a 355 MB wasm-binaries download), so
-# anything likely to be tweaked — the CMake pin, the build script, the patches — sits *after* it. Getting
-# this wrong costs a quarter of an hour per edit.
-#
 #   docker build -t lean4-wasm-single-threaded .
 #   docker run --rm -v "$PWD/out:/out" -v "$PWD/cache:/cache" lean4-wasm-single-threaded [1|2]
 #
 # See README.md for what each variant is and what "success" has to look like.
-
-ARG TARGETPLATFORM=linux/amd64
-FROM --platform=$TARGETPLATFORM ubuntu:22.04
+#
+# Two decisions worth knowing, both arrived at by trying the obvious thing first:
+#
+# 1. **The toolchain comes from `emscripten/emsdk:4.0.22`, not from emsdk's installer.** emsdk's own
+#    `install` fetches a 355 MB `wasm-binaries.tar.xz`, and on this network it arrived truncated twice —
+#    at the right byte count, but corrupt, so `tar` reported `xz: Unexpected end of input` and the build
+#    failed with what reads like a broken toolchain. Pre-downloading it with `curl --retry -C -` and
+#    asserting the size did not help. The official image ships the same emsdk version already installed,
+#    with a valid `EMSDK_NODE` and no download step at all. The trade is that this Dockerfile no longer
+#    mirrors the fork's, it inherits a maintained one.
+#
+# 2. **CMake is installed on top and pinned below 4.** The image's CMake is 3.22 and Lean needs >= 3.25
+#    for `block()`; `cmake>=3.28` alone now resolves to CMake 4.x, under which this build compiles
+#    *stage0* with the Emscripten toolchain instead of the native 32-bit clang the CI asks for — and it
+#    dies seconds into `make stage1` with `em++: error: passing any of -msse2 ... requires passing
+#    -msimd128`, because the stage0 flags are native-x86 flags being handed to a wasm compiler.
+#
+# What the base image does not bring is the 32-bit multilib toolchain: stage0 is a native i386 `lean`
+# used to compile the oleans and drive the cross-build, and `-m32 -msse2 -mfpmath=sse` is not optional
+# there (lean.h rejects x87's FLT_EVAL_METHOD=2).
+FROM emscripten/emsdk:4.0.22
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+# `Acquire::Retries` because this network is demonstrably flaky: it has already served a truncated
+# 355 MB download and failed container DNS twice mid-build. apt gives up on the first resolution failure.
+RUN apt-get update -o Acquire::Retries=5 && apt-get install -y -o Acquire::Retries=5 \
     git \
     curl \
     wget \
-    cmake \
     ninja-build \
     ccache \
     python3 \
@@ -38,7 +47,7 @@ RUN apt-get update && apt-get install -y \
 
 # 32-bit support for stage0: libuv and libc for i386, plus pkg-config pointed at the i386 dir (build.sh).
 RUN dpkg --add-architecture i386 && \
-    apt-get update && apt-get install -y \
+    apt-get update -o Acquire::Retries=5 && apt-get install -y -o Acquire::Retries=5 \
     libuv1-dev:i386 \
     pkg-config \
     libc6-dev:i386 \
@@ -46,25 +55,8 @@ RUN dpkg --add-architecture i386 && \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-ENV EMSDK=/opt/emsdk
-RUN git clone https://github.com/emscripten-core/emsdk.git ${EMSDK} && \
-    cd ${EMSDK} && \
-    ./emsdk install 4.0.22 && \
-    ./emsdk activate 4.0.22
-
-ENV PATH="${EMSDK}:${EMSDK}/upstream/emscripten:${PATH}"
-# Deliberately no `EMSDK_NODE`. The fork's Dockerfile pins it to the Node version *its* emsdk install
-# happened to fetch (20.18.0), and emsdk 4.0.22 now fetches 24.19.0 — so the pin points at a path that
-# does not exist, and `emcc` prefers `EMSDK_NODE` over `node` on `PATH` when it is set. `emsdk_env.sh`
-# sets it correctly, and build.sh sources that.
-
-# Ubuntu 22.04 ships CMake 3.22 and current Lean needs >= 3.25 for block().
-#
-# The upper bound is deliberate, and it is a real difference from the fork's Dockerfile: its
-# `cmake>=3.28` now resolves to CMake 4.x, and under CMake 4 this build compiles *stage0* with the
-# Emscripten toolchain instead of the native 32-bit clang that `-DSTAGE0_CMAKE_CXX_COMPILER=clang++` asks
-# for. The symptom is `em++: error: passing any of -msse2 ... requires passing -msimd128` a few seconds
-# into `make stage1`, because the stage0 flags are native-x86 flags (FINDINGS.md §9.1's environment).
+# pip installs into /usr/local/bin, which precedes /usr/bin on PATH, so this is the cmake that wins.
+# An ENTRYPOINT of our own replaces the base image's; build.sh sources emsdk_env.sh, so nothing is lost.
 RUN pip3 install --no-cache-dir 'cmake>=3.28,<4'
 
 WORKDIR /build

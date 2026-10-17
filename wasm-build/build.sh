@@ -47,13 +47,22 @@ fi
 # 0001 is the flags. 0002 is the runtime change that the fork's own CMake says is required before the
 # flags can work, and it is the part of this harness that is expected to need iterating on.
 #
-# The `git checkout` immediately below resets the tree to pristine, so a patch that does not apply is a
-# hard error rather than a silently unpatched build — which would waste hours and then look like a
-# runtime bug.
-git -C "$SRC" checkout -q -- .
-patch -d "$SRC" -p1 < /patches/0001-cmake-single-threaded.patch
-if [ "$VARIANT" = "2" ]; then
-  patch -d "$SRC" -p1 < /patches/0002-sequential-task-manager.patch
+# Resuming matters here: resetting and re-applying the patches rewrites the patched files, which `make`
+# reads as "sources changed" and answers by rebuilding stage0 — tens of minutes thrown away to change
+# nothing. So the reset and the patches are skipped when the tree already carries this variant's diff,
+# marked by a file in the source tree (which lives on the volume, so it survives the container).
+# `RESET=1` forces it, which is what switching variants needs.
+if [ "${RESET:-0}" = "1" ] || [ ! -f "$SRC/.applied-variant-$VARIANT" ]; then
+  # The reset makes the tree pristine, so a patch that does not apply is a hard error rather than a
+  # silently unpatched build — which would waste hours and then look like a runtime bug.
+  git -C "$SRC" checkout -q -- .
+  patch -d "$SRC" -p1 < /patches/0001-cmake-single-threaded.patch
+  if [ "$VARIANT" = "2" ]; then
+    patch -d "$SRC" -p1 < /patches/0002-sequential-task-manager.patch
+  fi
+  touch "$SRC/.applied-variant-$VARIANT"
+else
+  echo "tree already carries variant $VARIANT's patches; skipping the reset (RESET=1 to force one)"
 fi
 git -C "$SRC" diff --stat
 
