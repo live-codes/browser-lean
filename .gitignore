@@ -13,3 +13,4 @@ public/lean-mathlib/
 # and the artifacts come out of it, several GB of it. Committed to git are the recipe, not the result.
 wasm-build/cache/
 wasm-build/out/
+wasm-build/*.log
