@@ -634,6 +634,11 @@ the reason is upstream Lean work rather than build configuration.** What follows
 `cauli/lean4` @ `reinstate-wasm` and `cauli/lean4-wasm-in-browser`; the measurements marked as such were
 taken here, and **no single-threaded artifact has been built or run** — there is none to run.
 
+[`wasm-build/`](wasm-build/) is the harness for that build — Dockerfile, patches, verifier — and its
+README is the operational version of §9.1–9.3. Both patches apply cleanly to the pinned revision (checked,
+not assumed), and the verifier rejects the artifact shipped today with the right answer (`shared`, min 1024
+/ max 65536). The build itself has not been run.
+
 ### 9.1 The flags that make it a pthread build
 
 Two are load-bearing, and they live in different variables in `src/CMakeLists.txt`:

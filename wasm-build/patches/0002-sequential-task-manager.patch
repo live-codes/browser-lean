@@ -1,0 +1,142 @@
+Let the task manager run with no worker threads.
+
+FINDINGS.md §9.2 and §9.3: without worker threads, `IO.Promise.new` panics by design (`g_task_manager`
+is null, and six more promise/IO paths dereference it), and the `Init` olean import allocates faster
+than anything retires it. Both are the same missing piece — the "sequential task manager" the fork's
+CMake comment asks for.
+
+This is the *smallest* change that can supply it, and it deliberately differs from the direction that
+comment implies. Rather than dropping `-D LEAN_MULTI_THREAD` and rewriting the promise and IO paths to
+cope with a null manager, it **keeps the macro** and changes only `task_manager`, which is smaller and
+sidesteps the panic instead of working around it:
+
+  1. Create the manager with zero workers instead of not creating one, so `g_task_manager` is never null
+     and every promise/IO call site keeps something to talk to. No `#ifdef` at the call sites.
+  2. Drain on wait. With no workers nothing retires the queue, so `wait_for` and `wait_any` run it
+     themselves instead of sleeping on a condition variable nothing will signal. The waiter becomes the
+     worker — which is also what stops the async-const realization from accumulating.
+  3. Run a task that asks for a *dedicated* thread inline, since there is no thread to dedicate to it
+     and it cannot be queued above `LEAN_MAX_PRIO`.
+
+`-pthread` is still gone (0001), so there are no worker threads to create in the first place and none of
+the atomics that would come with them. `-DMULTI_THREAD=ON` is kept for the reason above.
+
+Not validated. This is a starting point for the build loop, not a result — see wasm-build/README.md.
+The line most likely to need revisiting is the `(sync := true)` guard in `wait_for`: it exists to catch a
+deadlock in the threaded runtime, and in a single-threaded runtime every wait is effectively
+synchronous, so its trigger needs re-examining while its intent is preserved. The patch keeps it.
+
+diff --git a/a/src/runtime/object.cpp b/b/src/runtime/object.cpp
+index a83cbcf..050a95f 100644
+--- a/src/runtime/object.cpp
++++ b/src/runtime/object.cpp
+@@ -766,6 +766,12 @@ class task_manager {
+             return;
+         }
+         if (prio > LEAN_MAX_PRIO) {
++            // wasm-build: a dedicated thread is exactly what a single-threaded build does not have,
++            // and this priority cannot be queued (the queues stop at LEAN_MAX_PRIO), so run it here.
++            if (m_max_std_workers == 0) {
++                run_task(lock, t);
++                return;
++            }
+             spawn_dedicated_worker(t);
+             return;
+         }
+@@ -895,6 +901,26 @@ class task_manager {
+         }
+     }
+ 
++    /*
++    wasm-build: retire queued work on the calling thread.
++
++    With no worker threads, `m_queue_cv.notify_one()` wakes nobody and a queued task would sit there
++    until the process died — so whoever waits has to run it. `run_task` is the same code the worker
++    loop calls (`dequeue`, then `run_task`), including the `g_current_task_object` scope that the
++    nested-wait logic in `wait_for` inspects, so draining behaves like a worker that happens to be you.
++
++    Re-entrancy is deliberate: a drained task that waits for another task drains deeper into this
++    same function, which is why a task that cannot make progress panics in `wait_for`/`wait_any`
++    rather than spinning. In a single-threaded runtime an unsatisfiable wait is a deadlock, and it
++    has to say so.
++    */
++    void drain(unique_lock<mutex> & lock) {
++        while (m_queues_size != 0) {
++            lean_task_object * t = dequeue();
++            run_task(lock, t);
++        }
++    }
++
+     void resolve_core(unique_lock<mutex> & lock, lean_task_object * t, object * v) {
+         mark_mt(v);
+         t->m_value = v;
+@@ -999,6 +1025,17 @@ public:
+         unique_lock<mutex> lock(m_mutex);
+         if (t->m_value)
+             return;
++        if (m_max_std_workers == 0) {
++            // wasm-build: nothing else can retire the queue, so the queue is drained here. If that
++            // still does not finish the task, nothing will: it is waiting on something this runtime
++            // cannot run (an IO callback, or a task that was never spawned), and saying so beats
++            // hanging forever.
++            drain(lock);
++            if (t->m_value)
++                return;
++            lean_panic("`Task.get` cannot make progress: this build has no worker threads and draining "
++                       "the task queue did not finish the task. See wasm-build/README.md.");
++        }
+         // see `Task.get`
+         bool in_pool = g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio <= LEAN_MAX_PRIO;
+         if (g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio == LEAN_SYNC_PRIO) {
+@@ -1021,6 +1058,14 @@ public:
+         if (object * t = wait_any_check(task_list))
+             return t;
+         unique_lock<mutex> lock(m_mutex);
++        if (m_max_std_workers == 0) {
++            // wasm-build: drain, then look again — a drained task may be what resolves one of these.
++            drain(lock);
++            if (object * t = wait_any_check(task_list))
++                return t;
++            lean_panic("`IO.waitAny` cannot make progress: this build has no worker threads and draining "
++                       "the task queue resolved none of the tasks it was given. See wasm-build/README.md.");
++        }
+         while (true) {
+             if (object * t = wait_any_check(task_list))
+                 return t;
+@@ -1073,13 +1118,20 @@ static task_manager * g_task_manager = nullptr;
+ extern "C" LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers) {
+     lean_assert(g_task_manager == nullptr);
+ #if defined(LEAN_MULTI_THREAD)
+-    if (num_workers > 0) {
+-        g_task_manager = new task_manager(num_workers);
+-    }
++    // wasm-build: created even with zero workers. A null manager is what makes `IO.Promise.new`
++    // panic and what six more promise/IO paths dereference unchecked; a manager with no workers is a
++    // task queue that the waiter drains, which is what a single-threaded runtime actually needs.
++    g_task_manager = new task_manager(num_workers);
+ #endif
+ }
+ 
+ static unsigned get_lean_num_threads() {
++#if defined(LEAN_EMSCRIPTEN) && !defined(__EMSCRIPTEN_PTHREADS__)
++    // wasm-build: no pthreads, so there are no worker threads to ask for. `__EMSCRIPTEN_PTHREADS__`
++    // is defined by Emscripten exactly when it is building with -pthread, so this only fires for the
++    // single-threaded artifact — the pthread build keeps asking for `hardware_concurrency()`.
++    return 0;
++#endif
+ #ifndef LEAN_EMSCRIPTEN
+     if (char const * num_threads = std::getenv("LEAN_NUM_THREADS")) {
+         return atoi(num_threads);
+@@ -1107,9 +1159,9 @@ extern "C" LEAN_EXPORT void lean_finalize_task_manager() {
+ scoped_task_manager::scoped_task_manager(unsigned num_workers) {
+     lean_assert(g_task_manager == nullptr);
+ #if defined(LEAN_MULTI_THREAD)
+-    if (num_workers > 0) {
+-        g_task_manager = new task_manager(num_workers);
+-    }
++    // wasm-build: see `lean_init_task_manager_using` — same reason, and this is the constructor the
++    // runtime entry points use.
++    g_task_manager = new task_manager(num_workers);
+ #endif
+ }
+ 

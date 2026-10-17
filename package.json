@@ -14,6 +14,7 @@
     "assets:libs": "node packages/lean-wasm/bin/fetch-assets.mjs public --only lib",
     "assets:mathlib": "node packages/lean-wasm/bin/fetch-assets.mjs public --only mathlib",
     "sync:vendor": "node scripts/vendor-package.mjs",
-    "check": "node --check serve.js && node --check public/main.js && node --check scripts/vendor-package.mjs && node --check packages/lean-wasm/bin/fetch-assets.mjs && node --check packages/lean-wasm/worker/lean-worker.js && node scripts/vendor-package.mjs --check"
+    "check": "node --check serve.js && node --check public/main.js && node --check scripts/vendor-package.mjs && node --check packages/lean-wasm/bin/fetch-assets.mjs && node --check packages/lean-wasm/worker/lean-worker.js && node --check wasm-build/verify-memory.mjs && node scripts/vendor-package.mjs --check",
+    "verify:memory": "node wasm-build/verify-memory.mjs"
   }
 }

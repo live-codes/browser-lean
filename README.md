@@ -280,9 +280,11 @@ public/vendor/         the package's browser build, vendored by `npm run sync:ve
 public/_headers        COOP/COEP for Cloudflare Pages, which is how a static host gets isolation
 packages/lean-wasm/    the published package, `@live-codes/lean-wasm`
   worker/lean-worker.js    the Lean runtime host (adapted from upstream, Apache-2.0) — a build input
-  src/                     the compiler, asset resolution, message classification, syntax probe
+  src/                     the compiler, asset resolution, message classification, syntax probe,
+                           and the artifact probe that reads the memory mode off the wasm
   bin/fetch-assets.mjs     the asset CLI (`npm run assets`), which also writes compressed layouts
   dist/lean-wasm.global.js the IIFE build, which is what gets vendored
+wasm-build/            the harness for a single-threaded build, and why it is upstream work (FINDINGS §9)
 serve.js               static server: COOP/COEP on by default, and nothing else
 FINDINGS.md            the spike log: what was measured, what breaks, what it means
 lean-run.png           screenshot of a verified run
@@ -387,8 +389,9 @@ accepted proofs, rejected proofs and library `#eval`, with the isolation failure
 silent-parse-failure gap characterised. Not yet suitable as a LiveCodes language, for the one
 measured reason above.
 
-Next: the two pieces of upstream Lean work a single-threaded build needs ([FINDINGS.md](FINDINGS.md) §9),
-and mirroring the artifacts somewhere we control.
+Next: the two pieces of upstream Lean work a single-threaded build needs ([FINDINGS.md](FINDINGS.md) §9) —
+the harness for which now exists in [`wasm-build/`](wasm-build/) — and mirroring the artifacts somewhere
+we control.
 
 ## License
 
