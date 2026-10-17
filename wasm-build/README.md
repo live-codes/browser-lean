@@ -108,6 +108,40 @@ how much work the realization does. So the answer is not a flag:
 - Warming `Init` at page load remains worth doing either way: it spends the time while the reader reads
   instead of after they click Run.
 
+## Baking the snapshot — the lever, and where it stands
+
+A snapshot removes the `Init` import from the first Run instead of making it cheaper, and it is upstream's
+own mechanism: their deploy bakes `snapshots/init.snap` with `scripts/bake-snapshots.sh` +
+`scripts/lean-wasm-node.cjs`, and the artifact already exports the loader (`lean_wasm_load_snapshot`). It has
+to be baked by **the same binary that will load it** — the snapshot embeds closure relocations that are only
+valid against the saving binary's function table — so a native `lean` cannot do it.
+
+`bake-snapshot.cjs` here is that driver, adapted to this harness's layout and to a single-threaded artifact
+(no shared memory for the embedder to hand over). What it establishes, and where it stops:
+
+- **The artifact runs under Node.** Not obvious: the same glue that runs in a worker runs under Node, with
+  `vm.runInThisContext` (the glue's top-level `var Module` would otherwise be shadowed by the CommonJS
+  wrapper) and NODEFS mounting the library tree at `/lib/lean` and a work directory at `/work`. It reaches
+  `lean_main entered, argc=3` with the right argv.
+- **The mounts are right.** `/lib/lean/Init.olean` is visible and readable, the probe file is there, and
+  `LEAN_PATH=/lib/lean` with cwd `/work`, all verified from inside `preRun`.
+- **Then `lean --incr-header-save` fails with `errno=44` — Emscripten's `ENOENT` — carrying no path, no
+  message and no stack.** It is not an Emscripten FS call: every FS entry point is wrapped to name the
+  operation and path, and none of them failed. So it is an IO error from Lean's own CLI startup, and the
+  next step is tracing it at that level (or running the same CLI under the *pthread* artifact to see whether
+  it is this build or CLI-under-Node in general).
+
+**A second route is open, and it avoids the problem entirely**: `lean_shell_main` is **exported**
+(`Shell.lean:640`), and there is no exported *save*, so saving is CLI-only — but a worker can call
+`lean_shell_main` itself, with `--incr-header-save=/work/init.snap`. That means a **bake mode in the
+browser**: run the CLI once in a throwaway worker (it exits the runtime, which is why it cannot be the
+runtime worker), read `init.snap` out of MEMFS, and download it. ~100 s once, on machinery already proven in
+the browser, and none of the Node-side unknowns.
+
+Either way the load side is small: fetch `snapshots/init.snap`, write it into the FS, and call
+`_lean_wasm_load_snapshot(path)` before the module is declared ready — the export and the cache-key
+semantics are already in the fork.
+
 ## Prerequisites
 
 - Docker, with ~15 GB of free disk and 8 GB+ of RAM. The fork's own note: the first build takes 30–60
