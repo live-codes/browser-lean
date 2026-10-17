@@ -61,9 +61,10 @@ document. There is no shim and no fallback.
 
 **Chrome has two escape hatches that skip the headers entirely**: a reverse origin trial for
 `SharedArrayBuffer` that has already been extended more than once and sits on a deprecation path, and
-`Document-Isolation-Policy`, which lets a document isolate itself regardless of the page around it.
-Both are Chrome-only and can be withdrawn — so Lean *could* ship in LiveCodes behind one of them, but
-the durable answer is a single-threaded build. See [FINDINGS.md](FINDINGS.md) §2.
+`Document-Isolation-Policy`, which lets a document isolate itself regardless of the page around it —
+shipped in Chrome 137 for desktop, and unlike COOP/COEP it applies *per frame*, so the embedder does
+nothing either way. Both are Chrome-only, so Lean *could* ship in LiveCodes behind one of them, but the
+durable answer is a single-threaded build. See [FINDINGS.md](FINDINGS.md) §2 and §9.
 
 To see the failure for yourself:
 
@@ -235,12 +236,15 @@ trade-off rather than a wall.
 A LiveCodes result page runs in a sandboxed iframe inside *someone else's* document, and cross-origin
 isolation is inherited from the top-level document, so it cannot give itself COOP/COEP. On any browser
 other than Chrome this runtime therefore has no `SharedArrayBuffer` and cannot start. Chrome-only
-escape hatches exist (the reverse origin trial for `SharedArrayBuffer`, or `Document-Isolation-Policy`),
-so Lean *could* ship behind one of them — acceptable, but they can be withdrawn and they help nobody
-else. Two ways forward, in preference order:
+escape hatches exist (the reverse origin trial for `SharedArrayBuffer`, or `Document-Isolation-Policy`,
+which has shipped in Chrome 137 desktop and — unlike COOP/COEP — applies per frame, so the embedder
+needs to do nothing), so Lean *could* ship behind one of them. Neither helps Firefox or Safari, which is
+what makes it a stopgap rather than an answer. Two ways forward, in preference order:
 
 1. **A single-threaded Lean wasm build.** No isolation, no trial, works everywhere, and removes the
-   question entirely. This is a build-and-release task.
+   question entirely — but it is not a flag flip. [FINDINGS.md](FINDINGS.md) §9 has the recipe and the two
+   upstream blockers: a sequential task manager, and an `Init`-import allocation with no thread pool to
+   drain it.
 2. **Ship Chrome-only behind the origin trial**, keeping the feature detection the page already has:
    where `SharedArrayBuffer` is missing, the language should say so plainly rather than fail obscurely.
 
@@ -375,7 +379,8 @@ accepted proofs, rejected proofs and library `#eval`, with the isolation failure
 silent-parse-failure gap characterised. Not yet suitable as a LiveCodes language, for the one
 measured reason above.
 
-Next: a single-threaded build, and mirroring the artifacts somewhere we control.
+Next: the two pieces of upstream Lean work a single-threaded build needs ([FINDINGS.md](FINDINGS.md) §9),
+and mirroring the artifacts somewhere we control.
 
 ## License
 

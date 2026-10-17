@@ -87,11 +87,14 @@ could not be embedded cleanly). Chrome offers two escape hatches that skip the h
   to give sites more time since the Chrome 92 restriction; it has already been extended more than once
   and sits on a deprecation path.
 - **`Document-Isolation-Policy`**, which lets a document turn on `crossOriginIsolated` for itself,
-  without deploying COOP or COEP, regardless of the isolation status of the page around it.
+  without deploying COOP or COEP, regardless of the isolation status of the page around it. This one has
+  shipped — Chrome 137 for desktop — and unlike COOP/COEP it applies per frame, so it needs nothing from
+  the embedder. Measured in §9.6.
 
-So Lean *could* ship in LiveCodes today behind one of these. Both are Chrome-only and both are trials
-or flags that can be withdrawn, so the honest default is to treat isolation as unavailable and prefer a
-**single-threaded Lean wasm build**, which needs none of this and works in every browser.
+So Lean *could* ship in LiveCodes today behind one of these. They are Chrome-only, and the origin trial
+sits on a deprecation path, so the honest default is to treat isolation as unavailable and prefer a
+**single-threaded Lean wasm build**, which needs none of this and works in every browser. §9 is what that
+build actually requires — and it is upstream Lean work, not just a build.
 
 The page therefore keys off `SharedArrayBuffer` itself, not off `crossOriginIsolated` — otherwise it
 would refuse to start in exactly the configuration a trial provides. Verified by shadowing the global
@@ -575,7 +578,9 @@ if it must happen; both can be withdrawn, and neither helps Firefox or Safari. T
 in preference order:
 
 1. **A single-threaded Lean wasm build.** No isolation, no trial, works everywhere, and removes the
-   whole question. This is a build-and-release task against cauli's build or the Lean FRO's wasm work.
+   whole question. §9 is the recipe, and the honest headline is that it is blocked on two pieces of
+   upstream Lean work — a sequential task manager, and an `Init`-import allocation that currently has no
+   thread pool to drain it — not on the build flags, which are an afternoon.
 2. **Ship Chrome-only behind the origin trial**, with the same feature detection the page already has:
    where `SharedArrayBuffer` is missing, the language should report that plainly rather than fail
    obscurely. Acceptable, and worth avoiding if it can be.
@@ -620,3 +625,188 @@ finding in §6 was established.
 
 Artifact inspection used a ~60-line wasm section parser over the module's import section, plus
 `curl -I`/`-w` with and without `Accept-Encoding: br` for the size and compression columns.
+
+## 9. A single-threaded build: what it takes
+
+§2 and §7 both land on the same answer: a build whose memory is not `shared` needs no COOP/COEP, no
+origin trial and no `Document-Isolation-Policy`, and works in every browser. **It is not a flag flip, and
+the reason is upstream Lean work rather than build configuration.** What follows is read out of
+`cauli/lean4` @ `reinstate-wasm` and `cauli/lean4-wasm-in-browser`; the measurements marked as such were
+taken here, and **no single-threaded artifact has been built or run** — there is none to run.
+
+### 9.1 The flags that make it a pthread build
+
+Two are load-bearing, and they live in different variables in `src/CMakeLists.txt`:
+
+| where | flag | why it matters |
+| --- | --- | --- |
+| l.78, l.281 | `option(MULTI_THREAD "MULTI_THREAD" ON)` → `-D LEAN_MULTI_THREAD` | the task manager and `lthread` are compiled out without it |
+| l.216 | `set(EMSCRIPTEN_SETTINGS "-fwasm-exceptions -pthread")` | **the `-pthread` here is unconditional**, reaches every compile, and is what puts atomics and TLS in the objects |
+| l.678 | `-pthread` appended when `MULTI_THREAD AND NOT MSVC AND NOT Darwin` | drops out on its own with `MULTI_THREAD=OFF` |
+| l.927 | `… -s STACK_SIZE=16777216 -sINITIAL_MEMORY=67108864 -sMAXIMUM_MEMORY=4294967296 -sPTHREAD_POOL_SIZE=4` | the pool is the 4 workers the glue spawns eagerly |
+| l.217 | `-sALLOW_MEMORY_GROWTH=1 -sINCOMING_MODULE_JS_API=…,mainScriptUrlOrBlob,…` | |
+
+So `MULTI_THREAD=OFF` alone is not enough — line 216's `-pthread` still yields the shared memory, and
+`-sPTHREAD_POOL_SIZE=4` still yields the pool. Both go:
+
+```
+-DMULTI_THREAD=OFF
+set(EMSCRIPTEN_SETTINGS "-fwasm-exceptions")     # l.216, minus -pthread
+# l.927, minus -sPTHREAD_POOL_SIZE=4
+```
+
+Three things get *better* in that configuration, which is worth knowing before deciding it is all cost:
+
+- **`-sALLOW_MEMORY_GROWTH=1` starts working.** Today the memory cannot grow — a `SharedArrayBuffer` is
+  not resizable here (l.921–923), which is why the worker reserves 2 GB up front (§2) and why
+  `scripts/patch-wasm-memory.py` exists upstream at all, raising the declared maximum by hand. An
+  unshared memory grows, so `-sINITIAL_MEMORY` can drop a long way.
+- **`-sINITIAL_MEMORY=67108864` was sized for the pthread layout** — "static data + the 16MB stack +
+  per-thread TLS; the pthread layout needs ~22MB up front" (l.920–921). No TLS, no 16 MB main stack.
+- **`-sASSERTIONS=1` becomes usable again.** l.228–230 records that it "is broken on emsdk 6 pthread
+  workers" — the breakage is in the pthread boot path, and assertions are exactly what a first bring-up
+  of this build wants.
+
+`-fwasm-exceptions` stays. It is native EH, independent of threads, and l.205–209 documents why the
+JS-emulated alternative is not on the table: every potentially-throwing call goes through an `invoke_*`
+trampoline and consumes browser JS stack, which a worker cannot enlarge, so deep kernel recursion dies
+with `RangeError` while the 16 MB wasm stack is nearly empty. `-sMAIN_MODULE=2` and the explicit
+`emscripten-exports.txt` list also stay as they are.
+
+### 9.2 Blocker one: no task manager, and `Promise.new` panics without one
+
+The fork says this itself, in the comment sitting directly above those flags (l.201–204):
+
+> Threads: 4.33's import machinery creates IO.Promises during env realization, and without
+> LEAN_MULTI_THREAD the task manager is a no-op, so Promise.new panics by design. A single-thread (no
+> COOP/COEP, phone-sized) build needs a sequential task manager upstream first.
+
+The runtime source confirms both halves. `lean_init_task_manager_using` (`src/runtime/object.cpp:1073`)
+is *entirely* inside `#if defined(LEAN_MULTI_THREAD)`, so with the macro off `g_task_manager` is
+permanently null. Task execution already copes — `lean_task_spawn_core` (l.1160), `lean_task_map_core`
+(l.1182) and `lean_task_bind_core` (l.1244) each take a `!g_task_manager` branch and run the continuation
+inline, as `lean_task_pure(apply_1(c, box(0)))`. The promise and IO paths do not:
+
+| `src/runtime/object.cpp` | with no task manager |
+| --- | --- |
+| `lean_promise_new` l.1281 | `lean_internal_panic` — "`IO.Promise.new` called before the task manager is running…" |
+| `lean_promise_resolve` l.1304, `deactivate_promise` l.1324 | dereference `g_task_manager` |
+| `lean_io_wait_any_core` l.1277, `lean_io_get_task_state_core` l.1270, `lean_io_cancel_core` l.1264 | dereference `g_task_manager` |
+
+**The work is the thing the comment names: a sequential task manager** — a task-manager object created
+when `LEAN_MULTI_THREAD` is off, which drains its queue inline at `wait_for`/`wait_any` instead of on
+worker threads. It is smaller than it sounds: the queue, the dependency graph and the priority handling
+in `task_manager` (l.729–1069) are orthogonal to *where* the drain happens, and only the drain has to
+become a call rather than a pool. With it, `lean_promise_new` stops panicking, `wait_any` has something
+to ask, and no call site needs an `#ifdef`.
+
+Two constraints to design around:
+
+- **It cannot be selected at runtime.** `get_lean_num_threads` (l.1082) reads `LEAN_NUM_THREADS` only
+  under `#ifndef LEAN_EMSCRIPTEN`, and otherwise returns `hardware_concurrency()` — on wasm the answer is
+  the device's core count with no environment override. The choice has to be made at build time.
+- **The artifact can report which kind it is once it boots**, and only once it boots:
+  `Internal.isMultiThread` (`src/Lean/Shell.lean:226`, extern `lean_internal_is_multi_thread`) exists
+  already. Before boot, the memory import flag is still the only signal — which is what §9.4 builds on.
+
+### 9.3 Blocker two: the `Init` import OOMs with nothing to drain it
+
+The other half of the same comment (l.176–180) is what decides whether the route is shippable:
+
+> Build with Emscripten pthreads. The single-threaded WASM build OOMs during the `Init` olean import
+> (upstream's async-const realization accumulates unboundedly with no worker threads to drain it); the
+> pthread build — like the native and the older 4.28 WASM builds — drains that work on real worker
+> threads. Requires cross-origin isolation (COOP/COEP) in the browser for SharedArrayBuffer.
+
+We did not reproduce this and cannot: it needs a build that does not exist. Two things follow regardless.
+It is a *memory* failure with a known shape — realization producing faster than a single thread retires
+it — so the sequential manager has to be drained *inside* the import loop, or the realization batched, and
+either way it is verified by importing the same 629-module `Init` closure the pthread build imports today
+(§5) and watching memory. And it is the reason the fork has not already shipped this: the flags are an
+afternoon, this is not.
+
+Worth recording, because it narrows the work: **the compile path is already single-thread-aware.** `Shell.lean`
+(l.124–130) elaborates with the synchronous `Frontend.processCommands` loop rather than
+`Elab.IO.processCommands` specifically because the latter "drives elaboration through the language-server
+snapshot/task infrastructure, which spawns elaboration tasks … In the single-threaded WASM worker those
+tasks are never drained, leaving the runtime in a state where the *next* `lean_wasm_compile` call fails
+immediately." So compiling is already task-free by construction; what is left is environment realization
+and import — §9.2 and this.
+
+### 9.4 What changes on this side, once an artifact exists
+
+None of it should be done before then: the current artifact needs its shared memory and its pool, and
+changing the runtime ahead of the build would only break the working path. Recorded here so the shape is
+agreed in advance.
+
+1. **`worker/lean-worker.js`, `pickMemory()`** — `shared: false`, and the `[2048, 1536, 1024, 768]` MB
+   step-down goes away with it: that ladder exists because a shared memory cannot grow, and an unshared
+   one can. Start around 256 MB and let `-sALLOW_MEMORY_GROWTH` do the rest. `MAX_PAGES` still has to stay
+   under whatever the module declares for its import — read that off the artifact as §2 does, and re-read
+   it whenever the pinned version moves.
+2. **`startLeanModule()`** — the blob-`lean.js` mechanism is pthread-specific: `mainScriptUrlOrBlob`
+   exists so the pool's sub-workers can load a same-origin script (§5). No sub-workers, no blob, no
+   `importScripts` indirection. `locateFile` keeps returning the wasm blob URL, because that part is about
+   serving the binary gzipped while keeping streaming compilation, not about threads.
+3. **`src/compiler.js`, `assertEnvironment()`** — the `SharedArrayBuffer` check becomes a property of the
+   *artifact* rather than a rule about the page. `loadWasmUrl` already holds the bytes, so the honest
+   check is "declares a shared memory import and there is no `SharedArrayBuffer` → throw with §2's
+   explanation". That keeps the pthread build's message exactly as it is, lets a single-threaded build
+   boot in the same document, and turns `serve.js --no-isolation` into a supported configuration instead
+   of a failure demo.
+4. **The page and the headers** — `public/_headers` and `serve.js`'s COOP/COEP are what this route
+   deletes. `main.js`'s isolation pill should stop reading "no SharedArrayBuffer" as a failure, and the
+   README's capability table gains its real fourth row: absent `SharedArrayBuffer`, boots anyway.
+5. **Assets** — a new `leanCommit` means a new core layer and a manifest pairing (§5), and a fresh mirror.
+   The wasm should come out *smaller* without TLS and atomics. `fetch-assets.mjs` already refuses to mix
+   builds, so the pairing check is in place.
+
+### 9.5 How to know it worked, and what was measured here
+
+The acceptance test is the one this spike has never been able to run: boot under
+`npm run start:no-isolation`, where `crossOriginIsolated === false` and `typeof SharedArrayBuffer ===
+'undefined'`, and run §4's table. A proof accepted in that document is the result. Then Firefox and
+Safari, which §6 records as never exercised — the payoff no Chrome-only escape hatch can give.
+
+Measured here, so whoever builds it knows what the failure modes look like (headless Chrome 155, a
+non-isolated document — `crossOriginIsolated: false`, `typeof SharedArrayBuffer: undefined`):
+
+| probe | result |
+| --- | --- |
+| `new WebAssembly.Memory({initial: 1024, maximum: 65536, shared: false})` | OK, 64 MiB — and `grow` works |
+| `structuredClone(unshared Memory)` / `postMessage({wasmMemory})` | `DataCloneError` |
+| `Atomics.load` on an unshared buffer | OK |
+| `Atomics.waitAsync` on an unshared buffer | `TypeError: … is not a shared typed array` |
+| the shipped module with its memory import patched to `flags 1` | validates — and a control module whose body runs `memory.atomic.notify` executes on an unshared memory |
+
+That last row is why the one-byte patch is not a shortcut. The module genuinely does not need the shared
+flag — but `PThread.initMainThread()` spawns its 4 workers eagerly and `postMessage({wasmMemory})` to
+each, so an unshared memory turns the pool into a `DataCloneError` on a `preRun` dependency and the boot
+*wedges* instead of degrading. Patching would mean neutering the glue as well, and it would still be
+leaning on V8 tolerating atomics on a non-shared memory, which the threads proposal says is invalid (the
+glue would also throw in `Atomics.waitAsync`, above). So the byte patch is a way to *demonstrate* that the
+shared flag is declarative; it is not a way to ship.
+
+### 9.6 Until then
+
+The current artifact cannot run without isolation, so §2's two escape hatches are the only options — and
+§2 needed one correction: **`Document-Isolation-Policy` is not a trial.** It shipped in Chrome 137 for
+desktop (`desktop_first: 137`, Android 146 planned; Safari's standards position is negative, Firefox's
+positive but unimplemented). It is a *response header on the frame*, so unlike COOP/COEP it asks nothing
+of the embedder, and it does what §2 hoped — verified here by serving a child frame with
+`Document-Isolation-Policy: isolate-and-require-corp` inside a parent that sends no isolation headers at
+all:
+
+```
+parent crossOriginIsolated: false          parent typeof SharedArrayBuffer: undefined
+child  crossOriginIsolated: true           child  typeof SharedArrayBuffer: function
+child  shared memory OK, 1048576 bytes
+```
+
+Two costs, both structural rather than temporary: it has to come from a real HTTP response, so a `srcdoc`
+or `blob:` frame has nowhere to put it; and an isolated frame loses **synchronous** DOM access to
+same-origin non-isolated frames — the parent's `contentWindow` read is blocked, exactly as the WICG
+explainer says — so the bridge has to be `postMessage`.
+
+That is a deployment that could ship Lean in LiveCodes in Chrome today. The single-threaded build is still
+the one that ends the question, and §9.2–9.3 are what it is waiting on.
