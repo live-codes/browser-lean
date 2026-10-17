@@ -48,15 +48,35 @@ cd wasm-build
 docker build -t lean4-wasm-single-threaded .
 
 # Variant 1: the flags only. This is expected to FAIL, and how it fails is the point.
-docker run --rm -v "$PWD/out:/out" lean4-wasm-single-threaded 1
+docker run --rm -v "$PWD/out:/out" -v "$PWD/cache:/cache" lean4-wasm-single-threaded 1
 
 # Variant 2: flags plus the sequential task manager. This is the one that should work.
-docker run --rm -v "$PWD/out:/out" lean4-wasm-single-threaded 2
+docker run --rm -v "$PWD/out:/out" -v "$PWD/cache:/cache" lean4-wasm-single-threaded 2
 ```
 
-Artifacts land in `out/<variant>/`. Each run finishes by reading the memory import out of the wasm it
-just built — `node verify-memory.mjs out/<variant>/lean.wasm`, using the runtime's own parser — so the
-first thing you see is either `unshared` or an explanation of why the artifact is not what was asked for.
+On Windows, give both mounts absolute paths and use `--mount` if the drive letter confuses the parser:
+
+```powershell
+docker run --rm --mount type=bind,source=D:/repo/wasm-build/out,target=/out `
+                --mount type=bind,source=D:/repo/wasm-build/cache,target=/cache `
+                lean4-wasm-single-threaded 2
+```
+
+**Mount `cache` — it is not optional in practice.** It holds the pinned fork and the cmake build tree, so
+a relink after a change to patch 0002 is minutes instead of another full build:
+
+```bash
+docker run --rm -v "$PWD/out:/out" -v "$PWD/cache:/cache" -e MAKE_TARGET=lean lean4-wasm-single-threaded 2
+```
+
+Each variant gets its own build directory (`build/wasm-1`, `build/wasm-2`), so switching between them does
+not reconfigure a tree the other one built. `-e EMSCRIPTEN_DEBUG=ON` adds a name section and assertions,
+which is worth the extra build when a wasm trap needs symbolising.
+
+Artifacts land in `out/<variant>/` — `lean.js`, `lean.wasm`, `olean/`, the resolved `LEAN_COMMIT`, and
+`applied.patch` (what the build actually applied, for provenance). Each run ends by telling you to read
+the memory import out of the wasm it just built, using the runtime's own parser, so the first thing you
+look at is either `unshared` or a statement of why the artifact is not what was asked for.
 
 ## Variant 1: the flags only — expected to fail, and why that is useful
 
