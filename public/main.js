@@ -177,6 +177,9 @@ async function ensureCompiler() {
     const created = await createCompiler({
       baseUrl,
       syntaxCheck: params.get('syntaxCheck') ?? 'auto',
+      // Reported as soon as it is known, so the pill says what the artifact needs even when that is what
+      // stops the boot.
+      onArtifact: showArtifact,
       onProgress: (message) => {
         setState({ stage: 'loading' });
         setStatus(message, 'busy');
@@ -252,6 +255,32 @@ async function run() {
   }
 }
 
+/**
+ * What this document can do. Only half the question: whether isolation is *required* is the artifact's
+ * declaration, which the runtime reads off the wasm before the boot, so this reports capability and the
+ * run reports the verdict (FINDINGS.md §9).
+ */
+function showCapability() {
+  const hasSAB = typeof SharedArrayBuffer !== 'undefined';
+  const isolated = self.crossOriginIsolated === true;
+  els.isolation.textContent = isolated
+    ? 'cross-origin isolated'
+    : hasSAB
+      ? 'SharedArrayBuffer, not isolated'
+      : 'no SharedArrayBuffer';
+  els.isolation.className = `pill ${hasSAB ? 'good' : 'bad'}`;
+  return { hasSAB, isolated };
+}
+
+/** Add the artifact's own answer to the pill, once the runtime has read it. */
+function showArtifact(artifact) {
+  const mode = artifact?.memory;
+  if (!mode || mode === 'unknown') return;
+  els.isolation.textContent += ` · ${mode} memory`;
+  els.isolation.className = `pill ${mode === 'shared' && !self.crossOriginIsolated ? 'bad' : 'good'}`;
+  setState({ artifact: mode });
+}
+
 function init() {
   EXAMPLES.forEach((example, index) => {
     const option = document.createElement('option');
@@ -285,27 +314,18 @@ function init() {
     }
   });
 
-  // The runtime needs a SharedArrayBuffer, which is what "cross-origin isolated" buys. The package
-  // throws with the same explanation; showing it up front saves a confusing first run.
-  const hasSAB = typeof SharedArrayBuffer !== 'undefined';
-  const isolated = self.crossOriginIsolated === true;
-
-  els.isolation.textContent = isolated
-    ? 'cross-origin isolated'
-    : hasSAB
-      ? 'SharedArrayBuffer, not isolated'
-      : 'no SharedArrayBuffer';
-  els.isolation.className = `pill ${hasSAB ? 'good' : 'bad'}`;
+  // Reporting the document's capability is not the same as reporting a failure: whether isolation is
+  // required is the artifact's declaration, and the runtime checks that before it downloads anything, so
+  // a run names the artifact and the remedy far better than a guess here could (FINDINGS.md §9).
+  const { hasSAB, isolated } = showCapability();
   els.payload.textContent = '~127 MB of assets';
 
   if (!hasSAB) {
     els.banner.className = 'show';
     els.banner.textContent =
-      'SharedArrayBuffer is unavailable, so the Lean runtime cannot boot. Serve the page with ' +
-      "COOP/COEP (npm start) — Lean needs a shared WebAssembly memory. An embedded page that cannot " +
-      "set those headers has only Chrome's reverse origin trial for SharedArrayBuffer, and that does " +
-      'not exist in Firefox or Safari.';
-    setStatus('SharedArrayBuffer required.', 'err');
+      'No SharedArrayBuffer in this document, so only a single-threaded Lean build can run here. The ' +
+      'artifact this repo mirrors is a pthread build and needs cross-origin isolation — serve the page ' +
+      'with `npm start`. A run will name the artifact and say so rather than failing obscurely.';
   }
 
   setState({

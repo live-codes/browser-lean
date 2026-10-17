@@ -7,6 +7,10 @@
   so without these the runtime cannot construct its memory and the page cannot boot at all. This is a
   measured requirement: lean.wasm imports a memory with limits flags 3 (has-max | shared).
 
+  They are for the artifact rather than for the page: the runtime reads that memory import off the wasm
+  before it boots, so a single-threaded build — one that declares an unshared memory — would need neither
+  header and neither would its consumers (FINDINGS.md §9).
+
   The other two are for the case this tree is also someone's asset CDN, which is how LiveCodes would
   consume it from another origin. They are not interchangeable:
     Access-Control-Allow-Origin  — for the fetch()ed binaries, oleans and layer packs

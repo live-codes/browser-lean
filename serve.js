@@ -2,18 +2,21 @@
  * A static server for this demo.
  *
  * It exists because `file://` cannot run ES modules or fetch the wasm assets, and
- * because the Lean runtime is a pthread build whose memory is declared `shared`:
- * `WebAssembly.Memory({ shared: true })` can only be constructed in a
- * cross-origin isolated document, so this server sets COOP/COEP.
+ * because the Lean artifact this repo mirrors is a pthread build whose memory is
+ * declared `shared`: `WebAssembly.Memory({ shared: true })` can only be
+ * constructed in a cross-origin isolated document, so this server sets COOP/COEP.
  *
- * That is a measured requirement, not a guess — `lean.wasm` imports a memory with
- * limits flags `3` (has-max | shared), min 256 pages, max 32768 pages. See
- * FINDINGS.md §2 for how that was read off the artifact.
+ * That is a measured requirement, not a guess — the pinned `lean.wasm` imports a
+ * memory with limits flags `3` (has-max | shared), min 1024 pages, max 65536. See
+ * FINDINGS.md §2 for how that was read off the artifact, and §9 for the build that
+ * would need none of it: the runtime reads the requirement off the artifact, so
+ * these headers are for the artifact rather than for the page.
  *
  *   node serve.js [port] [root] [--no-isolation] [--spa-fallback]
  *
  * `root` defaults to `public/` and is resolved against this file.
- * `--no-isolation` omits COOP/COEP, which is how the isolation failure is reproduced.
+ * `--no-isolation` omits COOP/COEP, which is how the isolation failure is reproduced
+ * for a shared-memory artifact — and how a single-threaded build would be served.
  * `--spa-fallback` answers a missing file with `index.html` and a `200`, the way
  * Cloudflare Pages does when it has a fallback configured. That is not an obscure
  * host quirk to tolerate: it is what made a broken import look like a successful
@@ -111,10 +114,11 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log(`browser-lean: http://localhost:${PORT}/`);
   console.log(
-    `serving ${ROOT} — cross-origin isolation ${noIsolation ? 'OFF (--no-isolation)' : 'ON (required)'}`,
+    `serving ${ROOT} — cross-origin isolation ${noIsolation ? 'OFF (--no-isolation)' : 'ON'}`,
   );
   if (noIsolation) {
-    console.log('note: Lean cannot boot without COOP/COEP — this mode is only for showing the failure');
+    console.log('note: the artifact mirrored here is a pthread build and will refuse to start without');
+    console.log('      COOP/COEP — this mode is for showing that failure, and for a single-threaded build');
   }
   console.log('the Lean artifacts are mirrored locally — run `npm run assets` first (~127 MB)');
   console.log('press Ctrl+C to stop');

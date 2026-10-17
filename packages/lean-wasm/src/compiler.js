@@ -87,6 +87,9 @@ function describeMemory(artifact) {
  *   `full` always parses, loading Lean and Std if needed (~350 MiB); `off` never parses.
  * @param {(message: string) => void} [options.onProgress] - human-readable progress, for a spinner.
  * @param {(message: string) => void} [options.onStatus] - the wasm build's own status lines.
+ * @param {(artifact: object) => void} [options.onArtifact] - called once the artifact's memory mode is
+ *   known, before the boot and before the cross-origin-isolation gate — so a caller can report what the
+ *   artifact needs even when it is what stops the boot. Same shape as the returned `artifact`.
  * @returns {Promise<{language: string, assets: object, artifact: object, run: Function, dispose: Function}>}
  */
 export async function createCompiler(options = {}) {
@@ -103,6 +106,15 @@ export async function createCompiler(options = {}) {
 	// What the artifact declares, read from the first ~64 KiB of it rather than the whole 96.17 MiB, so a
 	// document that cannot run the runtime finds that out before paying for the runtime (FINDINGS.md §2).
 	const artifact = await probeArtifactMemory(assets.assetBase);
+	const description = {
+		memory: artifact?.mode ?? 'unknown',
+		limits: artifact?.memory ?? null,
+		url: artifact?.url ?? null
+	};
+	// Reported before the gate rather than with the result, because it is known before the gate and it is
+	// the thing the gate is about — a caller showing it should not have to wait for a successful boot to
+	// learn what an unsuccessful one was missing.
+	options.onArtifact?.(description);
 	assertArtifactCanRun(artifact);
 	options.onProgress?.(describeMemory(artifact));
 
@@ -206,11 +218,7 @@ export async function createCompiler(options = {}) {
 		 * needs cross-origin isolation: `memory` is `'shared'`, `'unshared'`, or `'unknown'` when the probe
 		 * could not read it, and `limits` is the import's page bounds (FINDINGS.md §2 and §9).
 		 */
-		artifact: {
-			memory: artifact?.mode ?? 'unknown',
-			limits: artifact?.memory ?? null,
-			url: artifact?.url ?? null
-		},
+		artifact: description,
 
 		/**
 		 * Compile and check a program.

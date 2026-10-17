@@ -733,33 +733,56 @@ tasks are never drained, leaving the runtime in a state where the *next* `lean_w
 immediately." So compiling is already task-free by construction; what is left is environment realization
 and import — §9.2 and this.
 
-### 9.4 What changes on this side, once an artifact exists
+### 9.4 What changed on this side
 
-None of it should be done before then: the current artifact needs its shared memory and its pool, and
-changing the runtime ahead of the build would only break the working path. Recorded here so the shape is
-agreed in advance.
+The runtime no longer assumes a shared memory; it asks the artifact. That work is done and verified
+against the pthread build, and it is what makes the build in §9.1–9.3 usable the day it exists — nothing
+here waits on the artifact, and the pthread path is untouched.
 
-1. **`worker/lean-worker.js`, `pickMemory()`** — `shared: false`, and the `[2048, 1536, 1024, 768]` MB
-   step-down goes away with it: that ladder exists because a shared memory cannot grow, and an unshared
-   one can. Start around 256 MB and let `-sALLOW_MEMORY_GROWTH` do the rest. `MAX_PAGES` still has to stay
-   under whatever the module declares for its import — read that off the artifact as §2 does, and re-read
-   it whenever the pinned version moves.
-2. **`startLeanModule()`** — the blob-`lean.js` mechanism is pthread-specific: `mainScriptUrlOrBlob`
-   exists so the pool's sub-workers can load a same-origin script (§5). No sub-workers, no blob, no
-   `importScripts` indirection. `locateFile` keeps returning the wasm blob URL, because that part is about
-   serving the binary gzipped while keeping streaming compilation, not about threads.
-3. **`src/compiler.js`, `assertEnvironment()`** — the `SharedArrayBuffer` check becomes a property of the
-   *artifact* rather than a rule about the page. `loadWasmUrl` already holds the bytes, so the honest
-   check is "declares a shared memory import and there is no `SharedArrayBuffer` → throw with §2's
-   explanation". That keeps the pthread build's message exactly as it is, lets a single-threaded build
-   boot in the same document, and turns `serve.js --no-isolation` into a supported configuration instead
-   of a failure demo.
-4. **The page and the headers** — `public/_headers` and `serve.js`'s COOP/COEP are what this route
-   deletes. `main.js`'s isolation pill should stop reading "no SharedArrayBuffer" as a failure, and the
-   README's capability table gains its real fourth row: absent `SharedArrayBuffer`, boots anyway.
-5. **Assets** — a new `leanCommit` means a new core layer and a manifest pairing (§5), and a fresh mirror.
-   The wasm should come out *smaller* without TLS and atomics. `fetch-assets.mjs` already refuses to mix
-   builds, so the pairing check is in place.
+1. **The probe — `src/artifact-probe.js`** — reads the memory import out of the artifact before the boot.
+   Not in the original list, because the requirement had never been separated from the artifact: a
+   `SharedArrayBuffer` check in the compiler is really a question about the wasm, and once it is asked
+   properly it is both artifact-correct and cheap. Two mechanisms, chosen so a plain static host needs to
+   do nothing special: **no `Range` request** (the ordinary response body is read and the reader cancelled
+   once it has enough — `serve.js` here ignores `Range`, Cloudflare Pages honours it), and **a partial
+   gunzip**, because `DecompressionStream` inflates a prefix of a gzip stream and then ends in an error
+   that is expected rather than a failure. Measured: **65,536 bytes** off the wire for the pinned
+   artifact, against 17,335,349 for the whole gzipped file. The budget is one number plus a conservative
+   4× compression assumption, and everything fails soft to `unknown` — a 404, and the SPA-fallback host
+   that answers `200` with HTML (§5), both read as unknown rather than as a memory.
+2. **`worker/lean-worker.js`, `pickMemory()`** — unchanged for a shared artifact, and skipped entirely
+   for an unshared one. The step-down ladder stays for the pthread build (a shared memory cannot grow);
+   an unshared artifact is left to Emscripten, which already knows the limits it was built with and *can*
+   grow the memory. The declared maximum is now a ceiling and the declared minimum a floor, so §2's
+   `LinkError` — our 65536-page maximum against an older build's declared 32768 — can no longer be
+   produced at all.
+3. **`startLeanModule()`** — `mainScriptUrlOrBlob` is set only for a threaded build, since only that
+   build spawns sub-workers that must load the script same-origin. The `lean.js` blob stays for both:
+   it is how the script is evaluated in the worker at all, and it keeps a cross-origin boot from needing
+   `Cross-Origin-Resource-Policy` (§5). That is a correction to the original plan, which assumed the blob
+   was pthread-only.
+4. **`src/compiler.js`** — the `SharedArrayBuffer` check is now a check on the artifact's declaration,
+   and an artifact the probe could not read is deliberately *not* treated as shared: the boot will fail
+   with its own explanation a moment later, and refusing to start on that basis would block a
+   single-threaded build for a reason that has nothing to do with it. The compiler also exposes
+   `artifact: {memory, limits, url}`, which is what the page's pill now reports.
+5. **Assets** — still open, and only needed once an artifact exists: a new `leanCommit` means a new core
+   layer and a manifest pairing (§5), and a fresh mirror. The wasm should come out *smaller* without TLS
+   and atomics. `fetch-assets.mjs` already refuses to mix builds, so the pairing check is in place.
+
+Verified in headless Chrome, three ways — the second and third are new behaviour, and the third is the
+one that matters:
+
+| | `SharedArrayBuffer` | result |
+| --- | --- | --- |
+| pthread artifact (`npm start`) | present, isolated | boots, proof accepted; `initMs 5768`, `runMs 954`. The log gains `artifact: shared memory (min 1024 pages, max 65536 pages)` and `shared memory: 2048 MB (max 65536 pages)` |
+| pthread artifact, `--no-isolation` | absent | refuses, naming the artifact and both remedies, **before the boot**: a host instrumented to count bytes reports **720,896 of 17,335,349** written before the abort landed. The client read 64 KiB and cancelled; the 16.5 MiB artifact was never fetched |
+| an **unshared** artifact, `--no-isolation` | absent | **passes the gate and proceeds into the boot** — the log reads `artifact: unshared memory (min 256 pages, max 32768 pages) — no cross-origin isolation needed`, and no `SharedArrayBuffer` is involved anywhere. (It then fails on the rest of the synthetic host it was pointed at, which has no library — that host is the stand-in for the artifact this is all for) |
+
+The 720,896-byte figure is worth keeping: it is server-side bytes handed to the socket before the client's
+cancel arrived, not bytes the client used, and it is the honest number for "downloads nothing" when the
+response is streamed — 0.7 MB of 16.5 MiB rather than zero. The third row is the acceptance test for the
+route, run against a synthetic artifact because the real one does not exist yet.
 
 ### 9.5 How to know it worked, and what was measured here
 
