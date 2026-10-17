@@ -103,8 +103,13 @@ how much work the realization does. So the answer is not a flag:
   `lean_wasm_load_snapshot` is exported by this artifact, upstream ships `snapshots/init.snap` for exactly
   this, and its `Shell.lean` says a snapshot "skips the multi-minute `loadExts` import entirely". This is
   the lever, and it is upstream's own.
-- **Or let threads do it**: the pthread build imports in 1.22 s, and on Chrome it already boots without
-  cross-origin isolation (measured, §9.7).
+- **Or let threads do it, at the price of isolation**: the pthread build imports in 1.22 s — but it does
+  **not** boot without cross-origin isolation. Measured: the pinned artifact in a non-isolated page stalls
+  (`Starting the Lean runtime timed out after 120s`), because Emscripten's glue gates threading on the
+  `SharedArrayBuffer` *global*, which such a document does not have, even though Chrome 155 will construct a
+  shared wasm memory without isolation. An earlier claim here said the opposite and was not tested;
+  FINDINGS.md §9.7 now records the correction. This is why the single-threaded build is the only one that
+  runs headerless at all, and why its import has to be paid or skipped.
 - Warming `Init` at page load remains worth doing either way: it spends the time while the reader reads
   instead of after they click Run.
 

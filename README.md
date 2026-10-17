@@ -248,9 +248,11 @@ was a Chrome-only one ([FINDINGS.md](FINDINGS.md) §2). That is no longer the bl
   ([FINDINGS.md](FINDINGS.md) §9.7).
 - **The runtime already handles both artifacts** and decides from the wasm itself, so the same page serves
   either with no configuration.
-- **On Chrome 155 the pthread build boots without isolation as well**, because a shared *wasm* memory no
-  longer requires it even though the `SharedArrayBuffer` constructor still does. Treat that as
-  version-specific until it is established on purpose.
+- **The pthread build still needs isolation**, whatever Chrome 155 will do with a shared memory: measured,
+  a non-isolated page stalls it (`Starting the Lean runtime timed out after 120s`), because Emscripten's glue
+  gates threading on the `SharedArrayBuffer` *global*. So the single-threaded build is the only one that runs
+  headerless at all — and its ~100 s `Init` import is the cost that has to be paid or skipped
+  ([FINDINGS.md](FINDINGS.md) §9.7).
 
 What is left before a `lean` language is not a wall but work: host an artifact and the library trees it
 produces, exercise Firefox and Safari (never done, and the atomic-instruction question lives there), and

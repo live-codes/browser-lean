@@ -890,13 +890,17 @@ new SharedArrayBuffer(8):                      ReferenceError — SharedArrayBuf
 new WebAssembly.Memory({shared:true}):         OK, buffer=65536
 ```
 
-§2 concluded that a shared memory implies cross-origin isolation because the constructor is gated. That
-implication no longer holds for wasm memories on this engine, and it was load-bearing: the runtime's gate
-refused on it. The gate now probes the operation the runtime actually performs — constructing the memory —
-rather than the presence of the constructor, so where the engine allows it, the **pthread** build boots
-without isolation too. Whether this is a deliberate Chrome relaxation, an origin-trial-era remnant, or a
-V8 leniency is worth establishing before relying on it; §9.5 already records that V8 is loose about the
-atomics rule, so "V8 permits it" is not a promise.
+§2 concluded that a shared memory implies cross-origin isolation because the constructor is gated. For wasm
+memories on this engine that implication no longer holds, and it was load-bearing: the runtime's gate refused
+on it, so the gate now probes the operation the runtime actually performs — constructing the memory. **But
+that does not make the pthread artifact runnable without isolation, and the first pass here claimed it did
+without testing it.** Measured: the pinned pthread artifact in a non-isolated page does not boot at all — the
+worker stalls and the runtime reports `Starting the Lean runtime timed out after 120s`. The reason is that
+Emscripten's glue gates its own threading on the `SharedArrayBuffer` *global* (`_emscripten_has_threading_support
+= () => !!globalThis.SharedArrayBuffer`), which a non-isolated document does not have, so the pthread task
+manager wedges no matter what the memory constructor permits. §2 was right for the artifact; only the
+*inference from the constructor* was wrong. Which leaves the single-threaded build as the only one that runs
+without isolation, and its ~100 s import as a cost that has to be paid or skipped.
 
 **The cost is in the first compile, and it is large: 54 seconds.** Boot is *faster* than the pthread build
 (3.4 s against 5.1–5.8 s, with no worker pool to pre-spawn), but the first `Run` on this build took
