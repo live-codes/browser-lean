@@ -127,18 +127,27 @@ valid against the saving binary's function table — so a native `lean` cannot d
   `LEAN_PATH=/lib/lean` with cwd `/work`, all verified from inside `preRun`.
 - **Then `lean --incr-header-save` fails with `errno=44` — Emscripten's `ENOENT` — carrying no path, no
   message and no stack.** It is not an Emscripten FS call: every FS entry point is wrapped to name the
-  operation and path, and none of them failed. So it is an IO error from Lean's own CLI startup, and the
-  next step is tracing it at that level (or running the same CLI under the *pthread* artifact to see whether
-  it is this build or CLI-under-Node in general).
+  operation and path, and none of them failed. So it is an IO error from Lean's own CLI startup.
+- **And it is not this build.** Running **upstream's own deployed pthread artifact** through the same
+  driver fails *identically* — mounts verified, `lean_main entered`, then the same pathless `ENOENT`, and
+  again with no FS call failing. So the blocker is CLI-under-Node, not single-threaded-ness, and the
+  single-threaded build is not implicated. `--stack-size=8192`, which upstream's invocation has and mine
+  lacked, changes nothing.
 
-**A second route is open, and it avoids the problem entirely**: `lean_shell_main` is **exported**
-(`Shell.lean:640`), and there is no exported *save*, so saving is CLI-only — but a worker can call
-`lean_shell_main` itself, with `--incr-header-save=/work/init.snap`. That means a **bake mode in the
-browser**: run the CLI once in a throwaway worker (it exits the runtime, which is why it cannot be the
-runtime worker), read `init.snap` out of MEMFS, and download it. ~100 s once, on machinery already proven in
-the browser, and none of the Node-side unknowns.
+Two things about running a pthread artifact this way, both worth knowing: its sub-workers load `lean.js`
+from a path, so if that path sits inside a package whose `package.json` says `"type": "module"` Node
+resolves the glue as ESM and it dies on `require is not defined` — upstream's driver assumes a CJS project;
+and NODEFS will not mount a Windows **junction** as its root, answering ENOENT for everything beneath it,
+which is why `BAKE_LIB_ROOT` exists instead of symlinking a library tree.
 
-Either way the load side is small: fetch `snapshots/init.snap`, write it into the FS, and call
+**So the browser route is the one to take.** `lean_shell_main` is **exported** (`Shell.lean:640`) and there
+is no exported *save*, so saving is CLI-only — but a worker can call that CLI itself, with
+`--incr-header-save=/work/init.snap`. That means a **bake mode in the browser**: run the CLI once in a
+throwaway worker (it exits the runtime, which is why it cannot be the runtime worker), read `init.snap` out
+of MEMFS, and download it. ~100 s once, on machinery already proven in the browser, and none of these
+Node-side unknowns.
+
+The load side is small either way: fetch `snapshots/init.snap`, write it into the FS, and call
 `_lean_wasm_load_snapshot(path)` before the module is declared ready — the export and the cache-key
 semantics are already in the fork.
 

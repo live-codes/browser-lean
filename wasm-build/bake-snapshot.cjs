@@ -32,7 +32,11 @@ if (!outDir || !workDir) {
 }
 
 const leanJs = path.resolve(outDir, 'lean.js');
-const libLean = path.resolve(outDir, 'olean');
+// The library tree defaults to `<out-dir>/olean`, but `BAKE_LIB_ROOT` overrides it — which is how a
+// *pthread* artifact is tested against the single-threaded build's oleans without copying 2.2 GB. (NODEFS
+// will not mount a Windows **junction** as its root: it answers ENOENT for everything, which is why the
+// override exists rather than a symlink.)
+const libLean = path.resolve(process.env.BAKE_LIB_ROOT ?? path.join(outDir, 'olean'));
 const realWork = path.resolve(workDir);
 if (!fs.existsSync(leanJs)) throw new Error(`${leanJs} not found`);
 if (!fs.existsSync(libLean)) throw new Error(`${libLean} not found — the library tree was not copied out (drop SKIP_OLEAN_COPY)`);
@@ -47,11 +51,22 @@ process.chdir('/');
 // `/lib/lean` as its sysroot instead of stat-ing a host path inside MEMFS.
 process.argv[1] = '/bin/lean';
 
+const memoryMb = process.env.BAKE_MEMORY_MB ? Number(process.env.BAKE_MEMORY_MB) : null;
+
 globalThis.Module = {
 	arguments: [`--incr-header-save=/work/${name}.snap`, '/work/probe.lean'],
-	// No `wasmMemory`/`INITIAL_MEMORY`: this artifact **defines** its memory (a `-sMAIN_MODULE=2` module
-	// with no pthreads), so there is nothing for the embedder to construct — unlike upstream's pthread
-	// build, whose driver has to hand over a shared buffer.
+	// No `wasmMemory`/`INITIAL_MEMORY` for this artifact: it **defines** its memory (a `-sMAIN_MODULE=2`
+	// module with no pthreads), so there is nothing for the embedder to construct — unlike upstream's
+	// pthread build, whose driver hands over a shared buffer. `BAKE_MEMORY_MB` supplies one for testing a
+	// pthread artifact through this same driver, which is how we tell "CLI under Node does not work" apart
+	// from "this build's CLI does not work".
+	...(memoryMb === null ? {} : {
+		wasmMemory: new WebAssembly.Memory({ initial: (memoryMb * 1024 * 1024) / 65536, maximum: 65536, shared: true }),
+		INITIAL_MEMORY: memoryMb * 1024 * 1024
+	}),
+	// Only a pthread build needs this — its thread pool loads the script in sub-workers, and a worker
+	// script must be a URL or a path the runtime can load. A single-threaded artifact ignores the key.
+	mainScriptUrlOrBlob: leanJs,
 	locateFile: (file) => path.join(path.dirname(leanJs), file),
 	preRun: [function () {
 		const FS = Module.FS;
