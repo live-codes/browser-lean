@@ -143,6 +143,19 @@ async function gunzip(bytes) {
 }
 
 /**
+ * `fetch` reports a network failure as a bare `TypeError: Failed to fetch`, which says nothing about which
+ * of several URLs it was — and this worker fetches several. Naming the URL here is the difference between
+ * a five-second diagnosis and an afternoon.
+ */
+async function fetchOrThrow(url) {
+  try {
+    return await fetch(url);
+  } catch (error) {
+    throw new Error(`${url}: ${error && error.name ? error.name + ' — ' : ''}${(error && error.message) || error}`);
+  }
+}
+
+/**
  * Fetch the wasm module here rather than leaving it to Emscripten, so a host can store it
  * **compressed**. Cloudflare Pages refuses files over 25 MiB and this one is 96.2 MiB raw — 16.5 MiB
  * gzipped, which is what makes a plain static host (Pages included) able to serve it at all.
@@ -164,7 +177,7 @@ async function loadWasmUrl() {
   if (wasmBlobUrl) return wasmBlobUrl;
 
   for (const candidate of [`${assetBase}/lean.wasm.gz`, `${assetBase}/lean.wasm`]) {
-    const response = await fetch(candidate);
+    const response = await fetchOrThrow(candidate);
     if (response.status === 404) continue;
     if (!response.ok) throw new Error(`${candidate}: HTTP ${response.status}`);
 
@@ -519,6 +532,9 @@ async function startLeanModule() {
     },
   };
 
+  // Three separate steps, reported separately. Wrapping all of them in one `catch` that said "Failed to
+  // load lean.js" made a failure to fetch the 97 MB wasm look like a failure to fetch the 48 MB script —
+  // both fetched from the same base, and the message named only one of them.
   try {
     // Fetch lean.js ourselves and hand it to the runtime as a **same-origin blob**.
     //
@@ -529,19 +545,31 @@ async function startLeanModule() {
     // "the script at … failed to load" — with every other asset fetching fine, which
     // points at the wrong thing entirely. A blob URL is same-origin, and is what
     // `mainScriptUrlOrBlob` exists for.
-    const response = await fetch(`${assetBase}/lean.js${assetQ}`);
+    const response = await fetchOrThrow(`${assetBase}/lean.js${assetQ}`);
     if (!response.ok) throw new Error(`HTTP ${response.status} fetching lean.js`);
     const source = await response.text();
     // Kept for the lifetime of the runtime: pthread sub-workers load it lazily.
     mainScriptBlob = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     if (artifactIsThreaded) Module.mainScriptUrlOrBlob = mainScriptBlob;
+  } catch (err) {
+    post({ type: 'error', data: 'Failed to load lean.js: ' + ((err && err.message) || err) });
+    return;
+  }
+
+  try {
     // Emscripten and every pthread sub-worker instantiate from this same blob URL.
     await loadWasmUrl();
+  } catch (err) {
+    post({ type: 'error', data: 'Failed to fetch the Lean runtime: ' + ((err && err.message) || err) });
+    return;
+  }
+
+  try {
     // The blob is how lean.js is evaluated here at all — a threaded build additionally needs it to be
     // same-origin for its sub-workers, which a bare `importScripts` of a CDN URL would not be.
     importScripts(mainScriptBlob);
   } catch (err) {
-    post({ type: 'error', data: 'Failed to load lean.js: ' + ((err && err.message) || err) });
+    post({ type: 'error', data: 'Failed to evaluate lean.js: ' + ((err && err.message) || err) });
   }
 }
 

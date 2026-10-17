@@ -56,12 +56,12 @@ SharedArrayBuffer — which a document only has when it is cross-origin isolated
 and it does so before the boot: the memory import is read out of the first 64 KiB of the artifact, so the
 16.5 MiB of wasm is never fetched.
 
-That requirement is real, not a misdiagnosis — but it belongs to the artifact rather than to the page,
-and the runtime now reads which it is off the wasm. `lean.wasm` imports a WebAssembly memory with limits
-flags `3` — `has-max | shared` — min 1024 pages, max 65536 pages (4 GiB). A `shared` memory can only be
-constructed with a `SharedArrayBuffer`, which browsers expose only to a cross-origin isolated document.
-A build that declares an unshared memory needs none of it, and the same page will serve it — which is
-the whole point of [FINDINGS.md](FINDINGS.md) §9.
+That requirement is real, not a misdiagnosis — but it belongs to the artifact rather than to the page, and
+the runtime reads which it is off the wasm. This build's `lean.wasm` imports (or, in the single-threaded
+case, defines) a memory whose limits flags decide everything: `flags 3` is `has-max | shared`, and a shared
+memory is what isolation buys. **The unshared build is no longer hypothetical** —
+[`wasm-build/`](wasm-build/) produces it, and the demo accepts proofs on it in a document with no
+isolation at all ([FINDINGS.md](FINDINGS.md) §9.7).
 
 **Chrome has two escape hatches that skip the headers entirely**: a reverse origin trial for
 `SharedArrayBuffer` that has already been extended more than once and sits on a deprecation path, and
@@ -236,30 +236,26 @@ for Std/Lean/Batteries, `npm run assets:mathlib` for Mathlib. See [FINDINGS.md](
 - **~127 MiB of mirrored assets** (≈47 MB over the wire), fetched once.
 - **Chrome only, as tested.** Safari, Firefox and mobile were not exercised.
 
-## Not yet a LiveCodes language
+## Closer to a LiveCodes language
 
-Much better positioned than earlier attempts, but not shippable as-is, for one reason — and it is a
-trade-off rather than a wall.
+The reason this was not shippable has changed, and it is worth restating because the earlier conclusion was
+correct at the time. A LiveCodes result page runs in a sandboxed iframe inside *someone else's* document and
+cannot give itself COOP/COEP, which ruled out any runtime that needs cross-origin isolation; the only escape
+was a Chrome-only one ([FINDINGS.md](FINDINGS.md) §2). That is no longer the blocker:
 
-A LiveCodes result page runs in a sandboxed iframe inside *someone else's* document, and cross-origin
-isolation is inherited from the top-level document, so it cannot give itself COOP/COEP. On any browser
-other than Chrome this runtime therefore has no `SharedArrayBuffer` and cannot start. Chrome-only
-escape hatches exist (the reverse origin trial for `SharedArrayBuffer`, or `Document-Isolation-Policy`,
-which has shipped in Chrome 137 desktop and — unlike COOP/COEP — applies per frame, so the embedder
-needs to do nothing), so Lean *could* ship behind one of them. Neither helps Firefox or Safari, which is
-what makes it a stopgap rather than an answer. Two ways forward, in preference order:
+- **A single-threaded build exists** — [`wasm-build/`](wasm-build/) builds it, its memory is unshared
+  (`flags=1, shared=false`), and this page accepts proofs on it in a document that is not isolated at all
+  ([FINDINGS.md](FINDINGS.md) §9.7).
+- **The runtime already handles both artifacts** and decides from the wasm itself, so the same page serves
+  either with no configuration.
+- **On Chrome 155 the pthread build boots without isolation as well**, because a shared *wasm* memory no
+  longer requires it even though the `SharedArrayBuffer` constructor still does. Treat that as
+  version-specific until it is established on purpose.
 
-1. **A single-threaded Lean wasm build.** No isolation, no trial, works everywhere, and removes the
-   question entirely — but it is not a flag flip. [FINDINGS.md](FINDINGS.md) §9 has the recipe and the two
-   upstream blockers: a sequential task manager, and an `Init`-import allocation with no thread pool to
-   drain it.
-2. **Ship Chrome-only behind the origin trial**, keeping the feature detection the page already has:
-   where `SharedArrayBuffer` is missing, the language should say so plainly rather than fail obscurely.
-
-Everything else is now in place: a single long-lived Worker per page, ~0.3 s compiles, `#eval` of
-library functions working, and static assets that can be hosted anywhere. [FINDINGS.md](FINDINGS.md)
-§7 has the `lang-lean` shape that would follow. The driver it would need is no longer hypothetical: it
-is the package below, and the demo in this repo already runs on it.
+What is left before a `lean` language is not a wall but work: host an artifact and the library trees it
+produces, exercise Firefox and Safari (never done, and the atomic-instruction question lives there), and
+choose between the two artifacts — the single-threaded one costs 54 s on its first compile, the pthread one
+still needs isolation on engines that insist on it.
 
 ## npm package
 
@@ -384,14 +380,17 @@ makes this look the opposite of what it is, in [FINDINGS.md](FINDINGS.md) §5.
 
 ## Status
 
-Spike complete. The page runs Lean 4 client-side, verified end to end in headless Chrome for
-accepted proofs, rejected proofs and library `#eval`, with the isolation failure reproduced and the
-silent-parse-failure gap characterised. Not yet suitable as a LiveCodes language, for the one
-measured reason above.
+Spike complete, and the isolation problem is solved rather than worked around. [`wasm-build/`](wasm-build/)
+builds a single-threaded Lean wasm whose memory is unshared, and this page runs a proof on it **in a document
+with no cross-origin isolation and no `SharedArrayBuffer`** — `crossOriginIsolated: false`, `exitCode 0`,
+boot in 3.4 s ([FINDINGS.md](FINDINGS.md) §9.7). The page serves either artifact without configuration,
+because the runtime reads the requirement off the wasm before it boots.
 
-Next: the two pieces of upstream Lean work a single-threaded build needs ([FINDINGS.md](FINDINGS.md) §9) —
-the harness for which now exists in [`wasm-build/`](wasm-build/) — and mirroring the artifacts somewhere
-we control.
+What is left is deployment rather than a wall: publishing ~127 MB per variant, re-mirroring the library
+trees the new build produces (its `Init` closure packs to the same 629 modules / 30.7 MB as the layer
+upstream ships), the 54-second first compile a single-threaded build pays for the `Init` import, and knowing
+whether Firefox and Safari accept a module with an unshared memory that may still carry atomic instructions
+— neither has been exercised.
 
 ## License
 

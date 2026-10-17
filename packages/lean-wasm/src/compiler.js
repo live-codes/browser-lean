@@ -35,14 +35,37 @@ function assertEnvironment() {
 }
 
 /**
+ * Whether this document can have the shared memory the runtime needs.
+ *
+ * This asks the engine to *do* the thing rather than inspecting `SharedArrayBuffer`, and that is a
+ * correction: FINDINGS.md §2 concluded that a shared memory implies cross-origin isolation because the
+ * `SharedArrayBuffer` constructor is only exposed to an isolated document. Measured in Chrome 155, that
+ * implication no longer holds for **wasm** memories — in a document with `crossOriginIsolated: false` and
+ * `typeof SharedArrayBuffer === 'undefined'`, `new SharedArrayBuffer(8)` throws a `ReferenceError` while
+ * `new WebAssembly.Memory({initial: 1, maximum: 2, shared: true})` succeeds and returns a 65536-byte
+ * buffer. The runtime constructs a shared memory, so that is the operation to probe, and on this engine
+ * the pthread build boots without any isolation at all.
+ *
+ * @returns {boolean}
+ */
+function canHaveSharedMemory() {
+	try {
+		new WebAssembly.Memory({ initial: 1, maximum: 2, shared: true });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Whether this document can boot this artifact.
  *
- * The requirement belongs to the artifact rather than to the package. A `shared` memory import needs
- * `SharedArrayBuffer`, which a document only has when it is cross-origin isolated; a single-threaded
- * build declares an unshared memory and needs none of it (FINDINGS.md §9). Checking the declaration is
- * what lets one build of this package serve both.
+ * The requirement belongs to the artifact rather than to the package. A `shared` memory import needs a
+ * shared WebAssembly memory; an unshared one needs nothing at all (FINDINGS.md §9). Checking the
+ * declaration is what lets one build of this package serve both, and checking the *capability* rather
+ * than the constructor is what keeps the pthread build working on an engine that has relaxed the rule.
  *
- * An unreadable artifact is deliberately *not* treated as a shared one. A failed probe means this host
+ * An unreadable artifact is deliberately *not* treated as a shared one. A failed probe means the host
  * does not answer the way the boot expects, and the boot will fail with its own explanation a moment
  * later; refusing to start on that basis would block a single-threaded build for a reason that has
  * nothing to do with it.
@@ -50,16 +73,15 @@ function assertEnvironment() {
  * @param {null|{mode: string, url: string}} artifact - the probe's result.
  */
 function assertArtifactCanRun(artifact) {
-	if (typeof SharedArrayBuffer !== 'undefined') return;
 	if (artifact?.mode !== 'shared') return;
+	if (canHaveSharedMemory()) return;
 
 	throw new Error(
-		`The Lean artifact at ${artifact.url} declares a shared WebAssembly memory, so it needs ` +
-			'SharedArrayBuffer — which a document only has when it is cross-origin isolated. Serve the page ' +
-			'with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` ' +
-			'(or `credentialless`); an embed that cannot set those headers can isolate its own frame with ' +
-			'`Document-Isolation-Policy: isolate-and-require-corp` instead. A single-threaded Lean build ' +
-			'would need none of this — see FINDINGS.md §2 and §9.'
+		`The Lean artifact at ${artifact.url} declares a shared WebAssembly memory, and this browser will ` +
+			'not construct one here. Serve the page with `Cross-Origin-Opener-Policy: same-origin` and ' +
+			'`Cross-Origin-Embedder-Policy: require-corp` (or `credentialless`); an embed that cannot set ' +
+			'those headers can isolate its own frame with `Document-Isolation-Policy: isolate-and-require-corp` ' +
+			'instead. A single-threaded Lean build would need none of this — see FINDINGS.md §2 and §9.'
 	);
 }
 
@@ -118,10 +140,16 @@ export async function createCompiler(options = {}) {
 	assertArtifactCanRun(artifact);
 	options.onProgress?.(describeMemory(artifact));
 
+	// The worker needs the decision, not just the limits: `mode` is what tells it whether it has to
+	// construct the memory at all. Passing the raw descriptor instead leaves `mode` undefined, which reads
+	// as "threaded" and had the worker build a 2 GB *shared* memory — and point `mainScriptUrlOrBlob` at a
+	// cross-origin script — for an artifact that defines its own unshared memory.
+	const declared = artifact ? { mode: artifact.mode, ...artifact.memory } : null;
+
 	const runtime = createRuntime({
 		assetBase: assets.assetBase,
 		libBase: assets.libBase,
-		memory: artifact?.memory ?? null,
+		memory: declared,
 		onProgress: options.onProgress,
 		onStatus: options.onStatus
 	});

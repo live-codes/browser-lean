@@ -43,25 +43,38 @@ function take(chunks, limit) {
 }
 
 /**
- * Read `limit` bytes of a response body and stop the transfer.
+ * Read enough of a response body to find the memory, and stop the transfer.
+ *
+ * The budget is decided by what the bytes turn out to be, and it has to be, because the two layouts need
+ * different amounts and the two *module shapes* reach their memory at very different offsets:
+ *
+ *   - gzipped: 64 KiB of compressed input inflates to ~380 KiB, which covers the pinned build's imported
+ *     memory at byte 0x1302 with room to spare.
+ *   - plain: the full 256 KiB, because a `-sMAIN_MODULE=2` module *defines* its memory in section 5 —
+ *     after a 144 KB type section and the function and code sections — which the compressed budget stops
+ *     short of. That is how the first run against a freshly built artifact reported `unknown` and got
+ *     treated as shared (which is what an unreadable artifact falls back to).
  *
  * `content-length` is only used for the report; nothing about the answer depends on it.
  */
-async function readPrefix(response, limit) {
+async function readPrefix(response) {
 	if (!response.body) {
-		// No streaming: a body of 16.5 MiB is already in memory either way.
-		return new Uint8Array(await response.arrayBuffer()).subarray(0, limit);
+		// No streaming: the body is in memory either way, so take what is needed.
+		return new Uint8Array(await response.arrayBuffer()).subarray(0, MEMORY_PROBE_BYTES);
 	}
 
 	const reader = response.body.getReader();
 	const chunks = [];
 	let total = 0;
+	let limit = COMPRESSED_PREFIX_BYTES;
 	try {
-		while (total < limit) {
+		for (;;) {
 			const { value, done } = await reader.read();
 			if (done) break;
 			chunks.push(value);
 			total += value.length;
+			limit = looksGzipped(chunks[0]) ? COMPRESSED_PREFIX_BYTES : MEMORY_PROBE_BYTES;
+			if (total >= limit) break;
 		}
 	} catch {
 		// A dropped connection after enough bytes is the same as `done` for our purposes.
@@ -123,7 +136,7 @@ export async function probeArtifactMemory(assetBase) {
 		if (!response.ok) continue;
 
 		try {
-			const raw = await readPrefix(response, COMPRESSED_PREFIX_BYTES);
+			const raw = await readPrefix(response);
 			const bytes = looksGzipped(raw) ? await inflatePrefix(raw, MEMORY_PROBE_BYTES) : raw;
 			const memory = readMemory(bytes);
 			if (!memory) continue;

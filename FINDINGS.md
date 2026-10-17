@@ -838,3 +838,87 @@ explainer says — so the bridge has to be `postMessage`.
 
 That is a deployment that could ship Lean in LiveCodes in Chrome today. The single-threaded build is still
 the one that ends the question, and §9.2–9.3 are what it is waiting on.
+
+### 9.7 It builds, and it runs Lean with no isolation at all
+
+**The build works.** `wasm-build/` — the Dockerfile, the two patches, the flags — produced an artifact that
+Lean accepts proofs on, in a document that is not cross-origin isolated, with no `SharedArrayBuffer`,
+served by a host that sends no COOP or COEP. Measured in headless Chrome 155, page and assets on different
+origins:
+
+```
+page: crossOriginIsolated=false  typeof SharedArrayBuffer=undefined
+artifact: unshared memory (min 1024 pages, max 65536 pages) — no cross-origin isolation needed
+run: status=done exitCode=0 initMs=3434 runMs=53963
+output: "add_comm (a b : Nat) : a + b = b + a"
+```
+
+So §9.2 and §9.3 — the two blockers quoted from the fork's own comments — are answered by the patch in
+`patches/0002`, not by upstream work after all. What that patch does is §9.2's "sequential task manager"
+in its smallest form: keep `-D LEAN_MULTI_THREAD`, create the manager with **zero** workers so
+`g_task_manager` is never null, and make `wait_for`/`wait_any` drain the task queue on whichever thread is
+waiting. The waiter becomes the worker, which is also what stops the async-const realization from
+accumulating — the same change answers both blockers. The flags are §9.1's, with `-pthread` removed from
+`EMSCRIPTEN_SETTINGS` (where it is unconditional) and from the generic linker block, and
+`-sPTHREAD_POOL_SIZE=4` dropped.
+
+**The artifact is the shape §9.4 predicted, and one detail of it was not.** It is a `-sMAIN_MODULE=2`
+module: 97.52 MiB, importing 54 functions and nothing else, and **defining** its own memory —
+
+```
+imports: 54, by kind {0: 54}
+memory section: 1 defined memory
+  defined memory: flags=1 shared=false min=1024 max=65536
+```
+
+That broke the runtime's probe, which read only the *import* section — because the pthread build is the
+other shape (`env.memory`, flags 3, supplied by the embedder). For this module it found nothing, reported
+`unknown`, and an unknown artifact is treated as shared, so the runtime refused to run exactly the artifact
+it had been changed to support. `readMemory` now reads either, and reports which, because it also decides
+who constructs the memory: the embedder for an import, nobody for a definition.
+
+The library tree matches the deployed layer exactly, which is the best evidence available that this is the
+same build rather than a lookalike: packing the `Init` closure gives **629 modules, 1,887 files, 76.1 MB
+raw, 5 gzip packs, 30.7 MB compressed** — the same six numbers §5 records for the layer upstream ships.
+
+**A correction to §2, and it is about the engine's version.** In Chrome 155 a document with
+`crossOriginIsolated: false` and `typeof SharedArrayBuffer === 'undefined'` still constructs a **shared
+wasm memory**:
+
+```
+new SharedArrayBuffer(8):                      ReferenceError — SharedArrayBuffer is not defined
+new WebAssembly.Memory({shared:true}):         OK, buffer=65536
+```
+
+§2 concluded that a shared memory implies cross-origin isolation because the constructor is gated. That
+implication no longer holds for wasm memories on this engine, and it was load-bearing: the runtime's gate
+refused on it. The gate now probes the operation the runtime actually performs — constructing the memory —
+rather than the presence of the constructor, so where the engine allows it, the **pthread** build boots
+without isolation too. Whether this is a deliberate Chrome relaxation, an origin-trial-era remnant, or a
+V8 leniency is worth establishing before relying on it; §9.5 already records that V8 is loose about the
+atomics rule, so "V8 permits it" is not a promise.
+
+**The cost is in the first compile, and it is large: 54 seconds.** Boot is *faster* than the pthread build
+(3.4 s against 5.1–5.8 s, with no worker pool to pre-spawn), but the first `Run` on this build took
+**53,963 ms** against ~0.3 s warm on the pthread build. That is the `Init` import running on one thread
+with nothing to parallelize it — §9.3's "accumulates faster than one thread retires it", paid honestly
+rather than avoided. Subsequent compiles in the same session reuse the imported environment and are fast,
+but a LiveCodes result page pays this on first use, so it would need measuring against the pthread build's
+own cold path before choosing between them.
+
+**Atomics: still unresolved, and now with numbers.** Raw `0xFE` bytes in the code section drop from
+**429,614** in the pinned pthread build to **14,390** in this one — a 30× fall that is consistent with
+atomics being gone and does not establish it, since 14,390 bytes in 86 MB is about the rate operand bytes
+alone would produce. A real disassembler or Firefox and Safari are the check; V8 is not, and §9.5 records
+why. The harness prints the count and says this in those words rather than implying a verdict.
+
+**One host bug fell out of it, in this repo's own `serve.js`.** The runtime probes `lean.wasm.gz` and falls
+back to `lean.wasm` on a `404`; `serve.js` sent its `404` without `Access-Control-Allow-Origin`, and a
+cross-origin `fetch` of a response the browser will not hand over rejects with `TypeError: Failed to
+fetch` — indistinguishable from a dead network, and it named `lean.wasm.gz`, which was fine, while hiding
+the absence of `lean.wasm.gz`'s sibling, which was the actual state. Error responses need the same CORS
+headers as successes, and now get them.
+
+What is left is not a build problem: publishing an artifact (~127 MB per variant), re-mirroring the library
+trees it produces, and knowing whether Firefox and Safari accept a module with an unshared memory that may
+still carry atomic instructions.

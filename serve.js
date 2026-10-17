@@ -57,6 +57,26 @@ const TYPES = {
   '.md': 'text/markdown; charset=utf-8',
 };
 
+// A CDN hosting the three asset directories needs both of these, and they are not
+// interchangeable:
+//   Access-Control-Allow-Origin  — for the fetch()ed binaries and layer packs
+//   Cross-Origin-Resource-Policy — for lean.js, which the worker pulls in with
+//                                  importScripts(), a no-cors request that
+//                                  COEP checks against CORP, not against CORS
+// Without the second, the boot fails with "Failed to execute 'importScripts'
+// ... failed to load" even though every other asset arrived fine.
+//
+// They belong on the **error** responses too, which is not obvious and was measured: a 404 without
+// `Access-Control-Allow-Origin` is not a 404 the caller can see — a cross-origin `fetch` rejects with
+// `TypeError: Failed to fetch`, indistinguishable from a dead network. The runtime probes
+// `lean.wasm.gz` and falls back to `lean.wasm` on a 404, so a host that hides its 404s makes the plain
+// layout unreachable and reports it as a network failure. (This one cost an afternoon: the error named
+// `lean.wasm.gz`, the file was fine, and the *absence* of the other file was the thing being hidden.)
+const ASSET_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Cross-Origin-Resource-Policy': 'cross-origin'
+};
+
 const server = createServer(async (req, res) => {
   const urlPath = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
 
@@ -65,7 +85,7 @@ const server = createServer(async (req, res) => {
   const filePath = normalize(join(base, rel));
 
   if (!filePath.startsWith(normalize(base))) {
-    res.writeHead(403, { 'Content-Type': 'text/plain' }).end('Forbidden');
+    res.writeHead(403, { 'Content-Type': 'text/plain', ...ASSET_HEADERS }).end('Forbidden');
     return;
   }
 
@@ -78,7 +98,7 @@ const server = createServer(async (req, res) => {
     // shell and a `200`. That is how a wrong URL comes to look like a successful download, and how a
     // module import ends up refused for having MIME type `text/html`.
     if (!spaFallback) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' }).end(`Not found: /${rel}`);
+      res.writeHead(404, { 'Content-Type': 'text/plain', ...ASSET_HEADERS }).end(`Not found: /${rel}`);
       return;
     }
     served = join(base, 'index.html');
@@ -91,16 +111,7 @@ const server = createServer(async (req, res) => {
     // The page itself is small and changes; the ~800 MB of Lean assets are
     // fetched once and cached by the browser, not here.
     'Cache-Control': 'no-store',
-    // A CDN hosting the three asset directories needs both of these, and they are
-    // not interchangeable:
-    //   Access-Control-Allow-Origin  — for the fetch()ed binaries and layer packs
-    //   Cross-Origin-Resource-Policy — for lean.js, which the worker pulls in with
-    //                                  importScripts(), a no-cors request that
-    //                                  COEP checks against CORP, not against CORS
-    // Without the second, the boot fails with "Failed to execute 'importScripts'
-    // ... failed to load" even though every other asset arrived fine.
-    'Access-Control-Allow-Origin': '*',
-    'Cross-Origin-Resource-Policy': 'cross-origin',
+    ...ASSET_HEADERS
   };
 
   if (!noIsolation) {
