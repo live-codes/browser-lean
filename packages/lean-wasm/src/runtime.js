@@ -20,7 +20,7 @@ function createWorkerSource(config) {
 	return `self.__LEAN_WASM_CONFIG__ = ${JSON.stringify(config)};\n${RUNTIME_WORKER_SOURCE}`;
 }
 
-export function createRuntime({ assetBase, libBase, onProgress, onStatus }) {
+export function createRuntime({ assetBase, libBase, memory, onProgress, onStatus }) {
 	let worker = null;
 	let objectUrl = null;
 	let stdout = '';
@@ -46,6 +46,13 @@ export function createRuntime({ assetBase, libBase, onProgress, onStatus }) {
 				onStatus?.(msg.data);
 				return;
 			case 'memory':
+				// Only a threaded artifact gets here: an unshared one leaves the memory to Emscripten, so
+				// there is no choice to report.
+				emit(
+					msg.failed
+						? `shared memory: ${msg.mb} MB refused, trying a smaller one`
+						: `shared memory: ${msg.mb} MB (max ${msg.maximumPages} pages)`
+				);
 				return;
 			case 'library':
 				if (msg.stage === 'manifest') {
@@ -103,7 +110,11 @@ export function createRuntime({ assetBase, libBase, onProgress, onStatus }) {
 	}
 
 	async function start() {
-		worker = new Worker(URL.createObjectURL(new Blob([createWorkerSource({ assetBase, libBase })], { type: 'text/javascript' })));
+		worker = new Worker(
+			URL.createObjectURL(
+				new Blob([createWorkerSource({ assetBase, libBase, memory })], { type: 'text/javascript' })
+			)
+		);
 		worker.onmessage = dispatch;
 		worker.onerror = (event) => failAll(new Error(event.message || 'Lean runtime error'));
 

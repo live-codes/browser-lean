@@ -16,8 +16,10 @@
  * stretch in wasm, and a same-origin iframe shares the page's main thread, so it
  * freezes the whole tab. In a Worker it cannot.
  *
- * Requires a cross-origin isolated document — `pickMemory` constructs a
- * `shared: true` memory, which needs `SharedArrayBuffer`.
+ * Whether it needs a cross-origin isolated document is the artifact's decision, not this file's. The
+ * probe in @live-codes/lean-wasm reads the memory import off the module before the download, and a
+ * single-threaded build — one that declares an unshared memory — runs here with no isolation at all
+ * (FINDINGS.md §9). The pthread build the project ships today does need it.
  */
 
 // The build emits verbose tracing and it must not reach the UI.
@@ -39,6 +41,19 @@ const assetBase = (workerConfig.assetBase || workerParams.get('assetBase') || '/
 const assetQ = '';
 // Where the optional per-file libraries (Std, Lean, Batteries) are mirrored.
 const libBase = (workerConfig.libBase || workerParams.get('libBase') || '/lean-lib').replace(/\/$/, '');
+
+// What the artifact declares about its memory, read by `probeArtifactMemory` in @live-codes/lean-wasm and
+// handed in as configuration — the worker cannot ask, because it holds the whole module and the answer
+// has to arrive before the download (FINDINGS.md §2).
+//
+//   {mode: 'shared',   initial, maximum}  a pthread build: it needs SharedArrayBuffer, and the memory
+//                                         this worker constructs must match the declared limits
+//   {mode: 'unshared', initial, maximum}  a single-threaded build: no SharedArrayBuffer, no isolation,
+//                                         and no memory for this worker to construct at all
+//   null                                  the probe could not read the artifact, so the runtime does
+//                                         what it did before it could ask and assumes `shared`
+const declaredMemory = workerConfig.memory ?? null;
+const artifactIsThreaded = declaredMemory?.mode !== 'unshared';
 
 const post = (msg) => self.postMessage(msg);
 
@@ -86,30 +101,35 @@ function writeLibEntry(FS, name, data) {
 /**
  * Start with as much shared memory as we can get, and step down if the device
  * refuses. A `shared: true` memory is the reason this whole page needs
- * cross-origin isolation.
+ * cross-origin isolation — and it is only needed when the artifact declares one.
  *
- * MAX_PAGES must not exceed the maximum the module declares for the memory it
- * imports, or instantiation fails with
+ * The limits are the artifact's, not ours. Two failures come from ignoring that,
+ * and both are real: a memory whose maximum exceeds the module's declared maximum
+ * fails at instantiation with
  *   LinkError: Import #461 "env" "memory": memory import has a larger maximum
  *   size 65536 than the module's declared maximum 32768
- * The pinned build declares min 1024 / max 65536 pages (4 GiB); that is readable
- * straight off the module's import section, and it is worth re-reading whenever
- * the pinned version moves, because the previous build declared max 32768 and
- * linking it against 65536 is exactly the failure above.
+ * and a memory smaller than the module's declared minimum fails the other way.
+ * The pinned build declares min 1024 / max 65536 pages (4 GiB); the previous one
+ * declared max 32768 and linking it against 65536 is exactly the failure above.
+ * Now that the probe reads those numbers off the import section, the runtime
+ * cannot produce that mismatch — it only has to stay under the ceiling.
  */
 const MAX_PAGES = 65536;
 
 function pickMemory() {
   const PAGE = 65536;
+  // The declared maximum is a ceiling and the declared minimum is a floor. Falling back to our own
+  // ceiling when the artifact could not be read keeps the pre-probe behaviour unchanged.
+  const maximum = declaredMemory?.maximum ?? MAX_PAGES;
+  const floor = declaredMemory?.initial ?? 0;
+
   for (const mb of [2048, 1536, 1024, 768]) {
+    const initial = Math.max(floor, (mb * 1024 * 1024) / PAGE);
+    if (initial > maximum) continue;
     try {
-      const memory = new WebAssembly.Memory({
-        initial: (mb * 1024 * 1024) / PAGE,
-        maximum: MAX_PAGES,
-        shared: true,
-      });
-      post({ type: 'memory', mb, maximumPages: MAX_PAGES });
-      return { memory, bytes: mb * 1024 * 1024 };
+      const memory = new WebAssembly.Memory({ initial, maximum, shared: true });
+      post({ type: 'memory', mb, initialPages: initial, maximumPages: maximum, declared: declaredMemory !== null });
+      return { memory, bytes: initial * PAGE };
     } catch {
       post({ type: 'memory', mb, failed: true });
     }
@@ -397,19 +417,38 @@ function compileCode(code, fileName) {
 }
 
 async function startLeanModule() {
-  const picked = pickMemory();
-  if (!picked) {
-    post({ type: 'error', data: 'Could not allocate a shared WebAssembly memory (is the document cross-origin isolated?)' });
-    return;
+  // A shared memory is only this worker's job when the artifact declares one. A single-threaded build
+  // declares an unshared memory, which needs no SharedArrayBuffer and therefore no cross-origin
+  // isolation — and there is nothing to construct here either, because that memory can grow and
+  // Emscripten already knows the limits it was built with.
+  let picked = null;
+  if (artifactIsThreaded) {
+    picked = pickMemory();
+    if (!picked) {
+      post({
+        type: 'error',
+        data:
+          'The Lean artifact declares a shared WebAssembly memory, and this document has no ' +
+          'SharedArrayBuffer — which it would only have if it were cross-origin isolated. Serve the page ' +
+          'with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` ' +
+          '(or `credentialless`), or, for an embed that cannot set headers, `Document-Isolation-Policy: ' +
+          'isolate-and-require-corp` on the frame itself. A single-threaded Lean build would need none of ' +
+          'this. See FINDINGS.md §2 and §9.',
+      });
+      return;
+    }
   }
+
   self.Module = {
-    wasmMemory: picked.memory,
-    INITIAL_MEMORY: picked.bytes,
+    // Omitted entirely for an unshared artifact, so Emscripten allocates the memory it was built for
+    // rather than being handed limits guessed from outside.
+    ...(picked ? { wasmMemory: picked.memory, INITIAL_MEMORY: picked.bytes } : {}),
     locateFile: (path) =>
       path.endsWith('.wasm') && wasmBlobUrl ? wasmBlobUrl : `${assetBase}/${path}${assetQ}`,
-    // Tell Emscripten where the runtime script is, so the pthread sub-workers the
-    // runtime spawns can load lean.js (this file is the worker's own script).
-    mainScriptUrlOrBlob: `${assetBase}/lean.js${assetQ}`,
+    // Only a pthread build needs to say where its script is: it spawns sub-workers that have to load it
+    // same-origin. A single-threaded build has no sub-workers, and a build that does not list
+    // `mainScriptUrlOrBlob` in INCOMING_MODULE_JS_API would rather not be handed an unknown key.
+    ...(artifactIsThreaded ? { mainScriptUrlOrBlob: `${assetBase}/lean.js${assetQ}` } : {}),
     print: (text) => {
       noteActivity();
       if (isDebugLine(text)) return logDebug(text);
@@ -495,9 +534,11 @@ async function startLeanModule() {
     const source = await response.text();
     // Kept for the lifetime of the runtime: pthread sub-workers load it lazily.
     mainScriptBlob = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-    Module.mainScriptUrlOrBlob = mainScriptBlob;
+    if (artifactIsThreaded) Module.mainScriptUrlOrBlob = mainScriptBlob;
     // Emscripten and every pthread sub-worker instantiate from this same blob URL.
     await loadWasmUrl();
+    // The blob is how lean.js is evaluated here at all — a threaded build additionally needs it to be
+    // same-origin for its sub-workers, which a bare `importScripts` of a CDN URL would not be.
     importScripts(mainScriptBlob);
   } catch (err) {
     post({ type: 'error', data: 'Failed to load lean.js: ' + ((err && err.message) || err) });

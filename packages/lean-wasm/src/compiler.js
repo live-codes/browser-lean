@@ -6,6 +6,7 @@
 // with ten imports costs one load phase, not ten — and `auto` syntax checking means nothing pays for
 // the Lean library just to be told about a typo.
 
+import { probeArtifactMemory } from './artifact-probe.js';
 import { resolveAssets } from './assets.js';
 import { collect, problemsToLines } from './messages.js';
 import {
@@ -31,15 +32,47 @@ function assertEnvironment() {
 				'over as a blob so that it stays same-origin.'
 		);
 	}
-	if (typeof SharedArrayBuffer === 'undefined') {
-		throw new Error(
-			'Lean’s runtime imports a WebAssembly memory with `shared: true`, so it needs ' +
-				'SharedArrayBuffer — which a document only has when it is cross-origin isolated. Serve the ' +
-				'page with `Cross-Origin-Opener-Policy: same-origin` and ' +
-				'`Cross-Origin-Embedder-Policy: require-corp` (or `credentialless`). This is a hard ' +
-				'requirement, not a header this library can work around.'
-		);
+}
+
+/**
+ * Whether this document can boot this artifact.
+ *
+ * The requirement belongs to the artifact rather than to the package. A `shared` memory import needs
+ * `SharedArrayBuffer`, which a document only has when it is cross-origin isolated; a single-threaded
+ * build declares an unshared memory and needs none of it (FINDINGS.md §9). Checking the declaration is
+ * what lets one build of this package serve both.
+ *
+ * An unreadable artifact is deliberately *not* treated as a shared one. A failed probe means this host
+ * does not answer the way the boot expects, and the boot will fail with its own explanation a moment
+ * later; refusing to start on that basis would block a single-threaded build for a reason that has
+ * nothing to do with it.
+ *
+ * @param {null|{mode: string, url: string}} artifact - the probe's result.
+ */
+function assertArtifactCanRun(artifact) {
+	if (typeof SharedArrayBuffer !== 'undefined') return;
+	if (artifact?.mode !== 'shared') return;
+
+	throw new Error(
+		`The Lean artifact at ${artifact.url} declares a shared WebAssembly memory, so it needs ` +
+			'SharedArrayBuffer — which a document only has when it is cross-origin isolated. Serve the page ' +
+			'with `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` ' +
+			'(or `credentialless`); an embed that cannot set those headers can isolate its own frame with ' +
+			'`Document-Isolation-Policy: isolate-and-require-corp` instead. A single-threaded Lean build ' +
+			'would need none of this — see FINDINGS.md §2 and §9.'
+	);
+}
+
+/** The artifact's memory, in words, for a progress log. */
+function describeMemory(artifact) {
+	if (!artifact) {
+		return 'artifact: the memory import could not be read, so a shared memory is assumed';
 	}
+	const { initial, maximum } = artifact.memory;
+	const limits = `min ${initial} pages, ${maximum === null ? 'no maximum' : `max ${maximum} pages`}`;
+	return artifact.mode === 'unshared'
+		? `artifact: unshared memory (${limits}) — no cross-origin isolation needed`
+		: `artifact: shared memory (${limits}) — this needs SharedArrayBuffer`;
 }
 
 /**
@@ -54,7 +87,7 @@ function assertEnvironment() {
  *   `full` always parses, loading Lean and Std if needed (~350 MiB); `off` never parses.
  * @param {(message: string) => void} [options.onProgress] - human-readable progress, for a spinner.
  * @param {(message: string) => void} [options.onStatus] - the wasm build's own status lines.
- * @returns {Promise<{language: string, assets: object, run: Function, dispose: Function}>}
+ * @returns {Promise<{language: string, assets: object, artifact: object, run: Function, dispose: Function}>}
  */
 export async function createCompiler(options = {}) {
 	assertEnvironment();
@@ -66,9 +99,17 @@ export async function createCompiler(options = {}) {
 	}
 
 	const layers = optionalLayers(assets);
+
+	// What the artifact declares, read from the first ~64 KiB of it rather than the whole 96.17 MiB, so a
+	// document that cannot run the runtime finds that out before paying for the runtime (FINDINGS.md §2).
+	const artifact = await probeArtifactMemory(assets.assetBase);
+	assertArtifactCanRun(artifact);
+	options.onProgress?.(describeMemory(artifact));
+
 	const runtime = createRuntime({
 		assetBase: assets.assetBase,
 		libBase: assets.libBase,
+		memory: artifact?.memory ?? null,
 		onProgress: options.onProgress,
 		onStatus: options.onStatus
 	});
@@ -159,6 +200,17 @@ export async function createCompiler(options = {}) {
 
 		/** The resolved asset directories, for a caller that wants to log or pin them. */
 		assets,
+
+		/**
+		 * What the artifact declares about its memory, which is the thing that decides whether this page
+		 * needs cross-origin isolation: `memory` is `'shared'`, `'unshared'`, or `'unknown'` when the probe
+		 * could not read it, and `limits` is the import's page bounds (FINDINGS.md §2 and §9).
+		 */
+		artifact: {
+			memory: artifact?.mode ?? 'unknown',
+			limits: artifact?.memory ?? null,
+			url: artifact?.url ?? null
+		},
 
 		/**
 		 * Compile and check a program.
