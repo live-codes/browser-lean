@@ -12,7 +12,7 @@
  * default is this origin's root, which is what `npm start` serves.
  */
 
-const { createCompiler } = globalThis.leanWasm;
+const { createCompiler, bakeSnapshot } = globalThis.leanWasm;
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -281,7 +281,59 @@ function showArtifact(artifact) {
   setState({ artifact: mode });
 }
 
+/**
+ * Bake an `Init` snapshot with this artifact's own CLI, and offer it for download.
+ *
+ * The bake runs the runtime *as the Lean CLI* in a worker of its own, so the page stays responsive and the
+ * runtime exits when it is done. It takes as long as the import takes — which is the point: you pay that
+ * once here, and every first Run that loads the snapshot afterwards does not.
+ */
+async function runBake() {
+  const baseUrl = params.get('baseUrl') || new URL('/', location.href).href;
+  setState({ status: 'baking' });
+  setStatus('Baking an Init snapshot — this pays the import once…', 'busy');
+  appendLog(`Baking a snapshot from ${baseUrl}`);
+
+  try {
+    const started = performance.now();
+    const bytes = await bakeSnapshot({
+      baseUrl,
+      probe: params.get('probe') ?? '#check 2+2',
+      onProgress: (message) => setStatus(message, 'busy'),
+    });
+    const seconds = ((performance.now() - started) / 1000).toFixed(1);
+    appendLog(`Baked ${(bytes.length / 1048576).toFixed(1)} MB in ${seconds}s`);
+
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'init.snap';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+
+    // A headless probe cannot click a download, so it reads this instead.
+    window.__snapshotBytes = bytes.length;
+    setState({ status: 'baked', snapshotBytes: bytes.length });
+    setStatus(`Baked ${(bytes.length / 1048576).toFixed(1)} MB — serve it at snapshots/init.snap.`, 'ok');
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setPane(els.diagnostics, message, '');
+    appendLog(`Bake failed: ${message}`);
+    setStatus(message, 'err');
+    setState({ status: 'error' });
+  }
+}
+
 function init() {
+  // `?bake=1` — a one-off tool rather than a demo: the snapshot is what removes the `Init` import from a
+  // first Run (FINDINGS.md §9.7), and only this artifact's own binary can produce one for it.
+  if (params.get('bake') === '1') {
+    void runBake();
+    return;
+  }
+
   EXAMPLES.forEach((example, index) => {
     const option = document.createElement('option');
     option.value = String(index);

@@ -55,6 +55,20 @@ const libBase = (workerConfig.libBase || workerParams.get('libBase') || '/lean-l
 const declaredMemory = workerConfig.memory ?? null;
 const artifactIsThreaded = declaredMemory?.mode !== 'unshared';
 
+// Bake mode: run the runtime **as the Lean CLI** to produce an `--incr-header-save` environment snapshot,
+// rather than booting the playground. The snapshot takes the `Init` import out of the first Run, which on
+// the single-threaded build is ~100 s against ~1.3 s for the pthread build (FINDINGS.md §9.7), and it has
+// to be produced by the binary that will load it — a snapshot embeds closure relocations valid only
+// against the saving binary's function table.
+//
+// It cannot share a session with compiling: the CLI parses its own arguments and the runtime exits when it
+// is done (`-sEXIT_RUNTIME=1`). See `packages/lean-wasm/src/bake.js`.
+const bake = workerConfig.bake ?? null;
+// Where the bake writes its probe, and where a snapshot is written when one is loaded at boot. Both live
+// inside the virtual filesystem; `/workspace` is created in `preRun` either way.
+const PROBE_PATH = '/workspace/probe.lean';
+const SNAPSHOT_PATH = '/workspace/init.snap';
+
 const post = (msg) => self.postMessage(msg);
 
 function isDebugLine(text) {
@@ -429,6 +443,41 @@ function compileCode(code, fileName) {
   }
 }
 
+/**
+ * Finish the boot once the runtime is initialised: load a baked environment snapshot if this host serves
+ * one, then declare the runtime ready.
+ *
+ * The snapshot is why a first Run can be fast at all: it carries the imported `Init` environment, so the
+ * ~100 s import the single-threaded build otherwise pays (FINDINGS.md §9.7) never happens — upstream's
+ * `Shell.lean` says a snapshot "skips the multi-minute `loadExts` import entirely". It is optional: a host
+ * without one still works and simply pays the import.
+ */
+async function finishStartup() {
+  if (typeof Module._lean_wasm_load_snapshot === 'function') {
+    try {
+      const response = await fetchOrThrow(`${assetBase}/snapshots/init.snap`);
+      if (response.ok) {
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        Module.FS.writeFile(SNAPSHOT_PATH, bytes);
+        const code = Module._lean_wasm_load_snapshot(SNAPSHOT_PATH);
+        post({
+          type: 'status',
+          data:
+            code === 0
+              ? `loaded the Init snapshot (${(bytes.length / 1048576).toFixed(1)} MB) — the first run will not import`
+              : `the Init snapshot was refused (code ${code}); the first run will import instead`,
+        });
+      }
+    } catch {
+      // Absent is the normal case for a host that never baked one, and a host that answers 200 with an
+      // HTML shell for a missing file is caught by the loader, which returns a failure code.
+      post({ type: 'status', data: 'no Init snapshot at this host; the first run will import' });
+    }
+  }
+  moduleReady = true;
+  post({ type: 'ready' });
+}
+
 async function startLeanModule() {
   // A shared memory is only this worker's job when the artifact declares one. A single-threaded build
   // declares an unshared memory, which needs no SharedArrayBuffer and therefore no cross-origin
@@ -462,6 +511,11 @@ async function startLeanModule() {
     // same-origin. A single-threaded build has no sub-workers, and a build that does not list
     // `mainScriptUrlOrBlob` in INCOMING_MODULE_JS_API would rather not be handed an unknown key.
     ...(artifactIsThreaded ? { mainScriptUrlOrBlob: `${assetBase}/lean.js${assetQ}` } : {}),
+    // In bake mode the CLI owns startup — Emscripten runs `main` as soon as `onRuntimeInitialized`
+    // returns, so this worker must not also initialise the runtime itself, and must not wait for a `ready`.
+    ...(bake
+      ? { arguments: [`--incr-header-save=${bake.snapshotPath}`, PROBE_PATH], noInitialRun: false }
+      : { noInitialRun: true }),
     print: (text) => {
       noteActivity();
       if (isDebugLine(text)) return logDebug(text);
@@ -502,9 +556,21 @@ async function startLeanModule() {
         } catch {
           /* ignore */
         }
+        // The bake needs a file to elaborate, and one that imports nothing: that is what makes it pay the
+        // default `Init` header import, which is exactly the cost the snapshot exists to skip.
+        if (bake) {
+          try {
+            FS.writeFile(PROBE_PATH, bake.probe ?? '#check 2+2');
+          } catch (error) {
+            post({ type: 'error', data: 'could not write the bake probe: ' + ((error && error.message) || error) });
+          }
+        }
       },
     ],
     onRuntimeInitialized: function () {
+      // The CLI owns startup in bake mode. Returning from here is what lets Emscripten run `main`; doing
+      // this worker's own init first would initialise the runtime twice.
+      if (bake) return;
       try {
         Module._lean_initialize_runtime_module();
         Module._lean_initialize();
@@ -520,10 +586,29 @@ async function startLeanModule() {
           }
           throw new Error('lean_init_search_path failed (see stderr)');
         }
-        moduleReady = true;
-        post({ type: 'ready' });
+        void finishStartup();
       } catch (err) {
         post({ type: 'error', data: 'Lean init failed: ' + ((err && err.message) || err) });
+      }
+    },
+    onExit: function (code) {
+      if (!bake) {
+        moduleReady = false;
+        post({ type: 'status', data: `Lean exited (${code})` });
+        return;
+      }
+      // The CLI has run, so the snapshot is on the filesystem — or it is not, which is worth saying
+      // precisely rather than leaving the caller to time out.
+      try {
+        // Copied, not handed over: `FS.readFile` answers a view into the wasm heap, and posting that would
+        // either clone the whole heap or fail, since this artifact defines its memory.
+        const bytes = new Uint8Array(Module.FS.readFile(bake.snapshotPath));
+        post({ type: 'snapshot', bytes, code });
+      } catch (error) {
+        post({
+          type: 'error',
+          data: `the bake exited (${code}) without writing ${bake.snapshotPath}: ` + ((error && error.message) || error),
+        });
       }
     },
     onAbort: function (what) {

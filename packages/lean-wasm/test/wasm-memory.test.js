@@ -200,7 +200,10 @@ test('the single-threaded build declares a defined, unshared memory', async (t) 
 	const memory = readMemory(new Uint8Array(readFileSync(wasm)));
 	assert.equal(memory.source, 'defined', 'a -sMAIN_MODULE=2 build defines its memory rather than importing it');
 	assert.equal(memory.shared, false);
-	assert.equal(memory.initial, 1024);
+	// Not the exact initial size: that is `LEAN_WASM_INITIAL_MEMORY`, a build knob (wasm-build/README.md), and
+	// an experiment built the artifact at 1 GiB. What matters is the shape — a defined, unshared memory that
+	// the runtime is not expected to construct.
+	assert.ok(memory.initial >= 1024, `initial should be at least the upstream 64 MiB, got ${memory.initial} pages`);
 	assert.equal(memory.maximum, 65536);
 	assert.equal(memoryMode(memory), 'unshared');
 });

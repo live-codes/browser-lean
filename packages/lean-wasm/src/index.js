@@ -12,6 +12,7 @@
 //   const lean = await self.leanWasm.createCompiler({ baseUrl });
 
 import { DEFAULT_BASE_URL, requiredAssetPaths, resolveAssets } from './assets.js';
+import { bakeSnapshot } from './bake.js';
 import { createCompiler } from './compiler.js';
 import { fetchableRoots, optionalLayers } from './roots.js';
 
@@ -21,7 +22,7 @@ export const LANGUAGES = ['lean'];
 /** The accepted values of `syntaxCheck`. */
 export const SYNTAX_MODES = ['auto', 'full', 'off'];
 
-export { createCompiler, DEFAULT_BASE_URL, requiredAssetPaths, resolveAssets };
+export { bakeSnapshot, createCompiler, DEFAULT_BASE_URL, requiredAssetPaths, resolveAssets };
 
 /** Every library root the package can fetch, which depends on the resolved asset directories. */
 export function availableRoots(assets) {
