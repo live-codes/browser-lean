@@ -459,6 +459,10 @@ async function finishStartup() {
       if (response.ok) {
         const bytes = new Uint8Array(await response.arrayBuffer());
         Module.FS.writeFile(SNAPSHOT_PATH, bytes);
+        // The loader reads a dependency sidecar beside the snapshot. A self-contained snapshot's list is
+        // empty, which is why upstream ships only the snapshot itself and writes the sidecar in the worker —
+        // and why the load is refused without it.
+        Module.FS.writeFile(`${SNAPSHOT_PATH}.deps`, new Uint8Array([0x5b, 0x5d]));
         const code = Module._lean_wasm_load_snapshot(SNAPSHOT_PATH);
         post({
           type: 'status',

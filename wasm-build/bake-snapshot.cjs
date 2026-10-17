@@ -46,7 +46,23 @@ console.log(`baking ${name}.snap from "${probe}" into ${realWork} …`);
 
 // The glue chdirs the virtual FS to process.cwd() during startup and only `/` is guaranteed to exist
 // there, so step off the real cwd before it does.
-process.chdir('/');
+//
+// Which drive that is matters. NODEFS resolves a virtual path against the **host** before stat-ing it
+// (`realPath` + `fs.lstatSync`), and a path like `/home` is drive-relative on Windows — so the CLI's home
+// lookup lands on `<current drive>:\home` and fails with ENOENT when it is not there, taking the bake down
+// with it. Run from a drive we can write to, and make the directories it will look for.
+const driveRoot = path.parse(realWork).root || path.parse(process.cwd()).root;
+process.chdir(driveRoot);
+// The CLI probes for the usual Unix directories (`/home`, `/tmp`, …) as a fallback when the environment
+// variables are unset, and each miss is fatal here. Both halves are cheap, so do both: point the variables
+// at the real work directory, and let the probes find something.
+for (const dir of ['home', 'root', 'tmp', path.join('var', 'tmp')]) {
+	try {
+		fs.mkdirSync(path.join(driveRoot, dir), { recursive: true });
+	} catch {
+		/* present, or not permitted — the bake will say so if it matters */
+	}
+}
 // Emscripten forwards process.argv[1] as argv[0]; present the virtual install layout so Lean derives
 // `/lib/lean` as its sysroot instead of stat-ing a host path inside MEMFS.
 process.argv[1] = '/bin/lean';
@@ -54,7 +70,12 @@ process.argv[1] = '/bin/lean';
 const memoryMb = process.env.BAKE_MEMORY_MB ? Number(process.env.BAKE_MEMORY_MB) : null;
 
 globalThis.Module = {
-	arguments: [`--incr-header-save=/work/${name}.snap`, '/work/probe.lean'],
+	// `--threads=0` is load-bearing, not tidiness. The CLI defaults to `defaultNumThreads`, so it builds a
+	// real task-manager pool — and this artifact has no pthreads, so `std::thread` fails and the run dies
+	// with `lean::throwable: failed to create thread` before it elaborates anything (in a browser that throw
+	// surfaces as a bake that never returns). Zero workers routes tasks through the manager's sequential
+	// path, which is exactly how the playground runs this build.
+	arguments: ['--threads=0', `--incr-header-save=/work/${name}.snap`, '/work/probe.lean'],
 	// No `wasmMemory`/`INITIAL_MEMORY` for this artifact: it **defines** its memory (a `-sMAIN_MODULE=2`
 	// module with no pthreads), so there is nothing for the embedder to construct — unlike upstream's
 	// pthread build, whose driver hands over a shared buffer. `BAKE_MEMORY_MB` supplies one for testing a
@@ -86,10 +107,19 @@ globalThis.Module = {
 		FS.mount(NODEFS, { root: libLean }, '/lib/lean');
 		FS.mount(NODEFS, { root: realWork }, '/work');
 		Module.ENV.LEAN_PATH = '/lib/lean';
+		// Lean's CLI wants a home directory. On a Linux host `/home` is there; on Windows it is not, the
+		// lookup fails with ENOENT, and the failure takes the whole bake down with it — which is what
+		// `fs.lstatSync("/home") failed: ENOENT` was. Give it one to find, and a value to use, since either
+		// could be the path taken.
+		Module.ENV.HOME = '/work';
+		Module.ENV.TMPDIR = '/work';
+		mkdirTree('/home');
+		mkdirTree('/root');
+		mkdirTree('/tmp');
 		FS.chdir('/work');
 		// Name the failing FS operation. An `ErrnoError` here carries no path, so this is the only way to
 		// learn *what* was not found — and with NODEFS against a 32k-file tree, guessing is hopeless.
-		for (const op of ['open', 'stat', 'lstat', 'readdir', 'readFile', 'writeFile', 'mkdir', 'unlink', 'rename', 'chmod', 'chown', 'access', 'truncate', 'readlink', 'symlink']) {
+		for (const op of ['open', 'stat', 'lstat', 'readdir', 'readFile', 'writeFile', 'mkdir', 'unlink', 'rename', 'chmod', 'chown', 'access', 'truncate', 'readlink', 'symlink', 'read', 'write', 'close', 'llseek', 'mmap', 'msync', 'createStream', 'openStream']) {
 			const original = FS[op];
 			if (typeof original !== 'function') continue;
 			FS[op] = function (...args) {
@@ -97,6 +127,22 @@ globalThis.Module = {
 					return original.apply(FS, args);
 				} catch (error) {
 					console.error(`bake: FS.${op}(${JSON.stringify(args[0])}${args.length > 1 ? ', …' : ''}) failed, errno=${error && error.errno}`);
+					throw error;
+				}
+			};
+		}
+
+		// Node's own filesystem, wrapped too. The failing call is *not* an Emscripten FS one, so it is the
+		// glue or NODEFS reaching Node's fs directly — and Node's error carries the path that Emscripten's
+		// does not.
+		for (const op of ['openSync', 'readFileSync', 'statSync', 'lstatSync', 'readdirSync', 'accessSync', 'readlinkSync', 'realpathSync']) {
+			const original = fs[op];
+			if (typeof original !== 'function') continue;
+			fs[op] = function (...args) {
+				try {
+					return original.apply(fs, args);
+				} catch (error) {
+					console.error(`bake: node fs.${op}(${JSON.stringify(args[0])}) failed: ${error.code}`);
 					throw error;
 				}
 			};

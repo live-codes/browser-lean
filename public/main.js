@@ -185,7 +185,12 @@ async function ensureCompiler() {
         setStatus(message, 'busy');
         appendLog(message);
       },
-      onStatus: (message) => setStatus(message, 'busy'),
+      onStatus: (message) => {
+        // Also to the log: the status line holds only the latest message, and the ones worth reading later —
+        // whether an Init snapshot was loaded, say — are exactly the ones it overwrites.
+        setStatus(message, 'busy');
+        appendLog(message);
+      },
     });
 
     const initMs = Math.round(performance.now() - t0);
