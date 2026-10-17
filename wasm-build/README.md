@@ -15,25 +15,19 @@ no changes to consume what this builds.
 
 ## Status: the harness is checked, the build is not
 
-**Nothing here has been executed as a build.** The Docker daemon was not running on the machine this was
-written on, and a Lean wasm build is a multi-hour, ~15 GB affair, so what follows is a recipe with its
-reasoning made explicit rather than a transcript.
-
-What *was* checked, because both are cheap and both would otherwise waste hours:
-
-- **Both patches apply cleanly** to `cauli/lean4` @ the pinned commit. They are generated from the real
-  files rather than hand-diffed, and `wasm-build/README.md`'s hunks were verified with `git apply --check`
-  against the exact revision the build pins.
-- **`verify-memory.mjs` works**, run against the pinned pthread artifact: it reports `shared`, min 1024 /
-  max 65536, and exits non-zero — which is the correct answer for the artifact this project ships today
-  and the wrong answer for the one this directory exists to produce.
+**No artifact has been produced yet.** What is known so far is from attempting it: the image builds, the
+patches apply, and the first `make stage1` fails in stage0 — for a reason that turned out to be upstream's
+recipe and not this one (`## What the fork's own Docker recipe gets wrong`, below). The build is expected
+to take hours once it gets past that, so this README is explicit about what is verified and what is not.
 
 The two blockers below are quoted from the fork's own source, which is the strongest evidence available
-without the build; the *ordering* of them is a prediction, and variant 1 exists to test it.
+without a completed build; the *ordering* of them is a prediction, and variant 1 exists to test it.
 
-Expect to iterate. The value here is that the first build tells you which blocker fires first, and the
-harness prints the artifact's declared memory mode the moment it finishes, so a successful build is
-self-evident rather than a matter of opinion.
+What has been checked, because each is cheap and each would otherwise waste hours: the patches apply
+cleanly to the pinned revision (generated from the real files, after hand-counted hunks turned out to be
+miscounted, and verified with `git apply --check`), and `verify-memory.mjs` correctly *rejects* the
+artifact this project ships today — `shared`, min 1024 / max 65536, exit 1 — while counting the 429,614
+atomic-prefix bytes a single-threaded build has to beat.
 
 ## Prerequisites
 
@@ -157,10 +151,38 @@ Then mirror it the usual way (`npm run assets` against the new host), re-run
 `packages/lean-wasm/test/*` and `test/page.html`, and record the result in `FINDINGS.md` §9 — including
 the parts that turned out to be wrong, which is how §0 and §6.1 got written.
 
+## What the fork's own Docker recipe gets wrong
+
+`docker-wasm/` in `cauli/lean4` is the obvious place to start and it is stale in four ways, all found by
+building rather than reading. The Dockerfile and build.sh here are adapted from it with these fixed, and
+each is worth knowing before trusting anything else in it:
+
+1. **`cmake>=3.28` now installs CMake 4.x**, and under CMake 4 this build compiles *stage0* with the
+   Emscripten toolchain instead of the native 32-bit clang that `-DSTAGE0_CMAKE_CXX_COMPILER=clang++`
+   asks for. It fails a few seconds into `make stage1` with
+   `em++: error: passing any of -msse2 ... requires passing -msimd128` — the stage0 flags are native-x86
+   flags, and they are being handed to a wasm compiler. Pinned to `<4` here.
+2. **`EMSDK_NODE` is pinned to a Node version that no longer exists.** The Dockerfile hardcodes
+   `node/20.18.0_64bit/bin/node`; emsdk 4.0.22 now fetches 24.19.0, and `emcc` prefers `EMSDK_NODE` over
+   `node` on `PATH` when it is set — so the pin points at nothing. Removed here; `emsdk_env.sh` sets it
+   correctly and `build.sh` sources that.
+3. **Its build.sh prints "single-threaded; no lean.worker.js"** while its README documents `-pthread`
+   with `PTHREAD_POOL_SIZE=4` — and the deployed artifacts have the worker pool. The comment is wrong;
+   the README is right. That is a small thing to be wrong about, but it is the one thing this directory
+   is *about*, so it is worth not trusting.
+4. **`-DUSE_MIMALLOC=OFF` is in the CI but not in that build.sh**, so it configures and builds mimalloc
+   for wasm — which `src/CMakeLists.txt` says cannot work under Emscripten ("mimalloc's OS layer can't
+   grow memory under Emscripten"). Passed here, matching the CI.
+
+The authoritative reference is the CI, not `docker-wasm/`: `.github/workflows/ci.yml` has the wasm job's
+`CMAKE_OPTIONS`, and `build-template.yml` has its emsdk version (4.0.22) and the `--preset release` the
+job configures with. Where this harness and `docker-wasm/` disagree, the CI wins — and where the CI and
+the two of them disagree about whether the result is pthread-linked, the artifact does.
+
 ## Files
 
 ```
-Dockerfile                              emsdk 4.0.22, 32-bit stage0, cmake >= 3.28 — the fork's environment
+Dockerfile                              emsdk 4.0.22, 32-bit stage0, cmake >= 3.28, < 4 — see above
 build.sh                                clone the fork at the pinned commit, patch, configure, build, report
 patches/0001-cmake-single-threaded.patch     the flags
 patches/0002-sequential-task-manager.patch   the runtime change (unvalidated — see above)

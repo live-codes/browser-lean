@@ -1,0 +1,4 @@
+# The build context is the recipe, not the work area. Without this, a `docker build` re-run would tar up
+# the pinned fork and the cmake tree (several GB) and send them to the daemon before it started.
+cache/
+out/

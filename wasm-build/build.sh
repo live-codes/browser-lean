@@ -90,6 +90,7 @@ cmake "$SRC" \
     -DUSE_GMP=OFF \
     -DMMAP=OFF \
     -DSTAGE0_MMAP=OFF \
+    -DUSE_MIMALLOC=OFF \
     -DEMSCRIPTEN_DEBUG="$EMSCRIPTEN_DEBUG" \
     -DCMAKE_AR="${EMSDK}/upstream/emscripten/emar" \
     -DCMAKE_TOOLCHAIN_FILE="${EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake" \
