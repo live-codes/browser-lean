@@ -26,11 +26,21 @@ The line most likely to need revisiting is the `(sync := true)` guard in `wait_f
 deadlock in the threaded runtime, and in a single-threaded runtime every wait is effectively
 synchronous, so its trigger needs re-examining while its intent is preserved. The patch keeps it.
 
-diff --git a/a/src/runtime/object.cpp b/b/src/runtime/object.cpp
-index a83cbcf..050a95f 100644
+diff --git a/src/runtime/object.cpp b/src/runtime/object.cpp
+index a83cbcf..c9c7e31 100644
 --- a/src/runtime/object.cpp
 +++ b/src/runtime/object.cpp
-@@ -766,6 +766,12 @@ class task_manager {
+@@ -10,6 +10,9 @@ Author: Leonardo de Moura
+ #include <vector>
+ #include <deque>
+ #include <cmath>
++#ifdef LEAN_WASM_DRAIN_PROFILE
++#include <cstdio>
++#endif
+ #include <lean/lean.h>
+ #include "runtime/object.h"
+ #include "runtime/thread.h"
+@@ -766,6 +769,12 @@ class task_manager {
              return;
          }
          if (prio > LEAN_MAX_PRIO) {
@@ -43,7 +53,7 @@ index a83cbcf..050a95f 100644
              spawn_dedicated_worker(t);
              return;
          }
-@@ -895,6 +901,26 @@ class task_manager {
+@@ -895,6 +904,54 @@ class task_manager {
          }
      }
  
@@ -59,18 +69,46 @@ index a83cbcf..050a95f 100644
 +    same function, which is why a task that cannot make progress panics in `wait_for`/`wait_any`
 +    rather than spinning. In a single-threaded runtime an unsatisfiable wait is a deadlock, and it
 +    has to say so.
++
++    With LEAN_WASM_DRAIN_PROFILE it also counts tasks and accumulates the time spent in here, printed
++    sparsely on stdout — a first compile that spends its time in this loop says so, and one that does
++    not eliminates the whole question.
 +    */
 +    void drain(unique_lock<mutex> & lock) {
++#ifdef LEAN_WASM_DRAIN_PROFILE
++        static unsigned long long taskCount = 0;
++        static unsigned long long drainCount = 0;
++        static unsigned long long insideMs = 0;
++        static unsigned long long nextReportMs = 5000;
++        auto profileStart = std::chrono::steady_clock::now();
++        drainCount++;
++#endif
 +        while (m_queues_size != 0) {
 +            lean_task_object * t = dequeue();
 +            run_task(lock, t);
++#ifdef LEAN_WASM_DRAIN_PROFILE
++            taskCount++;
++#endif
 +        }
++#ifdef LEAN_WASM_DRAIN_PROFILE
++        insideMs += (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::steady_clock::now() - profileStart).count();
++        // Time-driven, not count-driven. Printing every 50,000 tasks produced nothing at all, which
++        // only says fewer than 50,000 tasks ran — and a few thousand tasks at three milliseconds each
++        // is the same 90 seconds as a million cheap ones. Reporting per 5 s of *accumulated drain
++        // time* answers the question either way: no lines means the drain is not where the time goes.
++        if (insideMs >= nextReportMs) {
++            nextReportMs = insideMs + 5000;
++            printf("[DRAIN] tasks=%llu drains=%llu inside_drain_ms=%llu\n", taskCount, drainCount, insideMs);
++            fflush(stdout);
++        }
++#endif
 +    }
 +
      void resolve_core(unique_lock<mutex> & lock, lean_task_object * t, object * v) {
          mark_mt(v);
          t->m_value = v;
-@@ -999,6 +1025,17 @@ public:
+@@ -999,6 +1056,17 @@ public:
          unique_lock<mutex> lock(m_mutex);
          if (t->m_value)
              return;
@@ -88,7 +126,7 @@ index a83cbcf..050a95f 100644
          // see `Task.get`
          bool in_pool = g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio <= LEAN_MAX_PRIO;
          if (g_current_task_object && g_current_task_object->m_imp.load(std::memory_order_relaxed)->m_prio == LEAN_SYNC_PRIO) {
-@@ -1021,6 +1058,14 @@ public:
+@@ -1021,6 +1089,14 @@ public:
          if (object * t = wait_any_check(task_list))
              return t;
          unique_lock<mutex> lock(m_mutex);
@@ -103,7 +141,7 @@ index a83cbcf..050a95f 100644
          while (true) {
              if (object * t = wait_any_check(task_list))
                  return t;
-@@ -1073,13 +1118,20 @@ static task_manager * g_task_manager = nullptr;
+@@ -1073,13 +1149,20 @@ static task_manager * g_task_manager = nullptr;
  extern "C" LEAN_EXPORT void lean_init_task_manager_using(unsigned num_workers) {
      lean_assert(g_task_manager == nullptr);
  #if defined(LEAN_MULTI_THREAD)
@@ -127,7 +165,7 @@ index a83cbcf..050a95f 100644
  #ifndef LEAN_EMSCRIPTEN
      if (char const * num_threads = std::getenv("LEAN_NUM_THREADS")) {
          return atoi(num_threads);
-@@ -1107,9 +1159,9 @@ extern "C" LEAN_EXPORT void lean_finalize_task_manager() {
+@@ -1107,9 +1190,9 @@ extern "C" LEAN_EXPORT void lean_finalize_task_manager() {
  scoped_task_manager::scoped_task_manager(unsigned num_workers) {
      lean_assert(g_task_manager == nullptr);
  #if defined(LEAN_MULTI_THREAD)

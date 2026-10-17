@@ -56,9 +56,12 @@ if [ "${RESET:-0}" = "1" ] || [ ! -f "$SRC/.applied-variant-$VARIANT" ]; then
   # The reset makes the tree pristine, so a patch that does not apply is a hard error rather than a
   # silently unpatched build — which would waste hours and then look like a runtime bug.
   git -C "$SRC" checkout -q -- .
-  patch -d "$SRC" -p1 < /patches/0001-cmake-single-threaded.patch
+  # `--batch` so a patch that does not apply is a hard failure. Without it patch asks "File to patch:" and
+  # reads its answer from *stdin* — which is the patch file — so it consumes hunks as replies and carries
+  # on having applied nothing, which then looks like a flags problem hours later.
+  patch --batch -d "$SRC" -p1 < /patches/0001-cmake-single-threaded.patch
   if [ "$VARIANT" = "2" ]; then
-    patch -d "$SRC" -p1 < /patches/0002-sequential-task-manager.patch
+    patch --batch -d "$SRC" -p1 < /patches/0002-sequential-task-manager.patch
   fi
   touch "$SRC/.applied-variant-$VARIANT"
 else
@@ -86,6 +89,13 @@ if [ "$VARIANT" = "1" ]; then
   MULTI_THREAD_FLAG="-DMULTI_THREAD=OFF"
 fi
 
+# Two experiment knobs, passed through so measuring does not need a patch edit:
+#   LEAN_INITIAL_MEMORY — the wasm memory's initial size in bytes (default: upstream's 64 MiB). It decides
+#                         whether the `Init` import ever has to grow an unshared memory.
+#   DRAIN_PROFILE=1     — instrument the sequential task manager's drain loop.
+#
+# The comments live above the invocation, not inside it: a `#` on a backslash-continued line ends the
+# command there, and the rest of these arguments would go to a second, nonsense `cmake`.
 cmake "$SRC" \
     -DCMAKE_C_COMPILER_WORKS=1 \
     "$MULTI_THREAD_FLAG" \
@@ -100,6 +110,8 @@ cmake "$SRC" \
     -DMMAP=OFF \
     -DSTAGE0_MMAP=OFF \
     -DUSE_MIMALLOC=OFF \
+    -DLEAN_WASM_INITIAL_MEMORY="${LEAN_INITIAL_MEMORY:-67108864}" \
+    -DLEAN_WASM_DRAIN_PROFILE="${DRAIN_PROFILE:-OFF}" \
     -DEMSCRIPTEN_DEBUG="$EMSCRIPTEN_DEBUG" \
     -DCMAKE_AR="${EMSDK}/upstream/emscripten/emar" \
     -DCMAKE_TOOLCHAIN_FILE="${EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake" \
@@ -110,9 +122,20 @@ cmake "$SRC" \
 make "${MAKE_TARGET:-stage1}" -j"$(nproc)"
 
 # ---- Report ---------------------------------------------------------------------------------------
+# `rm -rf` first: on a re-run the directory exists, and `cp -r src dest` with an existing dest copies
+# *into* it — leaving `olean/olean/` and silently halving what the packer then finds.
+#
+# SKIP_OLEAN_COPY=1 for a relink iteration: the oleans do not change when only C++ flags change, and copying
+# 2.2 GB / 32k files across a Docker Desktop bind mount costs ~25 minutes — which was, by a wide margin,
+# the slowest part of an otherwise ten-minute experiment loop.
 cp "$BUILD_DIR/stage1/bin/lean.js" "$OUT/"
 cp "$BUILD_DIR/stage1/bin/lean.wasm" "$OUT/"
-cp -r "$BUILD_DIR/stage1/lib/lean" "$OUT/olean"
+if [ "${SKIP_OLEAN_COPY:-0}" = "1" ]; then
+  echo "skipping the olean copy (SKIP_OLEAN_COPY=1) — reusing the ones already in $OUT"
+else
+  rm -rf "$OUT/olean"
+  cp -r "$BUILD_DIR/stage1/lib/lean" "$OUT/olean"
+fi
 git -C "$SRC" rev-parse HEAD > "$OUT/LEAN_COMMIT"
 git -C "$SRC" diff > "$OUT/applied.patch"
 

@@ -37,6 +37,16 @@ recorded: the CMake 4 pin, the emsdk `EMSDK_NODE` path, the `-DUSE_MIMALLOC=OFF`
 `docker-wasm/` does not, and — the expensive one — the bind-mounted work tree whose inode numbers do not fit
 in 32 bits (`## What the fork's own Docker recipe gets wrong`, below).
 
+Two of this harness's *own* footguns are worth recording, because both cost a build cycle. A regenerated
+patch whose `diff --git` header read `a/a/src/…` made GNU `patch` ask which file to patch and then apply
+**nothing** — `git apply` accepted the same file, but `patch` follows that header in preference to
+`---`/`+++`. And cutting the prose at `--- a/` instead of at the first diff marker left the previous
+`diff --git` line in place, so each regeneration appended another conflicting one. Both are fixed, and the
+patches are now verified by running the real `patch --batch --dry-run -p1` **in the build image** against a
+pristine copy of the two files — the tool the build actually uses, not a similar one. `build.sh` itself now
+passes `--batch`, so a patch that does not apply is a hard failure instead of reading its answer from
+stdin (which is the patch file).
+
 Two things about the result are worth keeping in view rather than buried:
 
 - **The first compile is slow: 109 s in the screenshot, 54 s in an earlier run.** Boot is *faster* than the
@@ -46,6 +56,45 @@ Two things about the result are worth keeping in view rather than buried:
   atomic-prefix bytes (429,614 → 14,390) and is explicit that this is evidence, not proof — and V8 does not
   enforce the spec rule either way, so Chrome accepting the module proves nothing. Firefox and Safari
   remain the check.
+
+## What the first-run cost is — and what it is not
+
+One machine, one page, one example (the proof, then the `#eval` example warm):
+
+| build | boot | first compile | warm compile |
+| --- | --- | --- | --- |
+| pthread (pinned, `npm start`) | 5.6 s | **1.22 s** | 0.37 s |
+| single-threaded (this build) | 3.4–19 s | **81–109 s** | 1.83 s |
+
+Four worker threads cannot explain 70–90×, so the gap is not "one thread instead of four". Four
+explanations were tested and **eliminated**, each by measurement rather than argument:
+
+- **Optimization.** `CMAKE_BUILD_TYPE` is empty in the top-level cache, which looked like the answer — but
+  stage1's own cache has it as `Release`, and stage1's flags are `-O3 -DNDEBUG`, read out of `flags.make`.
+  Not it.
+- **Initializers interpreted, or exports missing.** The two artifacts are the same program: 104,709 vs
+  104,692 exported names, **2,309 `initialize_*` in both**, 88,798 `*___boxed` in both, 96,973 `l_*` in
+  both, and the 19 differences are pthread and exception-handling plumbing. Not it.
+- **Unshared memory growth.** The pthread build reserves 2 GiB up front and never grows; ours started at
+  64 MiB. Rebuilt and measured with `-sINITIAL_MEMORY=1073741824`: **no change** (81 s). Not it.
+- **The sequential task manager's drain.** Instrumented to report every 5 s of *accumulated drain time*
+  — count-based reporting had been inconclusive, because a few thousand tasks at 3 ms each is the same
+  90 s as a million cheap ones. Across an 81 s compile it printed **nothing**, so the drain accumulates
+  under 5 s. Not it.
+
+The warm column matters as much as the first: **1.83 s against 0.37 s, about 5×**, on work with no import
+and no tasks in it. So the build is slower in steady state too, and the four explanations above do not
+cover that either — which together point at Lean's own execution under `LEAN_MULTI_THREAD` with no threads
+behind it, not at anything in this harness. Settling that needs wasm-level profiling rather than more flag
+experiments.
+
+Which leaves the lever that does not depend on the diagnosis: **bake an `Init` environment snapshot and
+load it at boot.** `lean_wasm_load_snapshot` is exported by this artifact, upstream ships
+`snapshots/init.snap` for exactly this, and its `Shell.lean` says a snapshot "skips the multi-minute
+`loadExts` import entirely" — it takes the import out of the first Run rather than making it cheaper.
+After that, warming `Init` at page load, which is upstream's other half and spends the time while the
+reader is reading. And if the target is Chrome, the pthread build already boots without isolation
+(measured, §9.7), at 1.22 s.
 
 ## Prerequisites
 

@@ -23,11 +23,11 @@ See wasm-build/README.md. Variant 1 (the fork's stated direction) additionally c
 `-DMULTI_THREAD=OFF`, which is a configure-time flag rather than a patch: with the macro undefined the
 task manager is compiled out and `IO.Promise.new` panics during the `Init` import.
 
-diff --git a/a/src/CMakeLists.txt b/b/src/CMakeLists.txt
-index 54c40ed..9fde9c5 100644
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 54c40ed..bb06649 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -210,10 +210,14 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+@@ -210,12 +210,30 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
      # miscompile (`unreachable` inside readModuleDataPartsOfMod on first
      # compile) was the extern world-token arity mismatch fixed in b6b649fe641.
      # EMSCRIPTEN_SETTINGS holds only flags that change CODEGEN and therefore
@@ -43,8 +43,24 @@ index 54c40ed..9fde9c5 100644
 +    set(EMSCRIPTEN_SETTINGS "-fwasm-exceptions")
      set(EMSCRIPTEN_LINK_SETTINGS "-sALLOW_MEMORY_GROWTH=1 -sINCOMING_MODULE_JS_API=print,printErr,setStatus,locateFile,mainScriptUrlOrBlob,INITIAL_MEMORY,wasmMemory,noInitialRun,preRun,onRuntimeInitialized,onAbort,onExit,arguments,ENV")
  
++    # wasm-build: the initial wasm memory, as a knob, because it decides whether the `Init` import
++    # ever has to *grow* the memory. An unshared memory that grows can be relocated and copied, and
++    # the pthread build sidesteps the whole question by reserving its 2 GiB shared buffer up front
++    # (see the linker flags below). 64 MiB is upstream's value; a larger one trades boot-time RSS for
++    # a first compile that does not pay for growth.
++    set(LEAN_WASM_INITIAL_MEMORY "67108864" CACHE STRING "initial wasm memory in bytes")
++
++    # wasm-build: instrument the sequential task manager, to answer whether the drain loop is where a
++    # first compile's time goes. Off by default; see the `drain` comment in runtime/object.cpp.
++    option(LEAN_WASM_DRAIN_PROFILE "profile the sequential task manager's drain loop" OFF)
++    if(LEAN_WASM_DRAIN_PROFILE)
++      string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_WASM_DRAIN_PROFILE")
++    endif()
++
    # EMSCRIPTEN_DEBUG: Enable readable function names and assertions for debugging
-@@ -674,7 +678,10 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
+   # This makes the WASM larger and slower but shows actual function names in stack traces
+   # instead of mangled names like "invoke_III"
+@@ -674,7 +692,10 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
  endif()
  # Linux ignores undefined symbols in shared libraries by default
  
@@ -56,7 +72,7 @@ index 54c40ed..9fde9c5 100644
    string(APPEND LEAN_EXTRA_LINKER_FLAGS " -pthread")
  endif()
  
-@@ -922,9 +929,11 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+@@ -922,9 +943,11 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
    # memory does NOT grow here (the browser's SharedArrayBuffer isn't resizable in
    # this config), so the worker reserves the real size up front; MAXIMUM_MEMORY=4GB
    # raises the wasm32 ceiling from 2GB so we can test whether the import fits.
@@ -65,7 +81,7 @@ index 54c40ed..9fde9c5 100644
    string(
      APPEND LEAN_EXE_LINKER_FLAGS
 -    " ${LIB}/temp/libleanshell.a ${TOOLCHAIN_STATIC_LINKER_FLAGS} ${EMSCRIPTEN_SETTINGS} ${EMSCRIPTEN_LINK_SETTINGS} -lnodefs.js -s EXIT_RUNTIME=1 -s MAIN_MODULE=2 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -sEXPORTED_FUNCTIONS=@${LEAN_SOURCE_DIR}/emscripten-exports.txt -sEXPORTED_RUNTIME_METHODS=ccall,callMain,FS,ENV,getValue,setValue,stringToNewUTF8,UTF8ToString -s STACK_SIZE=16777216 -sINITIAL_MEMORY=67108864 -sMAXIMUM_MEMORY=4294967296 -sPTHREAD_POOL_SIZE=4"
-+    " ${LIB}/temp/libleanshell.a ${TOOLCHAIN_STATIC_LINKER_FLAGS} ${EMSCRIPTEN_SETTINGS} ${EMSCRIPTEN_LINK_SETTINGS} -lnodefs.js -s EXIT_RUNTIME=1 -s MAIN_MODULE=2 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -sEXPORTED_FUNCTIONS=@${LEAN_SOURCE_DIR}/emscripten-exports.txt -sEXPORTED_RUNTIME_METHODS=ccall,callMain,FS,ENV,getValue,setValue,stringToNewUTF8,UTF8ToString -s STACK_SIZE=16777216 -sINITIAL_MEMORY=67108864 -sMAXIMUM_MEMORY=4294967296"
++    " ${LIB}/temp/libleanshell.a ${TOOLCHAIN_STATIC_LINKER_FLAGS} ${EMSCRIPTEN_SETTINGS} ${EMSCRIPTEN_LINK_SETTINGS} -lnodefs.js -s EXIT_RUNTIME=1 -s MAIN_MODULE=2 -s ERROR_ON_UNDEFINED_SYMBOLS=0 -sEXPORTED_FUNCTIONS=@${LEAN_SOURCE_DIR}/emscripten-exports.txt -sEXPORTED_RUNTIME_METHODS=ccall,callMain,FS,ENV,getValue,setValue,stringToNewUTF8,UTF8ToString -s STACK_SIZE=16777216 -sINITIAL_MEMORY=${LEAN_WASM_INITIAL_MEMORY} -sMAXIMUM_MEMORY=4294967296"
    )
  endif()
  
