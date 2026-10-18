@@ -29,9 +29,14 @@ bake() { # <name> <probe>
 	echo "=== ${name} from: $(printf '%s' "$probe" | head -1)"
 	# The bake performs the import once and exits itself, so nothing after the run is reliable — check the
 	# file rather than the exit status.
-	"$NODE" /w/bake-snapshot.cjs "$ARTIFACT" /bakeout "$name" "$probe" 2>&1 | tail -4 || true
+	#
+	# Keep the whole output in a file and show its tail. Piping straight through `tail` cost a diagnosis
+	# here: the first Lean bake trapped, and the four lines that survived were the bottom of a stack — the
+	# message that said why had already been dropped.
+	"$NODE" /w/bake-snapshot.cjs "$ARTIFACT" /bakeout "$name" "$probe" >"/bakeout/${name}.bake.log" 2>&1 || true
+	tail -20 "/bakeout/${name}.bake.log" || true
 	if [ ! -f "/bakeout/${name}.snap" ]; then
-		echo "no ${name}.snap was written — the output above says why" >&2
+		echo "no ${name}.snap was written — /bakeout/${name}.bake.log has the whole run" >&2
 		exit 1
 	fi
 	du -h "/bakeout/${name}.snap"
