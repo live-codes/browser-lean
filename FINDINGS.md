@@ -1007,3 +1007,14 @@ serve `import Batteries` at all, and the note the runtime prints — "mirror it 
 is optimistic for this build. `mirror-lib.sh` does the mirroring and writes the plain `lean-lib-files.json`
 index the runtime probes; plain rather than `.gz`, because a `.gz` index tells it to expect every module
 compressed too.
+
+**And the layout has to be enforced, not merely intended.** The runtime probes `lean-lib-files.json.gz` first,
+and finding one tells it every module in that directory is `.gz`. So a stale index from the *other* layout
+wins the probe and makes the whole tree unreadable: each `<module>.gz` request 404s, each 404 reads as "this
+module has no such sibling", every file is skipped, and the run ends precisely where it started —
+`unknown module prefix 'Std'`, with the note saying Std is not on the asset host. That is what happened here
+after the modules were finally in place: upstream's `.gz` index had been left behind by a fetch whose modules
+were all refused, and the plain index written afterwards was never the one being read. It also explains a
+symptom worth remembering — the page reported the *note* rather than a fetch error, because from the worker's
+point of view nothing had failed. `mirror-lib.sh` deletes the other layout's index rather than merely
+avoiding it.

@@ -50,6 +50,14 @@ present=()
 for root in "${ROOTS[@]}"; do
 	[ -d "${DEST}/${root}" ] && present+=("$root")
 done
+
+# One layout, enforced rather than intended. The runtime probes for `lean-lib-files.json.gz` *first*, and
+# finding one tells it every module in the directory is `.gz` — so a stale index from the other layout wins
+# the probe and quietly makes the whole tree unreadable: each module 404s, each 404 is "no such sibling",
+# every file is skipped, and the only symptom is the compiler still saying `unknown module prefix 'Std'` at
+# the end of the run. This is not hypothetical; it is what an earlier partial fetch left here, and it is why
+# the plain index written below was not the one being read.
+rm -f "${DEST}/lean-lib-files.json.gz"
 (
 	cd "$DEST"
 	{
@@ -57,5 +65,5 @@ done
 		for root in "${present[@]}"; do [ -f "${root}.olean" ] && echo "${root}.olean"; done
 	} | sort | sed 's/^/  "/; s/$/",/' | sed '$ s/,$//' | sed '1i [' | sed '$a ]'
 ) >"${DEST}/lean-lib-files.json"
-echo "index: $(grep -c olean "${DEST}/lean-lib-files.json") modules listed"
+echo "index: $(grep -c olean "${DEST}/lean-lib-files.json") modules listed, plain layout"
 du -sh "$DEST"
