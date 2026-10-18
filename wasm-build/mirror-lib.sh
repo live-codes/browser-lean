@@ -30,15 +30,32 @@ for root in "${ROOTS[@]}"; do
 	# .olean, .ir and .ir.sig travel together: an .ir is only read when its .ir.sig is present.
 	(cd "$LIB_ROOT" && find "$root" -type f \( -name '*.olean' -o -name '*.ir' -o -name '*.ir.sig' \) -print0 |
 		xargs -0 -r cp --parents -t "$DEST")
-	echo "${root}: $(find "${DEST}/${root}" -name '*.olean' | wc -l) modules"
+	# A library's own root module is a *sibling* of its directory — `Std.olean` beside `Std/` — so a search
+	# inside the directory misses it, and it is the one module `import Std` resolves. Upstream's index lists
+	# it first (`[ "Batteries.olean", …`), which is what gave this away.
+	(cd "$LIB_ROOT" && find . -maxdepth 1 -type f \
+		\( -name "${root}.olean" -o -name "${root}.ir" -o -name "${root}.ir.sig" \) -print0 |
+		xargs -0 -r cp --parents -t "$DEST")
+	echo "${root}: $(find "${DEST}/${root}" -name '*.olean' | wc -l) modules under it"
 done
 
 # The index is a JSON array of `.olean` paths — the one file the runtime probes to learn how the directory is
 # stored. Written plain and not `.gz`, because a `.gz` index tells the runtime to expect every module
 # compressed too; mixing the two layouts breaks the tree rather than degrading it.
+#
+# Only the roots this tree actually has: `find` on a missing directory exits non-zero, and under `set -e` that
+# takes the index down with it — leaving a mirror with 1,677 modules and nothing to probe. Batteries is
+# normally missing, because it is not part of Lean's own distribution.
+present=()
+for root in "${ROOTS[@]}"; do
+	[ -d "${DEST}/${root}" ] && present+=("$root")
+done
 (
 	cd "$DEST"
-	find "${ROOTS[@]}" -name '*.olean' 2>/dev/null | sort | sed 's/^/  "/; s/$/",/' | sed '$ s/,$//' | sed '1i [' | sed '$a ]'
+	{
+		find "${present[@]}" -name '*.olean'
+		for root in "${present[@]}"; do [ -f "${root}.olean" ] && echo "${root}.olean"; done
+	} | sort | sed 's/^/  "/; s/$/",/' | sed '$ s/,$//' | sed '1i [' | sed '$a ]'
 ) >"${DEST}/lean-lib-files.json"
-echo "index: $(find "$DEST" -name '*.olean' | wc -l) modules listed"
+echo "index: $(grep -c olean "${DEST}/lean-lib-files.json") modules listed"
 du -sh "$DEST"

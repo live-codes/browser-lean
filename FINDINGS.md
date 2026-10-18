@@ -976,5 +976,34 @@ container runs a copy of `build.sh` baked in at image build time, so edits to th
 
 **What this does not settle.** A snapshot is build-specific by construction — the loader's own doc says its
 closure relocation is only correct against that binary's function table — so one must be baked per artifact,
-and a 230 MB file per variant is a publishing decision rather than a technical one. Nor is any of it verified
-on Firefox or Safari, for the same reason the atomics count is not: V8 is one engine.
+and a 230 MB file per variant is a publishing decision rather than a technical one. Chrome is what this repo
+measured; **the snapshot path was then run in Firefox and works there too** (reported, not measured here).
+Safari is untested, which is the same gap the atomics count has.
+
+## 9.9 The optional libraries are per-build, and so is every path to them
+
+`Std`, `Lean` and `Batteries` are not packed. The runtime fetches them file by file when the compiler says
+`unknown module prefix 'X'` — `src/roots.js` turns that into a fetch and a retry — so a mirror needs a second
+directory beside `lean-wasm/`. Three things about it are easy to get wrong, and all three fail in a way that
+looks like something else.
+
+**The paths.** Upstream keeps the index beside the runtime and the tree one level down:
+`/lean-wasm/lean-lib-files.json`, but `/lean-wasm/lean-lib/Std.olean`. Asking for `<root>/Std.olean` does not
+404 — the host answers `200` with its SPA shell for every path it does not have — so all 5,598 requests come
+back as 1,576 bytes of HTML and are refused one by one at the end of a two-minute run. Probe the host and read
+the first bytes; a status code is worthless there.
+
+**The build.** Upstream's tree is built by `62b6a229`, this artifact's core layer by `dfe49531`. The fetch tool
+refuses the mixture, and the runtime would fail on it anyway, because an `.olean` is only readable by the
+compiler that wrote it. So a fork-built artifact mirrors its *own* library, which the build tree already holds
+— 32k files, of which only the `Init` closure is packed into the core layer.
+
+**The root module.** `Std.olean` is a sibling of `Std/`, not a member of it, so a search inside the directory
+misses it — and it is the module `import Std` resolves. Upstream's index lists it first
+(`[ "Batteries.olean", …`), which is how the omission surfaced.
+
+`Batteries` is absent from the tree entirely: it is not part of Lean's distribution, so a fork build cannot
+serve `import Batteries` at all, and the note the runtime prints — "mirror it with `lean-wasm-fetch-assets`" —
+is optimistic for this build. `mirror-lib.sh` does the mirroring and writes the plain `lean-lib-files.json`
+index the runtime probes; plain rather than `.gz`, because a `.gz` index tells it to expect every module
+compressed too.
