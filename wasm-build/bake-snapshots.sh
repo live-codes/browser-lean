@@ -33,7 +33,13 @@ bake() { # <name> <probe>
 	# Keep the whole output in a file and show its tail. Piping straight through `tail` cost a diagnosis
 	# here: the first Lean bake trapped, and the four lines that survived were the bottom of a stack — the
 	# message that said why had already been dropped.
-	"$NODE" /w/bake-snapshot.cjs "$ARTIFACT" /bakeout "$name" "$probe" >"/bakeout/${name}.bake.log" 2>&1 || true
+	#
+	# `--stack-size`: saving the Lean environment overflowed the call stack, and that was measured *after* a
+	# successful 2,308-module import and a successful elaboration — so it is the write, not the import, and
+	# not memory either (which is what I assumed first). A flag rather than `-sSTACK_SIZE` deliberately: a
+	# relink changes the binary, and a snapshot is valid only for the binary that baked it, so raising the
+	# wasm stack that way would also mean re-baking Init and Std.
+	"$NODE" --stack-size=4000 /w/bake-snapshot.cjs "$ARTIFACT" /bakeout "$name" "$probe" >"/bakeout/${name}.bake.log" 2>&1 || true
 	tail -20 "/bakeout/${name}.bake.log" || true
 	if [ ! -f "/bakeout/${name}.snap" ]; then
 		echo "no ${name}.snap was written — /bakeout/${name}.bake.log has the whole run" >&2
