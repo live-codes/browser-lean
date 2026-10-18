@@ -1077,3 +1077,34 @@ line counts in its `@@` headers and patch then refuses the file. But the knob is
 the binary invalidates *every* snapshot — they are per-binary — so both working ones were re-baked and Std
 re-measured against the new artifact: **13–31 s** depending on whether the mirror is warm or cold, against
 ~128 s before.
+
+## 9.12 Mathlib cannot be mirrored into this build, and every reason is checkable
+
+§9.9 left open whether a compatible Mathlib could be *found* rather than built. It cannot: both ways in are
+closed, and each is closed by a fact rather than an inference — which matters here, because this is the third
+route I proposed for this problem and the first two were wrong.
+
+**Through Mathlib's cache.** The plan was to pin Mathlib to the revision whose `lean-toolchain` is the Lean
+master nightly containing this artifact's commit, then `lake exe cache get`. Mathlib's `master` does not track
+Lean master; it tracks *releases*. On 2026-09-06 it pinned `v4.34.0-rc2` — bumped 2026-08-21, not again until
+2026-09-15 — and searching the history of `lean-toolchain` finds no `nightly-*` value anywhere. The branches
+that *do* follow nightlies (`nightly-testing-<date>`) are gone: `git ls-remote` against the repository returns
+**zero** nightly refs among its 48,763. So its published oleans were built by release toolchains, and an
+`.olean` is only readable by the compiler that wrote it.
+
+**Through a nightly toolchain.** A Lean nightly *is* a native toolchain built at one commit, so the nightly
+whose head is this artifact's commit would be exactly compatible. None exists: the tag that would carry it is
+`nightly-2026-09-07`, and there is no such tag. The neighbours (`-06`, `-08`, `-09`) have different trees —
+compared by tree hash rather than by date, because a tree hash is exact and a date is a guess, which is the
+lesson from the attempts that preceded this.
+
+So a working Mathlib needs a native Lean built at this commit *and* a Mathlib source snapshot that compiles
+against it. Mathlib's source of that date targets a release, and the source that tracked master is exactly the
+nightly-testing snapshot that no longer exists. That is a research project with a real chance of failing at its
+second step, not a task to run in the background.
+
+**What follows for the page.** The note the runtime prints for Mathlib is right for the host the package
+normally points at — upstream's layer matches upstream's artifact — and wrong for this one, where it advises a
+command that cannot succeed. Both layers carry their build in their manifest (`"version": "lean-core-62b6a22913"`
+against this artifact's `dfe4953`), so the runtime can tell the two cases apart and could say which it is. That
+is a change to the package rather than to the mirror, and it is the honest fix.
