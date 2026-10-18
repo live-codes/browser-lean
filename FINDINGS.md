@@ -926,3 +926,55 @@ headers as successes, and now get them.
 What is left is not a build problem: publishing an artifact (~127 MB per variant), re-mirroring the library
 trees it produces, and knowing whether Firefox and Safari accept a module with an unshared memory that may
 still carry atomic instructions.
+
+## 9.8 The first-run cost, eliminated — and the bug was in how the snapshot was called
+
+The single-threaded build's import is no longer on the users' path. On the same non-isolated page, with no
+`SharedArrayBuffer`: **first run 0.30 s and 0.55 s**, against **75–79 s** without a snapshot, and a
+page-to-accepted-proof wall of **5.4–5.5 s** — `Lean ready` now *includes* installing a 230 MB snapshot, and
+`Run #1` after it is half a second. The three measured numbers for this build now read 0.3 s (snapshot),
+75–79 s (no snapshot), and 54 s (§9.7's earlier run, which had a different page payload and no library layer
+in memory yet).
+
+**The call was wrong, and that was the whole problem.** The export's signature is
+`LEAN_EXPORT lean_object* lean_wasm_load_snapshot(lean_object*)` — the path is a Lean `String`, i.e. a boxed
+`lean_object*`. The worker passed a **JavaScript string**, which coerces to `0` as an i32, so the loader
+dereferenced a null-ish pointer and trapped with `memory access out of bounds` *before its first line ran*.
+A wrong call dressed as a wrong amount of memory — and it cost a 2 GiB rebuild, which changed nothing, to
+rule the memory out. The correct call is the one the compile path already used:
+
+    const ptr = Module.stringToNewUTF8(path);
+    const obj = Module._lean_mk_string(ptr);
+
+The tell was there to read: the loader traces its own entry (`[WASM DEBUG] wasmLoadSnapshot: loading …`) and
+**no trace appeared at all**. A trap below the trace means the body never started, which is an argument
+problem, not a data problem. One look at the generated C (`build/wasm-*/stage1/lib/temp/Lean/Shell.c`) gave
+the signature, after several rounds of guessing from the Lean side.
+
+**The bake needed `--threads=0`.** The CLI defaults to `defaultNumThreads`, builds a real task-manager pool,
+and `std::thread` fails on an artifact with no pthreads: `lean::throwable: failed to create thread`, before it
+elaborates anything. Under Node that prints; in a browser the throw leaves the bake never returning, which is
+what the ten-minute silence was. Zero workers routes the tasks through the same sequential path the
+playground uses.
+
+**And the cost it skips is measured, not inferred.** With the drain instrumentation left on, the CLI reports:
+
+    [DRAIN] tasks=8 drains=1 inside_drain_ms=133907
+
+Eight tasks, **134 s inside them**, ~17 s each, one after another. That is the import, and why no build flag
+changes it. §9.4's "the drain accumulates under 5 s" measured the playground's cached `wasm_compile` path
+instead of the CLI's frontend path; they are not the same work.
+
+**Two harness bugs, both silent.** The variant argument was compared literally, so `build.sh wasm-2` skipped
+the runtime patch while still writing that variant's applied-marker — and the next run trusted the marker,
+skipped the reset, and built without it. Such a binary links, boots, and then panics in `IO.Promise.new`,
+which reads as anything but a build problem. The tree's state is now *asked* (`git apply -R --check`) rather
+than remembered, and the argument is validated. Not with `patch -R --dry-run`: in batch mode patch skips a
+patch it believes is applied and still exits 0, so that check calls every patch applied. Separately, the
+container runs a copy of `build.sh` baked in at image build time, so edits to the script appear to do nothing
+— identical output, identical line numbers. `/w/build.sh` runs the mounted one.
+
+**What this does not settle.** A snapshot is build-specific by construction — the loader's own doc says its
+closure relocation is only correct against that binary's function table — so one must be baked per artifact,
+and a 230 MB file per variant is a publishing decision rather than a technical one. Nor is any of it verified
+on Firefox or Safari, for the same reason the atomics count is not: V8 is one engine.

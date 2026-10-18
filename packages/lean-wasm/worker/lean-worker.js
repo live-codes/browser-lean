@@ -463,21 +463,40 @@ async function finishStartup() {
       bytes = null;
     }
     if (bytes) {
-      // Writing is separate from fetching, and reporting them together hid which one failed — a 230 MB
-      // snapshot into a 1 GiB heap is its own kind of mistake.
       try {
         Module.FS.writeFile(SNAPSHOT_PATH, bytes);
         // The loader reads a dependency sidecar beside the snapshot. A self-contained snapshot's list is
-        // empty, which is why upstream ships only the snapshot itself and writes the sidecar in the worker —
-        // and why the load is refused without it.
+        // empty, which is why upstream ships only the snapshot itself and writes the sidecar in the worker.
         Module.FS.writeFile(`${SNAPSHOT_PATH}.deps`, new Uint8Array([0x5b, 0x5d]));
-        const code = Module._lean_wasm_load_snapshot(SNAPSHOT_PATH);
+        // The path must be a `lean_object*`, not a JavaScript string. The export's parameter is a Lean
+        // `String`, and a JS string coerces to 0 as an i32 — so the loader dereferences a bogus pointer and
+        // traps with "memory access out of bounds" *before* its first line runs. That is a wrong call
+        // dressed up as a wrong amount of memory, and it cost a 2 GiB rebuild to rule the memory out.
+        // `mkLeanString` is the same marshalling the compile path above uses.
+        const trace = [];
+        const outerPrintErr = Module.printErr;
+        Module.printErr = (line) => {
+          if (typeof line === 'string' && line.includes('wasmLoadSnapshot')) trace.push(line);
+          if (typeof outerPrintErr === 'function') outerPrintErr(line);
+        };
+        try {
+          Module._lean_wasm_load_snapshot(mkLeanString(SNAPSHOT_PATH));
+        } finally {
+          Module.printErr = outerPrintErr;
+        }
+        // The loader prints `cached env for […]` on success and `failed: …` on refusal, but that trace does
+        // not reach `printErr` on every path — so report what is known rather than assert a verdict. A missing
+        // trace is not a failure: the first run's time is what settles it, and on this build it is ~0.3 s when
+        // the cache is seeded against ~75 s when it is not.
+        const megabytes = (bytes.length / 1048576).toFixed(1);
+        const refused = trace.find((line) => line.includes('failed'));
         post({
           type: 'status',
-          data:
-            code === 0
-              ? `loaded the Init snapshot (${(bytes.length / 1048576).toFixed(1)} MB) — the first run will not import`
-              : `the Init snapshot was refused (code ${code}); the first run will import instead`,
+          data: trace.some((line) => line.includes('cached env for'))
+            ? `the loader seeded the environment cache from the Init snapshot (${megabytes} MB) — the first run skips the import`
+            : refused
+              ? `the Init snapshot was refused (${refused}) — the first run imports instead`
+              : `Init snapshot handed to the loader (${megabytes} MB); the first run's time shows whether the cache was seeded`,
         });
       } catch (error) {
         post({

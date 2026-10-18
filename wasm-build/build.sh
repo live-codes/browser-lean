@@ -8,7 +8,17 @@
 # them (FINDINGS.md §5) and a branch head would drift under us.
 set -euxo pipefail
 
-VARIANT="${1:-2}"
+# Accept the names the run commands use, and refuse anything else. This matters more than it looks: the
+# patch selection below is a `case`, so an unrecognised variant name skips the runtime patch *and* still gets
+# an applied-marker of its own — which is how a build came out with no task manager in it and was read as a
+# memory bug. An argument that is not understood is a hard error here.
+VARIANT_ARG="${1:-2}"
+VARIANT="${VARIANT_ARG#variant-}"
+VARIANT="${VARIANT#wasm-}"
+case "$VARIANT" in
+  1|2|3) ;;
+  *) echo "error: unknown variant '${VARIANT_ARG}' — expected 1, 2 or 3 ('wasm-2' and 'variant-2' are accepted)" >&2; exit 2 ;;
+esac
 FORK=https://github.com/cauli/lean4.git
 # cauli/lean4 @ reinstate-wasm, 2026-09-06 — the revision FINDINGS.md §9 quotes.
 PIN=dfe49531687435bcb38516a73a7c7ff55e3ef25e
@@ -49,28 +59,66 @@ fi
 #
 # Resuming matters here: resetting and re-applying the patches rewrites the patched files, which `make`
 # reads as "sources changed" and answers by rebuilding stage0 — tens of minutes thrown away to change
-# nothing. So the reset and the patches are skipped when the tree already carries this variant's diff,
-# marked by a file in the source tree (which lives on the volume, so it survives the container).
-# `RESET=1` forces it, which is what switching variants needs.
-if [ "${RESET:-0}" = "1" ] || [ ! -f "$SRC/.applied-variant-$VARIANT" ]; then
+# nothing. So the reset is skipped when the tree already carries this variant's patches.
+#
+# Whether it does is *asked of the tree*, not remembered. An earlier version kept a marker file per variant
+# name and trusted it; a run whose variant argument was not 1, 2 or 3 skipped the runtime patch, wrote the
+# marker anyway, and the next run then skipped the reset and built without it.
+#
+# `patch --batch -R --dry-run` is not the question to ask: in batch mode patch skips a patch it believes is
+# already applied and still exits 0, so it reports every patch as applied. `git apply -R --check` asks the
+# real one — can this patch be reversed out of the tree? — and fails when it cannot.
+variant_patches() {
+  echo "/patches/0001-cmake-single-threaded.patch"
+  case "$1" in
+    2) echo "/patches/0002-sequential-task-manager.patch" ;;
+    3) echo "/patches/0003-unthreaded-promise-shim.patch" ;;
+  esac
+}
+
+patch_is_applied() { git -C "$SRC" apply -R --check -p1 "$1" >/dev/null 2>&1; }
+
+# "Exactly these", not "at least these": variant 1 is the flags-only measurement, and a tree still carrying
+# the runtime patch would quietly measure something else.
+patches_match() {
+  local p
+  for p in /patches/0*.patch; do
+    if printf '%s\n' "$1" | grep -qx -- "$p"; then
+      patch_is_applied "$p" || return 1
+    else
+      patch_is_applied "$p" && return 1
+    fi
+  done
+  return 0
+}
+
+WANTED="$(variant_patches "$VARIANT")"
+for p in $WANTED; do
+  [ -f "$p" ] || { echo "error: missing patch ${p}" >&2; exit 1; }
+done
+
+if [ "${RESET:-0}" = "1" ] || ! patches_match "$WANTED"; then
   # The reset makes the tree pristine, so a patch that does not apply is a hard error rather than a
   # silently unpatched build — which would waste hours and then look like a runtime bug.
   git -C "$SRC" checkout -q -- .
   # `--batch` so a patch that does not apply is a hard failure. Without it patch asks "File to patch:" and
   # reads its answer from *stdin* — which is the patch file — so it consumes hunks as replies and carries
   # on having applied nothing, which then looks like a flags problem hours later.
-  patch --batch -d "$SRC" -p1 < /patches/0001-cmake-single-threaded.patch
-  if [ "$VARIANT" = "2" ]; then
-    # Keep the macro; create the manager with zero workers and drain on whoever waits.
-    patch --batch -d "$SRC" -p1 < /patches/0002-sequential-task-manager.patch
-  elif [ "$VARIANT" = "3" ]; then
-    # No macro at all: no manager, tasks run inline — plus the promise/IO paths that assume a manager.
-    patch --batch -d "$SRC" -p1 < /patches/0003-unthreaded-promise-shim.patch
-  fi
-  touch "$SRC/.applied-variant-$VARIANT"
+  for p in $WANTED; do patch --batch -d "$SRC" -p1 <"$p"; done
 else
-  echo "tree already carries variant $VARIANT's patches; skipping the reset (RESET=1 to force one)"
+  echo "tree already carries variant ${VARIANT}'s patches; skipping the reset (RESET=1 to force one)"
 fi
+
+# Verify. Both ways this goes wrong — a patch that quietly did not apply, and a tree left patched for a
+# different variant — produce a binary that links, boots, and then misbehaves a long way from the cause.
+if ! patches_match "$WANTED"; then
+  echo "error: ${SRC} does not carry exactly variant ${VARIANT}'s patches; refusing to build" >&2
+  for p in /patches/0*.patch; do
+    if patch_is_applied "$p"; then echo "  applied: $(basename "$p")" >&2; else echo "  missing: $(basename "$p")" >&2; fi
+  done
+  exit 1
+fi
+touch "$SRC/.applied-variant-$VARIANT"
 git -C "$SRC" diff --stat
 
 # ---- Configure ------------------------------------------------------------------------------------
