@@ -254,7 +254,13 @@ async function resolveSource(from) {
 		return {
 			kind: 'flat',
 			wasmBase: from,
-			libBase: from,
+			// Two bases, because upstream keeps the index beside the runtime and the per-file tree one level
+			// down: `/lean-wasm/lean-lib-files.json` but `/lean-wasm/lean-lib/Std.olean`. Asking for
+			// `<from>/Std.olean` instead does not fail — the host answers `200` with its SPA shell for every
+			// path it does not have, so it looks like a successful download of 1,576 bytes of HTML, and every
+			// one of 5,598 files is refused one by one at the end of a long run.
+			libIndexBase: from,
+			libBase: `${from}/lean-lib`,
 			layerManifest: `${from}/real-analysis-layer.json`,
 			layerPackBase: `${from}/real-analysis-lib`
 		};
@@ -263,6 +269,8 @@ async function resolveSource(from) {
 		return {
 			kind: 'mirror',
 			wasmBase: `${from}/lean-wasm`,
+			// What this tool writes: both the index and the tree inside `lean-lib/`.
+			libIndexBase: `${from}/lean-lib`,
 			libBase: `${from}/lean-lib`,
 			layerManifest: `${from}/lean-mathlib/real-analysis-layer.json`,
 			layerPackBase: `${from}/lean-mathlib`
@@ -308,7 +316,7 @@ async function fetchLayer({ manifestUrl, packBase, outRoot, packDir, manifestNam
  * suffix. The runtime probes the index once to decide how the whole directory is stored, so the two
  * must not be mixed.
  */
-async function fetchLibs(sourceBase, outRoot, roots) {
+async function fetchLibs(indexBase, moduleBase, outRoot, roots) {
 	const gz = compress ? '.gz' : '';
 	const indexPath = join(outRoot, `lean-lib-files.json${gz}`);
 	let index;
@@ -320,11 +328,11 @@ async function fetchLibs(sourceBase, outRoot, roots) {
 	} else {
 		if (stored && !verdict.ok) problems.push(`lean-lib-files.json${gz}: ${verdict.reason}`);
 		if (checkOnly) return 0;
-		const body = await fetchRetry(`${sourceBase}/lean-lib-files.json`);
-		if (!body) throw new Error(`lean-lib-files.json is not published at ${sourceBase}`);
+		const body = await fetchRetry(`${indexBase}/lean-lib-files.json`);
+		if (!body) throw new Error(`lean-lib-files.json is not published at ${indexBase}`);
 		const written = compress ? gzipSync(body, { level: 9 }) : body;
-		if (!(await writeValidated(indexPath, `lean-lib-files.json${gz}`, written, `${sourceBase}/lean-lib-files.json`))) {
-			throw new Error(`lean-lib-files.json is not a valid index at ${sourceBase}`);
+		if (!(await writeValidated(indexPath, `lean-lib-files.json${gz}`, written, `${indexBase}/lean-lib-files.json`))) {
+			throw new Error(`lean-lib-files.json is not a valid index at ${indexBase}`);
 		}
 		index = JSON.parse(body.toString('utf8'));
 	}
@@ -345,7 +353,7 @@ async function fetchLibs(sourceBase, outRoot, roots) {
 			if (i >= targets.length) return;
 			const rel = targets[i];
 			try {
-				const written = await fetchTo(`${sourceBase}/${rel}`, join(outRoot, rel), `lean-lib/${rel}`, { compress });
+				const written = await fetchTo(`${moduleBase}/${rel}`, join(outRoot, rel), `lean-lib/${rel}`, { compress });
 				if (written != null) bytes += written;
 			} catch (error) {
 				console.warn(`  ! ${rel}: ${error.message}`);
@@ -391,7 +399,7 @@ try {
 	}
 
 	if (only.includes('lib')) {
-		total.bytes += await fetchLibs(source.libBase, join(directory, 'lean-lib'), LIBRARY_ROOTS);
+		total.bytes += await fetchLibs(source.libIndexBase, source.libBase, join(directory, 'lean-lib'), LIBRARY_ROOTS);
 		console.log('');
 	}
 
@@ -423,7 +431,9 @@ try {
 		console.log('\nServe that directory as `baseUrl`, with both headers:');
 		console.log('  Access-Control-Allow-Origin: *');
 		console.log('  Cross-Origin-Resource-Policy: cross-origin');
-		console.log('\nLean needs a cross-origin isolated page (COOP/COEP) to run at all.');
+		console.log('\nThe page needs no cross-origin isolation. The artifact this mirrors is single-threaded, so');
+		console.log('there is no SharedArrayBuffer and no COOP/COEP to arrange. CORP matters only for an isolated');
+		console.log('page: `lean.js` arrives via importScripts(), which COEP checks against CORP, not CORS.');
 		if (compress) {
 			console.log('Compressed layout: the runtime prefers <file>.gz and falls back to the plain name,');
 			console.log('so you can delete the uncompressed originals to halve what you host.');
