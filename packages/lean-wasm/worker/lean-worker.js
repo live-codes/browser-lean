@@ -283,14 +283,76 @@ async function fetchIfPresent(url) {
 }
 
 /**
- * Fetch every published file for one library root.
+ * Supplying one library root: a baked snapshot when there is one for it, otherwise every published file of
+ * it, one file at a time.
  *
- * No dependency graph is computed here: the page retries the compile after each
- * load, and Lean's own "unknown module prefix" error names the next root that is
- * missing, so the closure is discovered by asking the compiler.
+ * No dependency graph is computed either way: the page retries the compile after each load, and Lean's own
+ * "unknown module prefix" error names the next root that is missing, so the closure is discovered by asking
+ * the compiler.
  */
+/**
+ * Try a baked snapshot for this root before its per-file tree.
+ *
+ * On a single-threaded build the *import* dominates, not the bytes: measured on the Std demo, fetching its
+ * 483 modules' 1,449 files takes 5 s and loading them takes 104 s. A snapshot turns that import into a
+ * deserialization. The loader reports its verdict on stderr — `cached env for [...]`, or `failed: ...` — and
+ * that is the only signal worth trusting; its return value is an IO result whose layout is not ours to guess.
+ *
+ * Returns null when there is no snapshot for this root or it was refused, and the caller falls through to
+ * the tree — which stays the general path, because a snapshot only matches the header it was baked for.
+ */
+async function tryRootSnapshot(root) {
+  const name = root.toLowerCase();
+  const url = `${assetBase}/snapshots/${name}.snap`;
+  let bytes = null;
+  try {
+    const response = await fetch(url);
+    if (response.ok) {
+      post({ type: 'status', data: `fetching the ${root} snapshot…` });
+      bytes = new Uint8Array(await response.arrayBuffer());
+    }
+  } catch {
+    return null;
+  }
+  if (!bytes) return null;
+
+  const path = `/workspace/${name}.snap`;
+  const trace = [];
+  const outerPrintErr = Module.printErr;
+  Module.printErr = (line) => {
+    if (typeof line === 'string' && line.includes('wasmLoadSnapshot')) trace.push(line);
+    if (typeof outerPrintErr === 'function') outerPrintErr(line);
+  };
+  try {
+    Module.FS.writeFile(path, bytes);
+    Module.FS.writeFile(`${path}.deps`, new Uint8Array([0x5b, 0x5d]));
+    Module._lean_wasm_load_snapshot(mkLeanString(path));
+  } catch {
+    return null;
+  } finally {
+    Module.printErr = outerPrintErr;
+  }
+
+  // Fall through to the file tree either way. The snapshot's verdict is not readable from here — the
+  // loader's trace does not reach `printErr` on this path, the same thing that made the Init snapshot's
+  // message read as "inconclusive" — and the tree is needed regardless: the program's header still has to
+  // *resolve* the module it imports, and a snapshot only supplies the elaborated environment for that
+  // header. What the snapshot removes is the import's realization, which is the 104 s rather than the 5 s.
+  post({
+    type: 'status',
+    data: `handed the ${root} snapshot to the loader (${(bytes.length / 1048576).toFixed(1)} MB) — the file tree follows either way`
+  });
+  return null;
+}
+
 async function loadRoot(root) {
   if (loadedRoots.has(root)) return { root, files: 0, bytes: 0, alreadyLoaded: true };
+
+  const fromSnapshot = await tryRootSnapshot(root);
+  if (fromSnapshot) {
+    loadedRoots.add(root);
+    return fromSnapshot;
+  }
 
   const index = await getLibraryIndex();
   const modules = index.filter((p) => p === `${root}.olean` || p.startsWith(`${root}/`));

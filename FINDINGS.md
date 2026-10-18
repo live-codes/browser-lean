@@ -1018,3 +1018,30 @@ were all refused, and the plain index written afterwards was never the one being
 symptom worth remembering — the page reported the *note* rather than a fetch error, because from the worker's
 point of view nothing had failed. `mirror-lib.sh` deletes the other layout's index rather than merely
 avoiding it.
+
+## 9.10 The same trick for the libraries: one snapshot per header
+
+The Std demo's first run was **127.56 s**; it is now **12.84 s**. Nothing about the artifact changed — 104 s
+of that was the `Std` import, and a snapshot removes an import the same way it removed `Init`'s.
+
+Timing the phases *first* is what made this quick, and the split is worth keeping: boot 9.0 s (including the
+230 MB `Init` snapshot, which has cut the first compile attempt from 75 s to ~9 s), then that attempt failing
+with `unknown module prefix 'Std'`, then **5 s to fetch all 1,449 files** of the tree at 8-way concurrency,
+then **104 s to load those 483 modules** — the number worth attacking, and the only one of the four a
+snapshot helps.
+
+A snapshot's cache key is the *header's import list*, read back out of the loaded environment, so it covers a
+program only when the imports match exactly. `std.snap` is baked from a probe that is `import Std.Data.HashMap`
+— the demo's own header — and comes out at 318 MB, 1.4× the `Init` snapshot, so it fits the same heap.
+`wasm-build/bake-snapshots.sh` bakes them by name (`init`, `std`, `lean`), off-line and once.
+
+It is loaded **on demand** rather than at boot: the on-demand path tries `snapshots/<root>.snap` before the
+file tree, and then fetches the tree anyway — not as a fallback but as a necessity, because the program's
+header still has to *resolve* the module it imports, and a snapshot only supplies the elaborated environment.
+What it removes is the realization: the 104 s, not the 5 s.
+
+Two caveats. It trades **318 MB on the wire** for ~104 s of compute — right for a mirror on localhost or a
+LAN, and worth re-measuring against a real host, where the tree's ~10 MB compressed might be the better deal.
+And the loader's verdict cannot be read on this path (the same blindness that made the `Init` snapshot's
+message inconclusive), so the worker reports what it *did* — "handed the snapshot to the loader" — and lets
+the run's own time be the answer.
