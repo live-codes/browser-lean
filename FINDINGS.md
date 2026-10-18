@@ -1045,3 +1045,35 @@ LAN, and worth re-measuring against a real host, where the tree's ~10 MB compres
 And the loader's verdict cannot be read on this path (the same blindness that made the `Init` snapshot's
 message inconclusive), so the worker reports what it *did* — "handed the snapshot to the loader" — and lets
 the run's own time be the answer.
+
+## 9.11 A Lean-sized snapshot cannot be baked, and the stack was not the reason
+
+`std.snap` works; `lean.snap` does not — and the evidence says the limit is inside the serializer, not in a
+resource this harness can raise.
+
+Saving a Lean-sized environment (the `Lean` header, 2,308 modules) fails *after* a successful import and a
+successful elaboration, in the write:
+
+    unhandled rejection: ... memory access out of bounds
+    RuntimeError: memory access out of bounds
+        at wasm-function[83475] ... wasm-function[5197] ... wasm-function[83475] ...
+
+Two things about that matter. It was first a JavaScript-stack overflow, cleared by `node --stack-size=4000`
+— so the save is *recursive*. And the wasm stack is not the limit either: this build already carries
+`-sSTACK_SIZE=16777216`, a literal the fork raised from Emscripten's 64 KB default because the import runs on
+the main stack once there are no worker threads, and re-linking at **256 MB** — sixteen times larger, with
+the module hash confirming the new binary — reproduces the failure unchanged, at the same alternating frame
+pair. A frame pair that repeats and does not care how much stack you give it is unbounded recursion, not
+exhaustion.
+
+So: `init` (231 MB) and `std` (319 MB) save and load; a `Lean` save does not, on this build. Upstream ships
+only `init.snap`, which fits that picture. The Lean demo therefore pays its import — **274 s**, measured as
+the bake's drain line — on first use, and the lever for that is a fix in Lean's serializer rather than
+anything in this harness.
+
+The stack knob stays, as a cache variable in the patch (`LEAN_WASM_STACK_SIZE`, default unchanged at 16 MiB).
+`patch-stack-knob.sh` regenerates the patch rather than editing it, because hand-editing a hunk shifts the
+line counts in its `@@` headers and patch then refuses the file. But the knob is also a reminder that changing
+the binary invalidates *every* snapshot — they are per-binary — so both working ones were re-baked and Std
+re-measured against the new artifact: **13–31 s** depending on whether the mirror is warm or cold, against
+~128 s before.

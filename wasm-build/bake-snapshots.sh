@@ -22,7 +22,10 @@ NODE=/cache/node24/bin/node
 
 bake() { # <name> <probe>
 	local name="$1" probe="$2"
-	if [ -f "/bakeout/${name}.snap" ]; then
+	# Snapshots are valid only for the binary that baked them, so a rebuild invalidates every one of them and
+	# `FORCE=1` is a requirement rather than a convenience — there is no "close enough" here, and the loader
+	# cannot tell you otherwise: it is the deserializer that traps.
+	if [ -f "/bakeout/${name}.snap" ] && [ "${FORCE:-0}" != "1" ]; then
 		echo "=== ${name}: already baked, leaving it ($(du -h "/bakeout/${name}.snap" | cut -f1))"
 		return
 	fi
