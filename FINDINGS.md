@@ -1142,3 +1142,29 @@ Three traps, all measured rather than assumed:
 What is *not* solved is speed: the first Mathlib import still runs long on one thread — 4,303 modules against
 Std's 483, which took 104 s — and the snapshot trick that removed Std's import (§9.10) is unlikely to help,
 since a Lean-sized save already fails inside the serializer (§9.11) and Mathlib's environment is larger.
+
+## 9.14 Mathlib's import cannot be snapshotted either, and now there are numbers
+
+The import works: **3,075 modules**, `inside_drain_ms=666521` — **11.1 minutes** on one thread — and the probe
+elaborates. The *save* then dies exactly as the Lean one did:
+
+    unhandled rejection: … Maximum call stack size exceeded
+        at wasm-function[55] … [190] … [6067] … [83475] … [5197]
+
+The same alternating frame pair, `83475` and `5197`, as §9.11 — and §9.11 already tried sixteen times the wasm
+stack and reproduced the failure unchanged. This is that same unbounded recursion in the serializer, not a limit
+either stack size can raise. So "snapshot the libraries" is closed for anything past Std: Init (230 MB) and Std
+(318 MB) save and load; Lean and Mathlib do not.
+
+What that leaves is Mathlib's first run at 11.1 minutes, paid once per session because the environment is cached
+afterwards — and the honest reason it cannot be cheaper: the alternative is threads, and threads are the
+cross-origin isolation this project exists to remove. A snapshot of a Mathlib-sized environment is the one thing
+that would have removed it, and the serializer is where that ends.
+
+Two things did come out of the attempt. The bake now runs **on the host, without Docker**, which mattered
+because the daemon was down: `process.cwd` has to be presented as `/`, because the glue chdirs the *virtual* FS
+to it and on Windows that value is drive-rooted (`D:\`), which joined into the NODEFS mount becomes `<work>/D:\`
+and makes every path under it read as missing — the symptom being `lstatSync("…\\bakeout/D:\\") failed: ENOENT`.
+And the bake library can be assembled entirely from host-visible files (`build-bake-lib.mjs`: Init unpacked from
+the core packs, Std/Lean gunzipped, Mathlib's closure unpacked from its 52 packs), which is what made a host bake
+possible at all.
