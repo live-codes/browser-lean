@@ -1108,3 +1108,37 @@ normally points at — upstream's layer matches upstream's artifact — and wron
 command that cannot succeed. Both layers carry their build in their manifest (`"version": "lean-core-62b6a22913"`
 against this artifact's `dfe4953`), so the runtime can tell the two cases apart and could say which it is. That
 is a change to the package rather than to the mirror, and it is the honest fix.
+
+## 9.13 Mathlib works again, because the artifact and the assets are now the same build
+
+The demo's Mathlib loads: `loading Mathlib: pack 52/52`, with no header or validation error. It had been broken
+since the artifact stopped being built at upstream's commit, because an `.olean` is only readable by the
+compiler that wrote it (§9.9) — so every upstream asset became unreadable at once, and *that* is why Mathlib
+"used to work": the pinned pthread artifact and upstream's assets were the same build.
+
+**The fix was to build ours at their commit**, `62b6a229…`. `check-upstream-commit.sh` gated it — commit
+present, all three wasm exports present, runtime patch applies; only patch 0001's Emscripten settings block
+disagreed, because the July tree used JS-emulated exceptions (`-sDISABLE_EXCEPTION_CATCHING=0`) where September
+used native wasm EH, with a comment saying native EH miscompiled *on their emsdk 6*. `port-patch.sh`
+re-expresses that hunk by hand (keeping native EH, which this container's emsdk 4.0.22 handles — the existing
+artifact proves it) and regenerates the patch; it applies cleanly, and the runtime patch applies on top.
+`build-upstream.sh` then builds in a *second* clone so the cached tree for the old commit survives, skips the
+olean copy, and bakes `init` and `std` against the new binary. `assemble-upstream-mirror.mjs` composes the
+mirror: upstream's core layer, lib tree and Mathlib layer, plus our two binaries and our snapshots.
+
+Three traps, all measured rather than assumed:
+
+- **`lean.wasm.gz` has to go.** The worker prefers the `.gz` name, so leaving upstream's gzipped pthread binary
+  beside ours means the page fetches *that*, and the failure is
+  `LinkError: Import #128 "env" "memory": memory import must be a WebAssembly.Memory object` — their module
+  imports a memory ours defines.
+- **The fetch tool refuses every `.pack`** with "not a gzip pack" even though the download is gzip: the body
+  reaches its check already decompressed, so the check sees pack contents. Verified by hand on one pack —
+  6,109,959 bytes on the wire, magic `1f 8b`, 16,761,836 after gunzip, exactly the manifest's `bytes`.
+  `fetch-packs.mjs` fetches the core and Mathlib packs verbatim instead.
+- **The lib index upstream is `lean-lib-files.json.gz`**, not the plain name, so a plain-name probe of that
+  directory reads as a failure when the directory is fine.
+
+What is *not* solved is speed: the first Mathlib import still runs long on one thread — 4,303 modules against
+Std's 483, which took 104 s — and the snapshot trick that removed Std's import (§9.10) is unlikely to help,
+since a Lean-sized save already fails inside the serializer (§9.11) and Mathlib's environment is larger.
