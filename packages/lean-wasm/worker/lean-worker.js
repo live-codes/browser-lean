@@ -323,24 +323,36 @@ async function tryRootSnapshot(root) {
     if (typeof line === 'string' && line.includes('wasmLoadSnapshot')) trace.push(line);
     if (typeof outerPrintErr === 'function') outerPrintErr(line);
   };
+  // Three steps, reported separately. A single `catch { return null }` made a failed install indistinguishable
+  // from no snapshot at all: the page silently took the file tree, and a run that had measured 13 s came back
+  // at 61 s with nothing to explain the difference. If a step fails, say which and why.
+  let failure = null;
   try {
     Module.FS.writeFile(path, bytes);
     Module.FS.writeFile(`${path}.deps`, new Uint8Array([0x5b, 0x5d]));
-    Module._lean_wasm_load_snapshot(mkLeanString(path));
-  } catch {
-    return null;
+    try {
+      // The file tree is still fetched afterwards, and that is not a fallback: the program's header has to
+      // *resolve* the module it imports, and a snapshot only supplies the elaborated environment for that
+      // header. What the snapshot removes is the realization — the 104 s, not the 5 s.
+      Module._lean_wasm_load_snapshot(mkLeanString(path));
+    } catch (error) {
+      failure = `the loader threw: ${(error && error.message) || error}`;
+    }
+  } catch (error) {
+    failure = `writing it into the file system failed: ${(error && error.message) || error}`;
   } finally {
     Module.printErr = outerPrintErr;
   }
 
-  // Fall through to the file tree either way. The snapshot's verdict is not readable from here — the
-  // loader's trace does not reach `printErr` on this path, the same thing that made the Init snapshot's
-  // message read as "inconclusive" — and the tree is needed regardless: the program's header still has to
-  // *resolve* the module it imports, and a snapshot only supplies the elaborated environment for that
-  // header. What the snapshot removes is the import's realization, which is the 104 s rather than the 5 s.
+  const megabytes = (bytes.length / 1048576).toFixed(1);
+  const refused = trace.find((line) => line.includes('failed'));
   post({
     type: 'status',
-    data: `handed the ${root} snapshot to the loader (${(bytes.length / 1048576).toFixed(1)} MB) — the file tree follows either way`
+    data: failure
+      ? `could not install the ${root} snapshot (${megabytes} MB): ${failure} — the file tree follows`
+      : refused
+        ? `the ${root} snapshot was refused (${refused}) — the file tree follows`
+        : `handed the ${root} snapshot to the loader (${megabytes} MB) — the file tree follows either way`
   });
   return null;
 }
@@ -518,7 +530,10 @@ async function finishStartup() {
   if (typeof Module._lean_wasm_load_snapshot === 'function') {
     let bytes = null;
     try {
-      const response = await fetchOrThrow(`${assetBase}/snapshots/init.snap`);
+      // A dead asset host must not hang the boot. Without a timeout this fetch waits indefinitely, `ready` is
+      // never posted, and the page dies at its own 120 s limit instead of falling back to a first run that
+      // imports — which is exactly what a stopped mirror looked like while I was chasing something else.
+      const response = await fetch(`${assetBase}/snapshots/init.snap`, { signal: AbortSignal.timeout(60000) });
       if (response.ok) bytes = new Uint8Array(await response.arrayBuffer());
     } catch (error) {
       post({ type: 'status', data: `no Init snapshot fetchable here (${(error && error.message) || error}); the first run will import` });

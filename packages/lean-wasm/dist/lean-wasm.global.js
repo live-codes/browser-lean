@@ -2,804 +2,819 @@
  *  importScripts('lean-wasm.global.js') then self.leanWasm.createCompiler({ baseUrl }).
  *  Runs Lean 4 (Apache-2.0) compiled to WebAssembly by cauli/lean4-wasm-in-browser (Apache-2.0);
  *  no third-party JavaScript is bundled. */
-var leanWasm=(()=>{var O=Object.defineProperty;var le=Object.getOwnPropertyDescriptor;var ce=Object.getOwnPropertyNames;var de=Object.prototype.hasOwnProperty;var ue=(e,t)=>{for(var n in t)O(e,n,{get:t[n],enumerable:!0})},he=(e,t,n,s)=>{if(t&&typeof t=="object"||typeof t=="function")for(let r of ce(t))!de.call(e,r)&&r!==n&&O(e,r,{get:()=>t[r],enumerable:!(s=le(t,r))||s.enumerable});return e};var me=e=>he(O({},"__esModule",{value:!0}),e);var De={};ue(De,{DEFAULT_BASE_URL:()=>C,LANGUAGES:()=>Fe,SYNTAX_MODES:()=>Ce,availableRoots:()=>je,bakeSnapshot:()=>W,createCompiler:()=>ie,layers:()=>We,requiredAssetPaths:()=>j,resolveAssets:()=>$});var C=void 0,S={wasm:"lean-wasm",lib:"lean-lib",mathlib:"lean-mathlib"};function fe(e,t){let n;try{n=new URL(e,globalThis.location?.href)}catch{throw new Error(`${t} must be an absolute http(s) URL, or relative to the page: ${e}`)}if(n.protocol!=="http:"&&n.protocol!=="https:")throw new Error(`${t} must be http or https, not ${n.protocol}//`);return n}function $(e){let t=e??void 0;if(t==null||t==="")throw new Error("baseUrl is required: this package ships no assets (Lean\u2019s wasm is 96.2 MiB, past the 20 MB per-file limit on jsDelivr), so the runtime is fetched from a host you control. Run `npx --package @live-codes/lean-wasm lean-wasm-fetch-assets <dir>` to materialise them, then pass that directory as baseUrl.");let n=fe(t,"baseUrl").href.replace(/\/+$/,""),s=r=>`${n}/${r}`;return{baseUrl:`${n}/`,assetBase:s(S.wasm),libBase:s(S.lib),layerBase:s(S.mathlib)}}function j(){return[`${S.wasm}/lean.js`,`${S.wasm}/lean.wasm`,`${S.wasm}/core-layer.json`,`${S.wasm}/core-lib/artifacts-*.pack`,`${S.lib}/lean-lib-files.json`,`${S.lib}/**`,`${S.mathlib}/real-analysis-layer.json`,`${S.mathlib}/artifacts-*.pack`]}var v=`/**
- * Persistent Lean 4 WASM host \u2014 Web Worker.
- *
- * Adapted from cauli/lean4-wasm-in-browser's \`lean-worker-persistent.worker.js\`
- * (Apache-2.0). The structure is theirs, because the details it encodes are not
- * guessable: the init sequence the fork needs, which exports exist, where the IO
- * result tags sit, and the fact that the runtime must be initialised **without**
- * running main() (which would tear it down via EXIT_RUNTIME).
- *
- * What is different here: the library is fetched and unpacked *in the worker*
- * from the packed core layer, rather than being handed over from the page. That
- * keeps ~76 MB of decompressed \`.olean\`/\`.ir\` from being copied across the
- * structured-clone boundary.
- *
- * Why a real Worker and not an iframe: the Init import is a long synchronous
- * stretch in wasm, and a same-origin iframe shares the page's main thread, so it
- * freezes the whole tab. In a Worker it cannot.
- *
- * Whether it needs a cross-origin isolated document is the artifact's decision, not this file's. The
- * probe in @live-codes/lean-wasm reads the memory import off the module before the download, and a
- * single-threaded build \u2014 one that declares an unshared memory \u2014 runs here with no isolation at all
- * (FINDINGS.md \xA79). The pthread build the project ships today does need it.
- */
-
-// The build emits verbose tracing and it must not reach the UI.
-const DEBUG_LINE = /^\\s*\\[(WASM DEBUG|DEBUG|IFRAME|PROFILE|PWORKER|COMPILE|SNAPSHOT|MEM)/;
-
-let libraryFiles = [];
-let moduleReady = false;
-let compileBusy = false;
-// Blob URL the runtime was bootstrapped from; pthread sub-workers load it too, so
-// it must outlive the boot.
-let mainScriptBlob = null;
-
-// Configuration arrives either as a global or as a query string. The packaged runtime
-// (@live-codes/lean-wasm) hands this file over as a blob, and a blob URL carries no query string, so
-// it prepends \`self.__LEAN_WASM_CONFIG__\`; the demo loads this file directly and uses the query.
-const workerConfig = self.__LEAN_WASM_CONFIG__ ?? {};
-const workerParams = new URLSearchParams(location.search);
-const assetBase = (workerConfig.assetBase || workerParams.get('assetBase') || '/lean-wasm').replace(/\\/$/, '');
-const assetQ = '';
-// Where the optional per-file libraries (Std, Lean, Batteries) are mirrored.
-const libBase = (workerConfig.libBase || workerParams.get('libBase') || '/lean-lib').replace(/\\/$/, '');
-
-// What the artifact declares about its memory, read by \`probeArtifactMemory\` in @live-codes/lean-wasm and
-// handed in as configuration \u2014 the worker cannot ask, because it holds the whole module and the answer
-// has to arrive before the download (FINDINGS.md \xA72).
-//
-//   {mode: 'shared',   initial, maximum}  a pthread build: it needs SharedArrayBuffer, and the memory
-//                                         this worker constructs must match the declared limits
-//   {mode: 'unshared', initial, maximum}  a single-threaded build: no SharedArrayBuffer, no isolation,
-//                                         and no memory for this worker to construct at all
-//   null                                  the probe could not read the artifact, so the runtime does
-//                                         what it did before it could ask and assumes \`shared\`
-const declaredMemory = workerConfig.memory ?? null;
-const artifactIsThreaded = declaredMemory?.mode !== 'unshared';
-
-// Bake mode: run the runtime **as the Lean CLI** to produce an \`--incr-header-save\` environment snapshot,
-// rather than booting the playground. The snapshot takes the \`Init\` import out of the first Run, which on
-// the single-threaded build is ~100 s against ~1.3 s for the pthread build (FINDINGS.md \xA79.7), and it has
-// to be produced by the binary that will load it \u2014 a snapshot embeds closure relocations valid only
-// against the saving binary's function table.
-//
-// It cannot share a session with compiling: the CLI parses its own arguments and the runtime exits when it
-// is done (\`-sEXIT_RUNTIME=1\`). See \`packages/lean-wasm/src/bake.js\`.
-const bake = workerConfig.bake ?? null;
-// Where the bake writes its probe, and where a snapshot is written when one is loaded at boot. Both live
-// inside the virtual filesystem; \`/workspace\` is created in \`preRun\` either way.
-const PROBE_PATH = '/workspace/probe.lean';
-const SNAPSHOT_PATH = '/workspace/init.snap';
-
-const post = (msg) => self.postMessage(msg);
-
-function isDebugLine(text) {
-  return DEBUG_LINE.test(text);
-}
-
-// The build's tracing is voluminous, so it never reaches the panes \u2014 but it is
-// the only view into the boot sequence, so keep it on the console rather than
-// discarding it.
-function logDebug(text) {
-  console.log('[lean]', text);
-}
-
-// Long stretches of the boot \u2014 the Init import especially \u2014 emit only filtered
-// debug lines, so the page would otherwise see total silence and could not tell
-// "still computing" from "wedged". A throttled heartbeat gives the page something
-// to reset its watchdog on.
-let lastActivityPost = 0;
-function noteActivity() {
-  const now = Date.now();
-  if (now - lastActivityPost < 1000) return;
-  lastActivityPost = now;
-  post({ type: 'activity' });
-}
-
-function mkdirp(FS, path) {
-  let current = '';
-  for (const part of path.split('/').filter((p) => p)) {
-    current += '/' + part;
-    try {
-      FS.mkdir(current);
-    } catch {
-      /* exists */
-    }
-  }
-}
-
-function writeLibEntry(FS, name, data) {
-  const fullPath = '/lib/lean/' + name;
-  mkdirp(FS, fullPath.substring(0, fullPath.lastIndexOf('/')));
-  FS.writeFile(fullPath, new Uint8Array(data));
-}
-
-/**
- * Start with as much shared memory as we can get, and step down if the device
- * refuses. A \`shared: true\` memory is the reason this whole page needs
- * cross-origin isolation \u2014 and it is only needed when the artifact declares one.
- *
- * The limits are the artifact's, not ours. Two failures come from ignoring that,
- * and both are real: a memory whose maximum exceeds the module's declared maximum
- * fails at instantiation with
- *   LinkError: Import #461 "env" "memory": memory import has a larger maximum
- *   size 65536 than the module's declared maximum 32768
- * and a memory smaller than the module's declared minimum fails the other way.
- * The pinned build declares min 1024 / max 65536 pages (4 GiB); the previous one
- * declared max 32768 and linking it against 65536 is exactly the failure above.
- * Now that the probe reads those numbers off the import section, the runtime
- * cannot produce that mismatch \u2014 it only has to stay under the ceiling.
- */
-const MAX_PAGES = 65536;
-
-function pickMemory() {
-  const PAGE = 65536;
-  // The declared maximum is a ceiling and the declared minimum is a floor. Falling back to our own
-  // ceiling when the artifact could not be read keeps the pre-probe behaviour unchanged.
-  const maximum = declaredMemory?.maximum ?? MAX_PAGES;
-  const floor = declaredMemory?.initial ?? 0;
-
-  for (const mb of [2048, 1536, 1024, 768]) {
-    const initial = Math.max(floor, (mb * 1024 * 1024) / PAGE);
-    if (initial > maximum) continue;
-    try {
-      const memory = new WebAssembly.Memory({ initial, maximum, shared: true });
-      post({ type: 'memory', mb, initialPages: initial, maximumPages: maximum, declared: declaredMemory !== null });
-      return { memory, bytes: initial * PAGE };
-    } catch {
-      post({ type: 'memory', mb, failed: true });
-    }
-  }
-  return null;
-}
-
-async function gunzip(bytes) {
-  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
-/**
- * \`fetch\` reports a network failure as a bare \`TypeError: Failed to fetch\`, which says nothing about which
- * of several URLs it was \u2014 and this worker fetches several. Naming the URL here is the difference between
- * a five-second diagnosis and an afternoon.
- */
-async function fetchOrThrow(url) {
-  try {
-    return await fetch(url);
-  } catch (error) {
-    throw new Error(\`\${url}: \${error && error.name ? error.name + ' \u2014 ' : ''}\${(error && error.message) || error}\`);
-  }
-}
-
-/**
- * Fetch the wasm module here rather than leaving it to Emscripten, so a host can store it
- * **compressed**. Cloudflare Pages refuses files over 25 MiB and this one is 96.2 MiB raw \u2014 16.5 MiB
- * gzipped, which is what makes a plain static host (Pages included) able to serve it at all.
- *
- * What comes back is a **blob URL**, not the bytes, and that is the point: this is a pthread build, so
- * Emscripten's sub-workers each load the module for themselves through \`locateFile\`. Handing them the
- * decompressed bytes as a same-origin blob means a compressed host stays a single download, without
- * needing \`wasmBinary\` (which the main thread honours but the workers ignore, so they fall back to
- * requesting \`lean.wasm\` \u2014 the one file a compressed host does not have).
- *
- * \`type: 'application/wasm'\` matters: it keeps \`WebAssembly.compileStreaming\` available, where a
- * typeless blob falls back to ArrayBuffer instantiation.
- *
- * Both layouts work: a host with no size limit keeps serving \`lean.wasm\`, and pays one 404 for the probe.
- */
-let wasmBlobUrl = null;
-
-async function loadWasmUrl() {
-  if (wasmBlobUrl) return wasmBlobUrl;
-
-  for (const candidate of [\`\${assetBase}/lean.wasm.gz\`, \`\${assetBase}/lean.wasm\`]) {
-    const response = await fetchOrThrow(candidate);
-    if (response.status === 404) continue;
-    if (!response.ok) throw new Error(\`\${candidate}: HTTP \${response.status}\`);
-
-    const name = candidate.slice(candidate.lastIndexOf('/') + 1);
-    const length = Number(response.headers.get('content-length')) || 0;
-    post({ type: 'status', data: \`downloading the runtime (\${name}\${length ? \`, \${(length / 1048576).toFixed(1)} MB\` : ''})\u2026\` });
-
-    let bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
-    wasmBlobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/wasm' }));
-    return wasmBlobUrl;
-  }
-
-  throw new Error(\`No lean.wasm (or lean.wasm.gz) at \${assetBase}\`);
-}
-
-/**
- * Fetch the packed core layer and slice it into individual files.
- *
- * Each pack is a gzip'd concatenation; the manifest carries the offset and
- * length of every entry within the *uncompressed* container, so no per-file
- * requests are needed \u2014 one 6 MB pack replaces ~380 round trips.
- */
-async function loadLibrary() {
-  const manifest = await (await fetch(\`\${assetBase}/core-layer.json\`)).json();
-  post({ type: 'library', stage: 'manifest', modules: manifest.modules, packs: manifest.packs.length });
-
-  const files = [];
-  let done = 0;
-  for (const pack of manifest.packs) {
-    const response = await fetch(\`\${assetBase}/core-lib/\${pack.file}\`);
-    if (!response.ok) throw new Error(\`\${pack.file}: HTTP \${response.status}\`);
-    let bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
-    if (bytes.length !== pack.bytes) {
-      throw new Error(\`\${pack.file}: got \${bytes.length} bytes, manifest says \${pack.bytes}\`);
-    }
-    for (const entry of pack.entries) {
-      files.push({ name: entry.path, data: bytes.subarray(entry.offset, entry.offset + entry.bytes) });
-    }
-    done += 1;
-    post({ type: 'library', stage: 'pack', loaded: done, total: manifest.packs.length, file: pack.file });
-  }
-
-  post({ type: 'library', stage: 'done', files: files.length });
-  return files;
-}
-
-// ---- Optional libraries -------------------------------------------------
-//
-// The core layer only carries the Init closure. Std / Lean / Batteries live as
-// individual files (\`.olean\` + \`.ir\` + \`.ir.sig\`) in a per-file tree indexed by
-// \`lean-lib-files.json\`, exactly as upstream ships them. They are fetched on
-// demand and written into the filesystem mid-session, which is enough because
-// module resolution happens at compile time.
-
-let libraryIndex = null;
-const loadedRoots = new Set();
-// Whether the tree is stored as \`<path>.gz\`. The index decides for the whole directory, so this costs
-// one probe per session rather than one per file \u2014 which matters when a root is 1,449 files.
-let libCompressed = false;
-
-async function getLibraryIndex() {
-  if (libraryIndex) return libraryIndex;
-
-  const candidates = [
-    [\`\${libBase}/lean-lib-files.json.gz\`, true],
-    [\`\${libBase}/lean-lib-files.json\`, false]
-  ];
-  for (const [url, compressed] of candidates) {
-    const response = await fetch(url);
-    if (response.status === 404) continue;
-    if (!response.ok) throw new Error(\`library index: HTTP \${response.status}\`);
-
-    let bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
-    libCompressed = compressed;
-    libraryIndex = JSON.parse(new TextDecoder().decode(bytes));
-    return libraryIndex;
-  }
-  throw new Error(\`No lean-lib-files.json (or .gz) at \${libBase}\`);
-}
-
-async function fetchIfPresent(url) {
-  const response = await fetch(url);
-  if (response.status === 404) return null;
-  if (!response.ok) throw new Error(\`\${url}: HTTP \${response.status}\`);
-  return new Uint8Array(await response.arrayBuffer());
-}
-
-/**
- * Supplying one library root: a baked snapshot when there is one for it, otherwise every published file of
- * it, one file at a time.
- *
- * No dependency graph is computed either way: the page retries the compile after each load, and Lean's own
- * "unknown module prefix" error names the next root that is missing, so the closure is discovered by asking
- * the compiler.
- */
-/**
- * Try a baked snapshot for this root before its per-file tree.
- *
- * On a single-threaded build the *import* dominates, not the bytes: measured on the Std demo, fetching its
- * 483 modules' 1,449 files takes 5 s and loading them takes 104 s. A snapshot turns that import into a
- * deserialization. The loader reports its verdict on stderr \u2014 \`cached env for [...]\`, or \`failed: ...\` \u2014 and
- * that is the only signal worth trusting; its return value is an IO result whose layout is not ours to guess.
- *
- * Returns null when there is no snapshot for this root or it was refused, and the caller falls through to
- * the tree \u2014 which stays the general path, because a snapshot only matches the header it was baked for.
- */
-async function tryRootSnapshot(root) {
-  const name = root.toLowerCase();
-  const url = \`\${assetBase}/snapshots/\${name}.snap\`;
-  let bytes = null;
-  try {
-    const response = await fetch(url);
-    if (response.ok) {
-      post({ type: 'status', data: \`fetching the \${root} snapshot\u2026\` });
-      bytes = new Uint8Array(await response.arrayBuffer());
-    }
-  } catch {
-    return null;
-  }
-  if (!bytes) return null;
-
-  const path = \`/workspace/\${name}.snap\`;
-  const trace = [];
-  const outerPrintErr = Module.printErr;
-  Module.printErr = (line) => {
-    if (typeof line === 'string' && line.includes('wasmLoadSnapshot')) trace.push(line);
-    if (typeof outerPrintErr === 'function') outerPrintErr(line);
-  };
-  try {
-    Module.FS.writeFile(path, bytes);
-    Module.FS.writeFile(\`\${path}.deps\`, new Uint8Array([0x5b, 0x5d]));
-    Module._lean_wasm_load_snapshot(mkLeanString(path));
-  } catch {
-    return null;
-  } finally {
-    Module.printErr = outerPrintErr;
-  }
-
-  // Fall through to the file tree either way. The snapshot's verdict is not readable from here \u2014 the
-  // loader's trace does not reach \`printErr\` on this path, the same thing that made the Init snapshot's
-  // message read as "inconclusive" \u2014 and the tree is needed regardless: the program's header still has to
-  // *resolve* the module it imports, and a snapshot only supplies the elaborated environment for that
-  // header. What the snapshot removes is the import's realization, which is the 104 s rather than the 5 s.
-  post({
-    type: 'status',
-    data: \`handed the \${root} snapshot to the loader (\${(bytes.length / 1048576).toFixed(1)} MB) \u2014 the file tree follows either way\`
-  });
-  return null;
-}
-
-async function loadRoot(root) {
-  if (loadedRoots.has(root)) return { root, files: 0, bytes: 0, alreadyLoaded: true };
-
-  const fromSnapshot = await tryRootSnapshot(root);
-  if (fromSnapshot) {
-    loadedRoots.add(root);
-    return fromSnapshot;
-  }
-
-  const index = await getLibraryIndex();
-  const modules = index.filter((p) => p === \`\${root}.olean\` || p.startsWith(\`\${root}/\`));
-  if (modules.length === 0) return { root, files: 0, bytes: 0, unavailable: true };
-
-  // A module's \`.ir\` is only used when its \`.ir.sig\` is present, so all three
-  // travel together.
-  const targets = [];
-  for (const module of modules) {
-    targets.push(module, module.replace(/\\.olean$/, '.ir'), module.replace(/\\.olean$/, '.ir.sig'));
-  }
-
-  let files = 0;
-  let bytes = 0;
-  let failed = 0;
-  let next = 0;
-  const CONCURRENCY = 8;
-  const urlOf = (rel) => \`\${libBase}/\${rel}\${libCompressed ? '.gz' : ''}\`;
-
-  async function worker() {
-    for (;;) {
-      const i = next++;
-      if (i >= targets.length) return;
-      const rel = targets[i];
-
-      // A transient failure used to be invisible \u2014 the file was skipped, and Lean only complained if
-      // something happened to import it. Retry once, then count it so the caller can say so.
-      let data = null;
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          const fetched = await fetchIfPresent(urlOf(rel));
-          if (!fetched) break; // a module simply has no such sibling
-          data = libCompressed ? await gunzip(fetched) : fetched;
-          break;
-        } catch (error) {
-          if (attempt >= 1) {
-            failed += 1;
-            break;
-          }
-        }
-      }
-      if (!data) continue;
-
-      // Every \`.olean\`, \`.ir\` and \`.ir.sig\` starts with the same header. Checking it here turns the
-      // two most common hosting mistakes into something actionable: a host with an SPA fallback
-      // answers \`200\` with HTML for a file that is not deployed, and Lean's own complaint about that
-      // arrives much later, from inside the kernel, as \`failed to read file '\u2026, invalid header\`.
-      if (!(data.length > 8 && data[0] === 0x6f && data[1] === 0x6c && data[2] === 0x65 && data[3] === 0x61 && data[4] === 0x6e)) {
-        const looksLikeHtml = data.length > 2 && data[0] === 0x3c;
-        throw new Error(
-          \`\${rel} is not a Lean object file\${looksLikeHtml ? ' \u2014 the host returned HTML for it, so the library' : ''}\` +
-            \`\${looksLikeHtml ? ' tree is missing from baseUrl (an SPA fallback hides the 404).' : \` (\${data.length} bytes).\`}\`
-        );
-      }
-
-      try {
-        writeLibEntry(Module.FS, rel, data);
-        files += 1;
-        bytes += data.length;
-      } catch {
-        failed += 1; // an individual write failure
-      }
-      if (files % 400 === 0) post({ type: 'modules', stage: 'progress', root, files, total: targets.length });
-    }
-  }
-
-  await Promise.all(Array.from({ length: CONCURRENCY }, worker));
-  loadedRoots.add(root);
-  post({ type: 'modules', stage: 'loaded', root, files, bytes, failed, total: targets.length });
-  return { root, files, bytes, failed };
-}
-
-// ---- Packed layers -----------------------------------------------------
-//
-// Mathlib is not published per-file: upstream ships it as a packed layer (a
-// manifest plus gzip'd containers carrying offset/length for every entry), the
-// same scheme the core Init layer uses. Packs are installed one at a time and
-// released, so peak memory stays around a single pack rather than the whole
-// 800 MiB layer.
-
-const loadedLayers = new Set();
-
-async function loadPackedLayer({ manifestUrl, packBase, label }) {
-  if (loadedLayers.has(label)) return { files: 0, bytes: 0, alreadyLoaded: true };
-
-  const manifest = await (await fetch(manifestUrl)).json();
-  if (!manifest.packs || !Array.isArray(manifest.packs)) {
-    throw new Error(\`\${label}: manifest has no packs\`);
-  }
-
-  let files = 0;
-  let bytes = 0;
-  for (const [index, pack] of manifest.packs.entries()) {
-    const response = await fetch(\`\${packBase}/\${pack.file}\`);
-    if (!response.ok) throw new Error(\`\${pack.file}: HTTP \${response.status}\`);
-
-    let raw = new Uint8Array(await response.arrayBuffer());
-    if (raw[0] === 0x1f && raw[1] === 0x8b) raw = await gunzip(raw);
-    if (raw.length !== pack.bytes) {
-      throw new Error(\`\${pack.file}: got \${raw.length} bytes, manifest says \${pack.bytes}\`);
-    }
-
-    for (const entry of pack.entries) {
-      writeLibEntry(Module.FS, entry.path, raw.subarray(entry.offset, entry.offset + entry.bytes));
-    }
-    files += pack.entries.length;
-    bytes += raw.length;
-    raw = null; // release this pack before the next one
-
-    post({ type: 'layer', stage: 'progress', label, pack: index + 1, packs: manifest.packs.length, files, bytes });
-  }
-
-  loadedLayers.add(label);
-  post({ type: 'layer', stage: 'loaded', label, files, bytes });
-  return { files, bytes };
-}
-
-function mkLeanString(str) {
-  const ptr = Module.stringToNewUTF8(str);
-  const obj = Module._lean_mk_string(ptr);
-  Module._free(ptr);
-  return obj;
-}
-
-function compileCode(code, fileName) {
-  if (!moduleReady) return { success: false, error: 'Module not ready' };
-  if (compileBusy) return { success: false, error: 'Compile already in progress' };
-  compileBusy = true;
-  const t0 = performance.now();
-  try {
-    const codeObj = mkLeanString(code);
-    const fnameObj = mkLeanString(fileName || '/workspace/input.lean');
-    const resObj = Module._lean_wasm_compile(codeObj, fnameObj);
-    const elapsed = performance.now() - t0;
-    // IO result: ctor tag byte at offset 7 (0 = ok, anything else = error).
-    const tag = Module.getValue(resObj + 7, 'i8') & 0xff;
-    if (tag !== 0) {
-      try {
-        Module._lean_io_result_show_error(resObj);
-      } catch {
-        /* the error text has already gone to stderr */
-      }
-      return { success: false, error: 'lean_wasm_compile returned an IO error', elapsed };
-    }
-    return { success: true, elapsed };
-  } catch (err) {
-    return { success: false, error: (err && err.message) || String(err) };
-  } finally {
-    compileBusy = false;
-  }
-}
-
-/**
- * Finish the boot once the runtime is initialised: load a baked environment snapshot if this host serves
- * one, then declare the runtime ready.
- *
- * The snapshot is why a first Run can be fast at all: it carries the imported \`Init\` environment, so the
- * ~100 s import the single-threaded build otherwise pays (FINDINGS.md \xA79.7) never happens \u2014 upstream's
- * \`Shell.lean\` says a snapshot "skips the multi-minute \`loadExts\` import entirely". It is optional: a host
- * without one still works and simply pays the import.
- */
-async function finishStartup() {
-  if (typeof Module._lean_wasm_load_snapshot === 'function') {
-    let bytes = null;
-    try {
-      const response = await fetchOrThrow(\`\${assetBase}/snapshots/init.snap\`);
-      if (response.ok) bytes = new Uint8Array(await response.arrayBuffer());
-    } catch (error) {
-      post({ type: 'status', data: \`no Init snapshot fetchable here (\${(error && error.message) || error}); the first run will import\` });
-      bytes = null;
-    }
-    if (bytes) {
-      try {
-        Module.FS.writeFile(SNAPSHOT_PATH, bytes);
-        // The loader reads a dependency sidecar beside the snapshot. A self-contained snapshot's list is
-        // empty, which is why upstream ships only the snapshot itself and writes the sidecar in the worker.
-        Module.FS.writeFile(\`\${SNAPSHOT_PATH}.deps\`, new Uint8Array([0x5b, 0x5d]));
-        // The path must be a \`lean_object*\`, not a JavaScript string. The export's parameter is a Lean
-        // \`String\`, and a JS string coerces to 0 as an i32 \u2014 so the loader dereferences a bogus pointer and
-        // traps with "memory access out of bounds" *before* its first line runs. That is a wrong call
-        // dressed up as a wrong amount of memory, and it cost a 2 GiB rebuild to rule the memory out.
-        // \`mkLeanString\` is the same marshalling the compile path above uses.
-        const trace = [];
-        const outerPrintErr = Module.printErr;
-        Module.printErr = (line) => {
-          if (typeof line === 'string' && line.includes('wasmLoadSnapshot')) trace.push(line);
-          if (typeof outerPrintErr === 'function') outerPrintErr(line);
-        };
-        try {
-          Module._lean_wasm_load_snapshot(mkLeanString(SNAPSHOT_PATH));
-        } finally {
-          Module.printErr = outerPrintErr;
-        }
-        // The loader prints \`cached env for [\u2026]\` on success and \`failed: \u2026\` on refusal, but that trace does
-        // not reach \`printErr\` on every path \u2014 so report what is known rather than assert a verdict. A missing
-        // trace is not a failure: the first run's time is what settles it, and on this build it is ~0.3 s when
-        // the cache is seeded against ~75 s when it is not.
-        const megabytes = (bytes.length / 1048576).toFixed(1);
-        const refused = trace.find((line) => line.includes('failed'));
-        post({
-          type: 'status',
-          data: trace.some((line) => line.includes('cached env for'))
-            ? \`the loader seeded the environment cache from the Init snapshot (\${megabytes} MB) \u2014 the first run skips the import\`
-            : refused
-              ? \`the Init snapshot was refused (\${refused}) \u2014 the first run imports instead\`
-              : \`Init snapshot handed to the loader (\${megabytes} MB); the first run's time shows whether the cache was seeded\`,
-        });
-      } catch (error) {
-        post({
-          type: 'status',
-          data: \`could not install the Init snapshot (\${(error && error.message) || error}); the first run will import\`,
-        });
-      }
-    }
-  }
-  moduleReady = true;
-  post({ type: 'ready' });
-}
-
-async function startLeanModule() {
-  // A shared memory is only this worker's job when the artifact declares one. A single-threaded build
-  // declares an unshared memory, which needs no SharedArrayBuffer and therefore no cross-origin
-  // isolation \u2014 and there is nothing to construct here either, because that memory can grow and
-  // Emscripten already knows the limits it was built with.
-  let picked = null;
-  if (artifactIsThreaded) {
-    picked = pickMemory();
-    if (!picked) {
-      post({
-        type: 'error',
-        data:
-          'The Lean artifact declares a shared WebAssembly memory, and this document has no ' +
-          'SharedArrayBuffer \u2014 which it would only have if it were cross-origin isolated. Serve the page ' +
-          'with \`Cross-Origin-Opener-Policy: same-origin\` and \`Cross-Origin-Embedder-Policy: require-corp\` ' +
-          '(or \`credentialless\`), or, for an embed that cannot set headers, \`Document-Isolation-Policy: ' +
-          'isolate-and-require-corp\` on the frame itself. A single-threaded Lean build would need none of ' +
-          'this. See FINDINGS.md \xA72 and \xA79.',
-      });
-      return;
-    }
-  }
-
-  self.Module = {
-    // Omitted entirely for an unshared artifact, so Emscripten allocates the memory it was built for
-    // rather than being handed limits guessed from outside.
-    ...(picked ? { wasmMemory: picked.memory, INITIAL_MEMORY: picked.bytes } : {}),
-    locateFile: (path) =>
-      path.endsWith('.wasm') && wasmBlobUrl ? wasmBlobUrl : \`\${assetBase}/\${path}\${assetQ}\`,
-    // Only a pthread build needs to say where its script is: it spawns sub-workers that have to load it
-    // same-origin. A single-threaded build has no sub-workers, and a build that does not list
-    // \`mainScriptUrlOrBlob\` in INCOMING_MODULE_JS_API would rather not be handed an unknown key.
-    ...(artifactIsThreaded ? { mainScriptUrlOrBlob: \`\${assetBase}/lean.js\${assetQ}\` } : {}),
-    // In bake mode the CLI owns startup \u2014 Emscripten runs \`main\` as soon as \`onRuntimeInitialized\`
-    // returns, so this worker must not also initialise the runtime itself, and must not wait for a \`ready\`.
-    ...(bake
-      ? { arguments: [\`--incr-header-save=\${bake.snapshotPath}\`, PROBE_PATH], noInitialRun: false }
-      : { noInitialRun: true }),
-    print: (text) => {
-      noteActivity();
-      if (isDebugLine(text)) return logDebug(text);
-      post({ type: 'stdout', data: text });
-    },
-    printErr: (text) => {
-      noteActivity();
-      if (isDebugLine(text)) return logDebug(text);
-      post({ type: 'stderr', data: text });
-    },
-    setStatus: (text) => {
-      if (text) post({ type: 'status', data: text });
-    },
-    noInitialRun: true,
-    preRun: [
-      function () {
-        const FS = Module.FS;
-        Module.ENV['LEAN_PATH'] = '/lib/lean';
-        for (const dir of ['/lib', '/lib/lean', '/workspace', '/bin']) {
-          try {
-            FS.mkdir(dir);
-          } catch {
-            /* exists */
-          }
-        }
-        let errors = 0;
-        for (const file of libraryFiles) {
-          try {
-            writeLibEntry(FS, file.name, file.data);
-          } catch {
-            errors += 1;
-          }
-        }
-        post({ type: 'library', stage: 'written', files: libraryFiles.length, errors });
-        libraryFiles = [];
-        try {
-          FS.chdir('/workspace');
-        } catch {
-          /* ignore */
-        }
-        // The bake needs a file to elaborate, and one that imports nothing: that is what makes it pay the
-        // default \`Init\` header import, which is exactly the cost the snapshot exists to skip.
-        if (bake) {
-          try {
-            FS.writeFile(PROBE_PATH, bake.probe ?? '#check 2+2');
-          } catch (error) {
-            post({ type: 'error', data: 'could not write the bake probe: ' + ((error && error.message) || error) });
-          }
-        }
-      },
-    ],
-    onRuntimeInitialized: function () {
-      // The CLI owns startup in bake mode. Returning from here is what lets Emscripten run \`main\`; doing
-      // this worker's own init first would initialise the runtime twice.
-      if (bake) return;
-      try {
-        Module._lean_initialize_runtime_module();
-        Module._lean_initialize();
-        Module._lean_io_mark_end_initialization();
-        if (Module._lean_init_task_manager) Module._lean_init_task_manager();
-        if (Module._lean_enable_initializer_execution) Module._lean_enable_initializer_execution();
-        const spRes = Module._lean_init_search_path();
-        if ((Module.getValue(spRes + 7, 'i8') & 0xff) !== 0) {
-          try {
-            Module._lean_io_result_show_error(spRes);
-          } catch {
-            /* ignore */
-          }
-          throw new Error('lean_init_search_path failed (see stderr)');
-        }
-        void finishStartup();
-      } catch (err) {
-        post({ type: 'error', data: 'Lean init failed: ' + ((err && err.message) || err) });
-      }
-    },
-    onExit: function (code) {
-      if (!bake) {
-        moduleReady = false;
-        post({ type: 'status', data: \`Lean exited (\${code})\` });
-        return;
-      }
-      // The CLI has run, so the snapshot is on the filesystem \u2014 or it is not, which is worth saying
-      // precisely rather than leaving the caller to time out.
-      try {
-        // Copied, not handed over: \`FS.readFile\` answers a view into the wasm heap, and posting that would
-        // either clone the whole heap or fail, since this artifact defines its memory.
-        const bytes = new Uint8Array(Module.FS.readFile(bake.snapshotPath));
-        post({ type: 'snapshot', bytes, code });
-      } catch (error) {
-        post({
-          type: 'error',
-          data: \`the bake exited (\${code}) without writing \${bake.snapshotPath}: \` + ((error && error.message) || error),
-        });
-      }
-    },
-    onAbort: function (what) {
-      moduleReady = false;
-      post({ type: 'error', data: 'Aborted: ' + (what || 'unknown') });
-    },
-  };
-
-  // Three separate steps, reported separately. Wrapping all of them in one \`catch\` that said "Failed to
-  // load lean.js" made a failure to fetch the 97 MB wasm look like a failure to fetch the 48 MB script \u2014
-  // both fetched from the same base, and the message named only one of them.
-  try {
-    // Fetch lean.js ourselves and hand it to the runtime as a **same-origin blob**.
-    //
-    // \`importScripts\` itself tolerates a cross-origin script, but this is a pthread
-    // build: the runtime spawns its thread pool with \`new Worker(mainScriptUrlOrBlob)\`,
-    // and a worker script must be same-origin. With a cross-origin asset base that
-    // throws during evaluation, and \`importScripts\` reports it only as
-    // "the script at \u2026 failed to load" \u2014 with every other asset fetching fine, which
-    // points at the wrong thing entirely. A blob URL is same-origin, and is what
-    // \`mainScriptUrlOrBlob\` exists for.
-    const response = await fetchOrThrow(\`\${assetBase}/lean.js\${assetQ}\`);
-    if (!response.ok) throw new Error(\`HTTP \${response.status} fetching lean.js\`);
-    const source = await response.text();
-    // Kept for the lifetime of the runtime: pthread sub-workers load it lazily.
-    mainScriptBlob = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
-    if (artifactIsThreaded) Module.mainScriptUrlOrBlob = mainScriptBlob;
-  } catch (err) {
-    post({ type: 'error', data: 'Failed to load lean.js: ' + ((err && err.message) || err) });
-    return;
-  }
-
-  try {
-    // Emscripten and every pthread sub-worker instantiate from this same blob URL.
-    await loadWasmUrl();
-  } catch (err) {
-    post({ type: 'error', data: 'Failed to fetch the Lean runtime: ' + ((err && err.message) || err) });
-    return;
-  }
-
-  try {
-    // The blob is how lean.js is evaluated here at all \u2014 a threaded build additionally needs it to be
-    // same-origin for its sub-workers, which a bare \`importScripts\` of a CDN URL would not be.
-    importScripts(mainScriptBlob);
-  } catch (err) {
-    post({ type: 'error', data: 'Failed to evaluate lean.js: ' + ((err && err.message) || err) });
-  }
-}
-
-self.onmessage = async (event) => {
-  const msg = event.data || {};
-  if (msg.type === 'start') {
-    try {
-      libraryFiles = await loadLibrary();
-      await startLeanModule();
-    } catch (err) {
-      post({ type: 'error', data: 'Loading the Lean library failed: ' + ((err && err.message) || err) });
-    }
-  } else if (msg.type === 'compile') {
-    post({ type: 'result', id: msg.id, ...compileCode(msg.code, msg.path) });
-  } else if (msg.type === 'load_modules') {
-    const results = [];
-    for (const root of msg.roots || []) {
-      try {
-        results.push(await loadRoot(root));
-      } catch (err) {
-        results.push({ root, files: 0, bytes: 0, error: (err && err.message) || String(err) });
-      }
-    }
-    post({ type: 'modules_loaded', id: msg.id, roots: msg.roots || [], results });
-  } else if (msg.type === 'load_layer') {
-    try {
-      const result = await loadPackedLayer(msg);
-      post({ type: 'layer_loaded', id: msg.id, label: msg.label, ok: true, ...result });
-    } catch (err) {
-      post({ type: 'layer_loaded', id: msg.id, label: msg.label, ok: false, error: (err && err.message) || String(err) });
-    }
-  }
-};
-`;async function W({baseUrl:e,probe:t="#check 2+2",onProgress:n,timeoutMs:s=12e5}={}){let r=$(e),a={assetBase:r.assetBase,libBase:r.libBase,bake:{probe:t,snapshotPath:"/workspace/init.snap"}},i=new Worker(URL.createObjectURL(new Blob([`self.__LEAN_WASM_CONFIG__ = ${JSON.stringify(a)};
-${v}`],{type:"text/javascript"})));try{return await new Promise((d,h)=>{let m=setTimeout(()=>h(new Error(`the bake did not finish within ${Math.round(s/6e4)} minutes`)),s);i.onmessage=y=>{let u=y.data||{};if(u.type==="snapshot"){clearTimeout(m),d(new Uint8Array(u.bytes));return}if(u.type==="error"){clearTimeout(m),h(new Error(u.data));return}u.type==="status"&&u.data&&n?.(u.data),u.type==="library"&&u.stage==="manifest"?n?.(`core layer: ${u.modules} modules in ${u.packs} packs`):u.type==="library"&&u.stage==="pack"&&n?.(`core pack ${u.loaded}/${u.total}`)},i.onerror=y=>{clearTimeout(m),h(new Error(y.message||"the bake worker failed"))},i.postMessage({type:"start"})})}finally{i.terminate()}}var T=[0,97,115,109],pe=2,ye=5,be=0,we=1,ge=2,ke=3,xe=4,U=1,D=2,A=262144;function z(e,t){return{pos:t,byte(){return this.pos>=e.length?null:e[this.pos++]},u32(){let n=0,s=0;for(;;){if(this.pos>=e.length||s>28)return null;let r=e[this.pos++];if(n|=(r&127)<<s,s+=7,(r&128)===0)return n>>>0}},name(){let n=this.u32();if(n===null||this.pos+n>e.length)return null;let s="";for(let r=0;r<n;r++)s+=String.fromCharCode(e[this.pos+r]);return this.pos+=n,s},skip(n){return this.pos+n>e.length?null:(this.pos+=n,!0)}}}function _e(e,t){let n=e.u32();if(n===null)return null;for(let s=0;s<n;s++){let r=e.name(),a=e.name();if(r===null||a===null)return null;let i=e.byte();if(i===null)return null;if(i===ge){let d=e.u32();if(d===null)return null;let h=e.u32();if(h===null)return null;let m=null;return d&U&&(m=e.u32(),m===null)?null:{module:r,field:a,shared:(d&D)!==0,initial:h,maximum:m}}if(i===be){if(e.u32()===null)return null}else if(i===we){if(e.skip(1)===null)return null;let d=e.u32();if(d===null||e.u32()===null||d&U&&e.u32()===null)return null}else if(i===ke){if(e.skip(2)===null)return null}else if(i===xe){if(e.skip(1)===null||e.u32()===null)return null}else return null;if(e.pos>t)return null}return null}function Se(e){if(!e||e.length<8)return null;for(let n=0;n<T.length;n++)if(e[n]!==T[n])return null;let t=z(e,8);for(;t.pos<e.length;){let n=t.byte(),s=t.u32();if(n===null||s===null)return null;let r=t.pos+s;if(r>e.length)return null;if(n===pe)return _e(t,r);t.pos=r}return null}function Ee(e){if(!e||e.length<8)return null;for(let n=0;n<T.length;n++)if(e[n]!==T[n])return null;let t=z(e,8);for(;t.pos<e.length;){let n=t.byte(),s=t.u32();if(n===null||s===null)return null;let r=t.pos+s;if(r>e.length)return null;if(n===ye){let a=t.u32();if(a===null||a===0)return null;let i=t.u32();if(i===null)return null;let d=t.u32();if(d===null)return null;let h=null;return i&U&&(h=t.u32(),h===null)?null:{shared:(i&D)!==0,initial:d,maximum:h}}t.pos=r}return null}function G(e){let t=Se(e);if(t)return{source:"import",...t};let n=Ee(e);return n?{source:"defined",...n}:null}var H=A/4;function q(e,t){let n=e.reduce((a,i)=>a+i.length,0),s=new Uint8Array(Math.min(n,t)),r=0;for(let a of e){if(r>=s.length)break;let i=a.subarray(0,Math.min(a.length,s.length-r));s.set(i,r),r+=i.length}return s}async function $e(e){if(!e.body)return new Uint8Array(await e.arrayBuffer()).subarray(0,A);let t=e.body.getReader(),n=[],s=0,r=H;try{for(;;){let{value:a,done:i}=await t.read();if(i||(n.push(a),s+=a.length,r=Y(n[0])?H:A,s>=r))break}}catch{}finally{t.cancel().catch(()=>{})}return q(n,r)}async function Me(e,t){let n=new Blob([e]).stream().pipeThrough(new DecompressionStream("gzip")).getReader(),s=[],r=0;try{for(;r<t;){let{value:a,done:i}=await n.read();if(i)break;s.push(a),r+=a.length}}catch{}finally{n.cancel().catch(()=>{})}return q(s,t)}function Y(e){return e.length>1&&e[0]===31&&e[1]===139}async function K(e){let t=String(e??"").replace(/\/+$/,""),n=[`${t}/lean.wasm.gz`,`${t}/lean.wasm`];for(let s of n){let r;try{r=await fetch(s)}catch{continue}if(r.status!==404&&r.ok)try{let a=await $e(r),i=Y(a)?await Me(a,A):a,d=G(i);if(!d)continue;return{mode:d.shared?"shared":"unshared",memory:d,url:s,bytesRead:a.length}}catch{continue}}return null}function Le(e){return e.startsWith("[DEBUG:")||e.startsWith("mainModule? =")||e.startsWith("- /lib/lean/")||e.startsWith("wasm streaming compile failed:")||e==="falling back to ArrayBuffer instantiation"}function Ae(e){let t=e.data;return typeof t=="string"?t:t&&typeof t=="object"?t.msg??t.message??JSON.stringify(t):String(t??"")}function I(e,t){let n=[],s=[],r=0;for(let[a,i]of[["stdout",e],["stderr",t]])for(let d of(i??"").split(`
-`)){let h=d.trim();if(!h)continue;if(Le(h)){r+=1;continue}let m=null;if(h.startsWith("{"))try{m=JSON.parse(h)}catch{m=null}if(m&&typeof m=="object"&&m.severity){let y={severity:m.severity,text:Ae(m),pos:m.pos??null};(m.severity==="information"?n:s).push(y)}else{let y={severity:a==="stdout"?"output":"error",text:h,pos:null};(a==="stdout"?n:s).push(y)}}return{info:n,problems:s,noise:r}}function X(e){let t=/\(line \d+, col \d+\)|at line \d+, column \d+/;return e.map(({severity:n,text:s,pos:r})=>{let a=String(s).replace(/\u001b\[[0-9;]*m/g,""),i=r?.line!=null&&!t.test(a)?`  (line ${r.line}${r.column!=null?`, col ${r.column}`:""})`:"";return n==="output"?a:`${n}: ${a}${i}`})}var P=["Std","Lean","Batteries"];function M(e){return[{label:"Mathlib",manifestUrl:`${e.layerBase}/real-analysis-layer.json`,packBase:e.layerBase,roots:["Mathlib","Aesop","Qq","Plausible","ProofWidgets","ImportGraph","LeanSearchClient","Game"]}]}var J={Lake:"Lake is a build tool, and there is no build step here."};function Q(e){return e.replace(/\/-[\s\S]*?-\//g,"").replace(/--[^\n]*/g,"")}function N(e){let t=[];for(let n of Q(e).split(`
-`)){let s=/^\s*import\s+([A-Za-z0-9_'.]+)/.exec(n);if(!s)continue;let r=s[1].replace(/^'/,"").split(".")[0];r&&!t.includes(r)&&t.push(r)}return t}function V(e){return Q(e).split(`
-`).filter(t=>/^\s*import\s+\S/.test(t)).map(t=>t.trim()).join(`
-`)}function Z(e){let t=[];for(let n of e){let s=/unknown module prefix '([^']+)'/.exec(n.text);s&&!t.includes(s[1])&&t.push(s[1])}return t}function ee(e){return[...P,...M(e).flatMap(t=>t.roots)]}function Be(e,t){return P.includes(e)||M(t).some(n=>n.roots.includes(e))?"lean-wasm-fetch-assets":null}function te(e,t,n){let s=[],r=a=>{s.includes(a)||s.push(a)};for(let a of N(e))if(t.includes(a)){let i=Be(a,n);r(i?`${a} is not on the asset host. Mirror it with \`${i}\`.`:`${a} is not available here.`)}else J[a]&&r(J[a]);return s}function ne(e){let t=[];for(let n of e){let s=/object file '[^']*' of module (\S+)/.exec(n.text);if(!s)continue;let r=`${s[1]} is not in the published Mathlib closure. Upstream ships only the 4,303 modules its Real Analysis course needs, so some of Mathlib is available here and some is not.`;t.includes(r)||t.push(r)}return t}var Re="/workspace/input.lean";function ve(e){return`self.__LEAN_WASM_CONFIG__ = ${JSON.stringify(e)};
-${v}`}function re({assetBase:e,libBase:t,memory:n,onProgress:s,onStatus:r}){let a=null,i=null,d="",h="",m=1,y=[],u=c=>{c&&s?.(c)};function B(c){let o=c.data||{};switch(o.type){case"stdout":d+=o.data+`
+var leanWasm=(()=>{var O=Object.defineProperty;var le=Object.getOwnPropertyDescriptor;var ce=Object.getOwnPropertyNames;var de=Object.prototype.hasOwnProperty;var ue=(e,r)=>{for(var t in r)O(e,t,{get:r[t],enumerable:!0})},he=(e,r,t,s)=>{if(r&&typeof r=="object"||typeof r=="function")for(let n of ce(r))!de.call(e,n)&&n!==t&&O(e,n,{get:()=>r[n],enumerable:!(s=le(r,n))||s.enumerable});return e};var fe=e=>he(O({},"__esModule",{value:!0}),e);var De={};ue(De,{DEFAULT_BASE_URL:()=>C,LANGUAGES:()=>Fe,SYNTAX_MODES:()=>Ce,availableRoots:()=>je,bakeSnapshot:()=>W,createCompiler:()=>ie,layers:()=>We,requiredAssetPaths:()=>j,resolveAssets:()=>E});var C=void 0,S={wasm:"lean-wasm",lib:"lean-lib",mathlib:"lean-mathlib"};function me(e,r){let t;try{t=new URL(e,globalThis.location?.href)}catch{throw new Error(`${r} must be an absolute http(s) URL, or relative to the page: ${e}`)}if(t.protocol!=="http:"&&t.protocol!=="https:")throw new Error(`${r} must be http or https, not ${t.protocol}//`);return t}function E(e){let r=e??void 0;if(r==null||r==="")throw new Error("baseUrl is required: this package ships no assets (Lean\u2019s wasm is 96.2 MiB, past the 20 MB per-file limit on jsDelivr), so the runtime is fetched from a host you control. Run `npx --package @live-codes/lean-wasm lean-wasm-fetch-assets <dir>` to materialise them, then pass that directory as baseUrl.");let t=me(r,"baseUrl").href.replace(/\/+$/,""),s=n=>`${t}/${n}`;return{baseUrl:`${t}/`,assetBase:s(S.wasm),libBase:s(S.lib),layerBase:s(S.mathlib)}}function j(){return[`${S.wasm}/lean.js`,`${S.wasm}/lean.wasm`,`${S.wasm}/core-layer.json`,`${S.wasm}/core-lib/artifacts-*.pack`,`${S.lib}/lean-lib-files.json`,`${S.lib}/**`,`${S.mathlib}/real-analysis-layer.json`,`${S.mathlib}/artifacts-*.pack`]}var v=`/**\r
+ * Persistent Lean 4 WASM host \u2014 Web Worker.\r
+ *\r
+ * Adapted from cauli/lean4-wasm-in-browser's \`lean-worker-persistent.worker.js\`\r
+ * (Apache-2.0). The structure is theirs, because the details it encodes are not\r
+ * guessable: the init sequence the fork needs, which exports exist, where the IO\r
+ * result tags sit, and the fact that the runtime must be initialised **without**\r
+ * running main() (which would tear it down via EXIT_RUNTIME).\r
+ *\r
+ * What is different here: the library is fetched and unpacked *in the worker*\r
+ * from the packed core layer, rather than being handed over from the page. That\r
+ * keeps ~76 MB of decompressed \`.olean\`/\`.ir\` from being copied across the\r
+ * structured-clone boundary.\r
+ *\r
+ * Why a real Worker and not an iframe: the Init import is a long synchronous\r
+ * stretch in wasm, and a same-origin iframe shares the page's main thread, so it\r
+ * freezes the whole tab. In a Worker it cannot.\r
+ *\r
+ * Whether it needs a cross-origin isolated document is the artifact's decision, not this file's. The\r
+ * probe in @live-codes/lean-wasm reads the memory import off the module before the download, and a\r
+ * single-threaded build \u2014 one that declares an unshared memory \u2014 runs here with no isolation at all\r
+ * (FINDINGS.md \xA79). The pthread build the project ships today does need it.\r
+ */\r
+\r
+// The build emits verbose tracing and it must not reach the UI.\r
+const DEBUG_LINE = /^\\s*\\[(WASM DEBUG|DEBUG|IFRAME|PROFILE|PWORKER|COMPILE|SNAPSHOT|MEM)/;\r
+\r
+let libraryFiles = [];\r
+let moduleReady = false;\r
+let compileBusy = false;\r
+// Blob URL the runtime was bootstrapped from; pthread sub-workers load it too, so\r
+// it must outlive the boot.\r
+let mainScriptBlob = null;\r
+\r
+// Configuration arrives either as a global or as a query string. The packaged runtime\r
+// (@live-codes/lean-wasm) hands this file over as a blob, and a blob URL carries no query string, so\r
+// it prepends \`self.__LEAN_WASM_CONFIG__\`; the demo loads this file directly and uses the query.\r
+const workerConfig = self.__LEAN_WASM_CONFIG__ ?? {};\r
+const workerParams = new URLSearchParams(location.search);\r
+const assetBase = (workerConfig.assetBase || workerParams.get('assetBase') || '/lean-wasm').replace(/\\/$/, '');\r
+const assetQ = '';\r
+// Where the optional per-file libraries (Std, Lean, Batteries) are mirrored.\r
+const libBase = (workerConfig.libBase || workerParams.get('libBase') || '/lean-lib').replace(/\\/$/, '');\r
+\r
+// What the artifact declares about its memory, read by \`probeArtifactMemory\` in @live-codes/lean-wasm and\r
+// handed in as configuration \u2014 the worker cannot ask, because it holds the whole module and the answer\r
+// has to arrive before the download (FINDINGS.md \xA72).\r
+//\r
+//   {mode: 'shared',   initial, maximum}  a pthread build: it needs SharedArrayBuffer, and the memory\r
+//                                         this worker constructs must match the declared limits\r
+//   {mode: 'unshared', initial, maximum}  a single-threaded build: no SharedArrayBuffer, no isolation,\r
+//                                         and no memory for this worker to construct at all\r
+//   null                                  the probe could not read the artifact, so the runtime does\r
+//                                         what it did before it could ask and assumes \`shared\`\r
+const declaredMemory = workerConfig.memory ?? null;\r
+const artifactIsThreaded = declaredMemory?.mode !== 'unshared';\r
+\r
+// Bake mode: run the runtime **as the Lean CLI** to produce an \`--incr-header-save\` environment snapshot,\r
+// rather than booting the playground. The snapshot takes the \`Init\` import out of the first Run, which on\r
+// the single-threaded build is ~100 s against ~1.3 s for the pthread build (FINDINGS.md \xA79.7), and it has\r
+// to be produced by the binary that will load it \u2014 a snapshot embeds closure relocations valid only\r
+// against the saving binary's function table.\r
+//\r
+// It cannot share a session with compiling: the CLI parses its own arguments and the runtime exits when it\r
+// is done (\`-sEXIT_RUNTIME=1\`). See \`packages/lean-wasm/src/bake.js\`.\r
+const bake = workerConfig.bake ?? null;\r
+// Where the bake writes its probe, and where a snapshot is written when one is loaded at boot. Both live\r
+// inside the virtual filesystem; \`/workspace\` is created in \`preRun\` either way.\r
+const PROBE_PATH = '/workspace/probe.lean';\r
+const SNAPSHOT_PATH = '/workspace/init.snap';\r
+\r
+const post = (msg) => self.postMessage(msg);\r
+\r
+function isDebugLine(text) {\r
+  return DEBUG_LINE.test(text);\r
+}\r
+\r
+// The build's tracing is voluminous, so it never reaches the panes \u2014 but it is\r
+// the only view into the boot sequence, so keep it on the console rather than\r
+// discarding it.\r
+function logDebug(text) {\r
+  console.log('[lean]', text);\r
+}\r
+\r
+// Long stretches of the boot \u2014 the Init import especially \u2014 emit only filtered\r
+// debug lines, so the page would otherwise see total silence and could not tell\r
+// "still computing" from "wedged". A throttled heartbeat gives the page something\r
+// to reset its watchdog on.\r
+let lastActivityPost = 0;\r
+function noteActivity() {\r
+  const now = Date.now();\r
+  if (now - lastActivityPost < 1000) return;\r
+  lastActivityPost = now;\r
+  post({ type: 'activity' });\r
+}\r
+\r
+function mkdirp(FS, path) {\r
+  let current = '';\r
+  for (const part of path.split('/').filter((p) => p)) {\r
+    current += '/' + part;\r
+    try {\r
+      FS.mkdir(current);\r
+    } catch {\r
+      /* exists */\r
+    }\r
+  }\r
+}\r
+\r
+function writeLibEntry(FS, name, data) {\r
+  const fullPath = '/lib/lean/' + name;\r
+  mkdirp(FS, fullPath.substring(0, fullPath.lastIndexOf('/')));\r
+  FS.writeFile(fullPath, new Uint8Array(data));\r
+}\r
+\r
+/**\r
+ * Start with as much shared memory as we can get, and step down if the device\r
+ * refuses. A \`shared: true\` memory is the reason this whole page needs\r
+ * cross-origin isolation \u2014 and it is only needed when the artifact declares one.\r
+ *\r
+ * The limits are the artifact's, not ours. Two failures come from ignoring that,\r
+ * and both are real: a memory whose maximum exceeds the module's declared maximum\r
+ * fails at instantiation with\r
+ *   LinkError: Import #461 "env" "memory": memory import has a larger maximum\r
+ *   size 65536 than the module's declared maximum 32768\r
+ * and a memory smaller than the module's declared minimum fails the other way.\r
+ * The pinned build declares min 1024 / max 65536 pages (4 GiB); the previous one\r
+ * declared max 32768 and linking it against 65536 is exactly the failure above.\r
+ * Now that the probe reads those numbers off the import section, the runtime\r
+ * cannot produce that mismatch \u2014 it only has to stay under the ceiling.\r
+ */\r
+const MAX_PAGES = 65536;\r
+\r
+function pickMemory() {\r
+  const PAGE = 65536;\r
+  // The declared maximum is a ceiling and the declared minimum is a floor. Falling back to our own\r
+  // ceiling when the artifact could not be read keeps the pre-probe behaviour unchanged.\r
+  const maximum = declaredMemory?.maximum ?? MAX_PAGES;\r
+  const floor = declaredMemory?.initial ?? 0;\r
+\r
+  for (const mb of [2048, 1536, 1024, 768]) {\r
+    const initial = Math.max(floor, (mb * 1024 * 1024) / PAGE);\r
+    if (initial > maximum) continue;\r
+    try {\r
+      const memory = new WebAssembly.Memory({ initial, maximum, shared: true });\r
+      post({ type: 'memory', mb, initialPages: initial, maximumPages: maximum, declared: declaredMemory !== null });\r
+      return { memory, bytes: initial * PAGE };\r
+    } catch {\r
+      post({ type: 'memory', mb, failed: true });\r
+    }\r
+  }\r
+  return null;\r
+}\r
+\r
+async function gunzip(bytes) {\r
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));\r
+  return new Uint8Array(await new Response(stream).arrayBuffer());\r
+}\r
+\r
+/**\r
+ * \`fetch\` reports a network failure as a bare \`TypeError: Failed to fetch\`, which says nothing about which\r
+ * of several URLs it was \u2014 and this worker fetches several. Naming the URL here is the difference between\r
+ * a five-second diagnosis and an afternoon.\r
+ */\r
+async function fetchOrThrow(url) {\r
+  try {\r
+    return await fetch(url);\r
+  } catch (error) {\r
+    throw new Error(\`\${url}: \${error && error.name ? error.name + ' \u2014 ' : ''}\${(error && error.message) || error}\`);\r
+  }\r
+}\r
+\r
+/**\r
+ * Fetch the wasm module here rather than leaving it to Emscripten, so a host can store it\r
+ * **compressed**. Cloudflare Pages refuses files over 25 MiB and this one is 96.2 MiB raw \u2014 16.5 MiB\r
+ * gzipped, which is what makes a plain static host (Pages included) able to serve it at all.\r
+ *\r
+ * What comes back is a **blob URL**, not the bytes, and that is the point: this is a pthread build, so\r
+ * Emscripten's sub-workers each load the module for themselves through \`locateFile\`. Handing them the\r
+ * decompressed bytes as a same-origin blob means a compressed host stays a single download, without\r
+ * needing \`wasmBinary\` (which the main thread honours but the workers ignore, so they fall back to\r
+ * requesting \`lean.wasm\` \u2014 the one file a compressed host does not have).\r
+ *\r
+ * \`type: 'application/wasm'\` matters: it keeps \`WebAssembly.compileStreaming\` available, where a\r
+ * typeless blob falls back to ArrayBuffer instantiation.\r
+ *\r
+ * Both layouts work: a host with no size limit keeps serving \`lean.wasm\`, and pays one 404 for the probe.\r
+ */\r
+let wasmBlobUrl = null;\r
+\r
+async function loadWasmUrl() {\r
+  if (wasmBlobUrl) return wasmBlobUrl;\r
+\r
+  for (const candidate of [\`\${assetBase}/lean.wasm.gz\`, \`\${assetBase}/lean.wasm\`]) {\r
+    const response = await fetchOrThrow(candidate);\r
+    if (response.status === 404) continue;\r
+    if (!response.ok) throw new Error(\`\${candidate}: HTTP \${response.status}\`);\r
+\r
+    const name = candidate.slice(candidate.lastIndexOf('/') + 1);\r
+    const length = Number(response.headers.get('content-length')) || 0;\r
+    post({ type: 'status', data: \`downloading the runtime (\${name}\${length ? \`, \${(length / 1048576).toFixed(1)} MB\` : ''})\u2026\` });\r
+\r
+    let bytes = new Uint8Array(await response.arrayBuffer());\r
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);\r
+    wasmBlobUrl = URL.createObjectURL(new Blob([bytes], { type: 'application/wasm' }));\r
+    return wasmBlobUrl;\r
+  }\r
+\r
+  throw new Error(\`No lean.wasm (or lean.wasm.gz) at \${assetBase}\`);\r
+}\r
+\r
+/**\r
+ * Fetch the packed core layer and slice it into individual files.\r
+ *\r
+ * Each pack is a gzip'd concatenation; the manifest carries the offset and\r
+ * length of every entry within the *uncompressed* container, so no per-file\r
+ * requests are needed \u2014 one 6 MB pack replaces ~380 round trips.\r
+ */\r
+async function loadLibrary() {\r
+  const manifest = await (await fetch(\`\${assetBase}/core-layer.json\`)).json();\r
+  post({ type: 'library', stage: 'manifest', modules: manifest.modules, packs: manifest.packs.length });\r
+\r
+  const files = [];\r
+  let done = 0;\r
+  for (const pack of manifest.packs) {\r
+    const response = await fetch(\`\${assetBase}/core-lib/\${pack.file}\`);\r
+    if (!response.ok) throw new Error(\`\${pack.file}: HTTP \${response.status}\`);\r
+    let bytes = new Uint8Array(await response.arrayBuffer());\r
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);\r
+    if (bytes.length !== pack.bytes) {\r
+      throw new Error(\`\${pack.file}: got \${bytes.length} bytes, manifest says \${pack.bytes}\`);\r
+    }\r
+    for (const entry of pack.entries) {\r
+      files.push({ name: entry.path, data: bytes.subarray(entry.offset, entry.offset + entry.bytes) });\r
+    }\r
+    done += 1;\r
+    post({ type: 'library', stage: 'pack', loaded: done, total: manifest.packs.length, file: pack.file });\r
+  }\r
+\r
+  post({ type: 'library', stage: 'done', files: files.length });\r
+  return files;\r
+}\r
+\r
+// ---- Optional libraries -------------------------------------------------\r
+//\r
+// The core layer only carries the Init closure. Std / Lean / Batteries live as\r
+// individual files (\`.olean\` + \`.ir\` + \`.ir.sig\`) in a per-file tree indexed by\r
+// \`lean-lib-files.json\`, exactly as upstream ships them. They are fetched on\r
+// demand and written into the filesystem mid-session, which is enough because\r
+// module resolution happens at compile time.\r
+\r
+let libraryIndex = null;\r
+const loadedRoots = new Set();\r
+// Whether the tree is stored as \`<path>.gz\`. The index decides for the whole directory, so this costs\r
+// one probe per session rather than one per file \u2014 which matters when a root is 1,449 files.\r
+let libCompressed = false;\r
+\r
+async function getLibraryIndex() {\r
+  if (libraryIndex) return libraryIndex;\r
+\r
+  const candidates = [\r
+    [\`\${libBase}/lean-lib-files.json.gz\`, true],\r
+    [\`\${libBase}/lean-lib-files.json\`, false]\r
+  ];\r
+  for (const [url, compressed] of candidates) {\r
+    const response = await fetch(url);\r
+    if (response.status === 404) continue;\r
+    if (!response.ok) throw new Error(\`library index: HTTP \${response.status}\`);\r
+\r
+    let bytes = new Uint8Array(await response.arrayBuffer());\r
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);\r
+    libCompressed = compressed;\r
+    libraryIndex = JSON.parse(new TextDecoder().decode(bytes));\r
+    return libraryIndex;\r
+  }\r
+  throw new Error(\`No lean-lib-files.json (or .gz) at \${libBase}\`);\r
+}\r
+\r
+async function fetchIfPresent(url) {\r
+  const response = await fetch(url);\r
+  if (response.status === 404) return null;\r
+  if (!response.ok) throw new Error(\`\${url}: HTTP \${response.status}\`);\r
+  return new Uint8Array(await response.arrayBuffer());\r
+}\r
+\r
+/**\r
+ * Supplying one library root: a baked snapshot when there is one for it, otherwise every published file of\r
+ * it, one file at a time.\r
+ *\r
+ * No dependency graph is computed either way: the page retries the compile after each load, and Lean's own\r
+ * "unknown module prefix" error names the next root that is missing, so the closure is discovered by asking\r
+ * the compiler.\r
+ */\r
+/**\r
+ * Try a baked snapshot for this root before its per-file tree.\r
+ *\r
+ * On a single-threaded build the *import* dominates, not the bytes: measured on the Std demo, fetching its\r
+ * 483 modules' 1,449 files takes 5 s and loading them takes 104 s. A snapshot turns that import into a\r
+ * deserialization. The loader reports its verdict on stderr \u2014 \`cached env for [...]\`, or \`failed: ...\` \u2014 and\r
+ * that is the only signal worth trusting; its return value is an IO result whose layout is not ours to guess.\r
+ *\r
+ * Returns null when there is no snapshot for this root or it was refused, and the caller falls through to\r
+ * the tree \u2014 which stays the general path, because a snapshot only matches the header it was baked for.\r
+ */\r
+async function tryRootSnapshot(root) {\r
+  const name = root.toLowerCase();\r
+  const url = \`\${assetBase}/snapshots/\${name}.snap\`;\r
+  let bytes = null;\r
+  try {\r
+    const response = await fetch(url);\r
+    if (response.ok) {\r
+      post({ type: 'status', data: \`fetching the \${root} snapshot\u2026\` });\r
+      bytes = new Uint8Array(await response.arrayBuffer());\r
+    }\r
+  } catch {\r
+    return null;\r
+  }\r
+  if (!bytes) return null;\r
+\r
+  const path = \`/workspace/\${name}.snap\`;\r
+  const trace = [];\r
+  const outerPrintErr = Module.printErr;\r
+  Module.printErr = (line) => {\r
+    if (typeof line === 'string' && line.includes('wasmLoadSnapshot')) trace.push(line);\r
+    if (typeof outerPrintErr === 'function') outerPrintErr(line);\r
+  };\r
+  // Three steps, reported separately. A single \`catch { return null }\` made a failed install indistinguishable\r
+  // from no snapshot at all: the page silently took the file tree, and a run that had measured 13 s came back\r
+  // at 61 s with nothing to explain the difference. If a step fails, say which and why.\r
+  let failure = null;\r
+  try {\r
+    Module.FS.writeFile(path, bytes);\r
+    Module.FS.writeFile(\`\${path}.deps\`, new Uint8Array([0x5b, 0x5d]));\r
+    try {\r
+      // The file tree is still fetched afterwards, and that is not a fallback: the program's header has to\r
+      // *resolve* the module it imports, and a snapshot only supplies the elaborated environment for that\r
+      // header. What the snapshot removes is the realization \u2014 the 104 s, not the 5 s.\r
+      Module._lean_wasm_load_snapshot(mkLeanString(path));\r
+    } catch (error) {\r
+      failure = \`the loader threw: \${(error && error.message) || error}\`;\r
+    }\r
+  } catch (error) {\r
+    failure = \`writing it into the file system failed: \${(error && error.message) || error}\`;\r
+  } finally {\r
+    Module.printErr = outerPrintErr;\r
+  }\r
+\r
+  const megabytes = (bytes.length / 1048576).toFixed(1);\r
+  const refused = trace.find((line) => line.includes('failed'));\r
+  post({\r
+    type: 'status',\r
+    data: failure\r
+      ? \`could not install the \${root} snapshot (\${megabytes} MB): \${failure} \u2014 the file tree follows\`\r
+      : refused\r
+        ? \`the \${root} snapshot was refused (\${refused}) \u2014 the file tree follows\`\r
+        : \`handed the \${root} snapshot to the loader (\${megabytes} MB) \u2014 the file tree follows either way\`\r
+  });\r
+  return null;\r
+}\r
+\r
+async function loadRoot(root) {\r
+  if (loadedRoots.has(root)) return { root, files: 0, bytes: 0, alreadyLoaded: true };\r
+\r
+  const fromSnapshot = await tryRootSnapshot(root);\r
+  if (fromSnapshot) {\r
+    loadedRoots.add(root);\r
+    return fromSnapshot;\r
+  }\r
+\r
+  const index = await getLibraryIndex();\r
+  const modules = index.filter((p) => p === \`\${root}.olean\` || p.startsWith(\`\${root}/\`));\r
+  if (modules.length === 0) return { root, files: 0, bytes: 0, unavailable: true };\r
+\r
+  // A module's \`.ir\` is only used when its \`.ir.sig\` is present, so all three\r
+  // travel together.\r
+  const targets = [];\r
+  for (const module of modules) {\r
+    targets.push(module, module.replace(/\\.olean$/, '.ir'), module.replace(/\\.olean$/, '.ir.sig'));\r
+  }\r
+\r
+  let files = 0;\r
+  let bytes = 0;\r
+  let failed = 0;\r
+  let next = 0;\r
+  const CONCURRENCY = 8;\r
+  const urlOf = (rel) => \`\${libBase}/\${rel}\${libCompressed ? '.gz' : ''}\`;\r
+\r
+  async function worker() {\r
+    for (;;) {\r
+      const i = next++;\r
+      if (i >= targets.length) return;\r
+      const rel = targets[i];\r
+\r
+      // A transient failure used to be invisible \u2014 the file was skipped, and Lean only complained if\r
+      // something happened to import it. Retry once, then count it so the caller can say so.\r
+      let data = null;\r
+      for (let attempt = 0; ; attempt += 1) {\r
+        try {\r
+          const fetched = await fetchIfPresent(urlOf(rel));\r
+          if (!fetched) break; // a module simply has no such sibling\r
+          data = libCompressed ? await gunzip(fetched) : fetched;\r
+          break;\r
+        } catch (error) {\r
+          if (attempt >= 1) {\r
+            failed += 1;\r
+            break;\r
+          }\r
+        }\r
+      }\r
+      if (!data) continue;\r
+\r
+      // Every \`.olean\`, \`.ir\` and \`.ir.sig\` starts with the same header. Checking it here turns the\r
+      // two most common hosting mistakes into something actionable: a host with an SPA fallback\r
+      // answers \`200\` with HTML for a file that is not deployed, and Lean's own complaint about that\r
+      // arrives much later, from inside the kernel, as \`failed to read file '\u2026, invalid header\`.\r
+      if (!(data.length > 8 && data[0] === 0x6f && data[1] === 0x6c && data[2] === 0x65 && data[3] === 0x61 && data[4] === 0x6e)) {\r
+        const looksLikeHtml = data.length > 2 && data[0] === 0x3c;\r
+        throw new Error(\r
+          \`\${rel} is not a Lean object file\${looksLikeHtml ? ' \u2014 the host returned HTML for it, so the library' : ''}\` +\r
+            \`\${looksLikeHtml ? ' tree is missing from baseUrl (an SPA fallback hides the 404).' : \` (\${data.length} bytes).\`}\`\r
+        );\r
+      }\r
+\r
+      try {\r
+        writeLibEntry(Module.FS, rel, data);\r
+        files += 1;\r
+        bytes += data.length;\r
+      } catch {\r
+        failed += 1; // an individual write failure\r
+      }\r
+      if (files % 400 === 0) post({ type: 'modules', stage: 'progress', root, files, total: targets.length });\r
+    }\r
+  }\r
+\r
+  await Promise.all(Array.from({ length: CONCURRENCY }, worker));\r
+  loadedRoots.add(root);\r
+  post({ type: 'modules', stage: 'loaded', root, files, bytes, failed, total: targets.length });\r
+  return { root, files, bytes, failed };\r
+}\r
+\r
+// ---- Packed layers -----------------------------------------------------\r
+//\r
+// Mathlib is not published per-file: upstream ships it as a packed layer (a\r
+// manifest plus gzip'd containers carrying offset/length for every entry), the\r
+// same scheme the core Init layer uses. Packs are installed one at a time and\r
+// released, so peak memory stays around a single pack rather than the whole\r
+// 800 MiB layer.\r
+\r
+const loadedLayers = new Set();\r
+\r
+async function loadPackedLayer({ manifestUrl, packBase, label }) {\r
+  if (loadedLayers.has(label)) return { files: 0, bytes: 0, alreadyLoaded: true };\r
+\r
+  const manifest = await (await fetch(manifestUrl)).json();\r
+  if (!manifest.packs || !Array.isArray(manifest.packs)) {\r
+    throw new Error(\`\${label}: manifest has no packs\`);\r
+  }\r
+\r
+  let files = 0;\r
+  let bytes = 0;\r
+  for (const [index, pack] of manifest.packs.entries()) {\r
+    const response = await fetch(\`\${packBase}/\${pack.file}\`);\r
+    if (!response.ok) throw new Error(\`\${pack.file}: HTTP \${response.status}\`);\r
+\r
+    let raw = new Uint8Array(await response.arrayBuffer());\r
+    if (raw[0] === 0x1f && raw[1] === 0x8b) raw = await gunzip(raw);\r
+    if (raw.length !== pack.bytes) {\r
+      throw new Error(\`\${pack.file}: got \${raw.length} bytes, manifest says \${pack.bytes}\`);\r
+    }\r
+\r
+    for (const entry of pack.entries) {\r
+      writeLibEntry(Module.FS, entry.path, raw.subarray(entry.offset, entry.offset + entry.bytes));\r
+    }\r
+    files += pack.entries.length;\r
+    bytes += raw.length;\r
+    raw = null; // release this pack before the next one\r
+\r
+    post({ type: 'layer', stage: 'progress', label, pack: index + 1, packs: manifest.packs.length, files, bytes });\r
+  }\r
+\r
+  loadedLayers.add(label);\r
+  post({ type: 'layer', stage: 'loaded', label, files, bytes });\r
+  return { files, bytes };\r
+}\r
+\r
+function mkLeanString(str) {\r
+  const ptr = Module.stringToNewUTF8(str);\r
+  const obj = Module._lean_mk_string(ptr);\r
+  Module._free(ptr);\r
+  return obj;\r
+}\r
+\r
+function compileCode(code, fileName) {\r
+  if (!moduleReady) return { success: false, error: 'Module not ready' };\r
+  if (compileBusy) return { success: false, error: 'Compile already in progress' };\r
+  compileBusy = true;\r
+  const t0 = performance.now();\r
+  try {\r
+    const codeObj = mkLeanString(code);\r
+    const fnameObj = mkLeanString(fileName || '/workspace/input.lean');\r
+    const resObj = Module._lean_wasm_compile(codeObj, fnameObj);\r
+    const elapsed = performance.now() - t0;\r
+    // IO result: ctor tag byte at offset 7 (0 = ok, anything else = error).\r
+    const tag = Module.getValue(resObj + 7, 'i8') & 0xff;\r
+    if (tag !== 0) {\r
+      try {\r
+        Module._lean_io_result_show_error(resObj);\r
+      } catch {\r
+        /* the error text has already gone to stderr */\r
+      }\r
+      return { success: false, error: 'lean_wasm_compile returned an IO error', elapsed };\r
+    }\r
+    return { success: true, elapsed };\r
+  } catch (err) {\r
+    return { success: false, error: (err && err.message) || String(err) };\r
+  } finally {\r
+    compileBusy = false;\r
+  }\r
+}\r
+\r
+/**\r
+ * Finish the boot once the runtime is initialised: load a baked environment snapshot if this host serves\r
+ * one, then declare the runtime ready.\r
+ *\r
+ * The snapshot is why a first Run can be fast at all: it carries the imported \`Init\` environment, so the\r
+ * ~100 s import the single-threaded build otherwise pays (FINDINGS.md \xA79.7) never happens \u2014 upstream's\r
+ * \`Shell.lean\` says a snapshot "skips the multi-minute \`loadExts\` import entirely". It is optional: a host\r
+ * without one still works and simply pays the import.\r
+ */\r
+async function finishStartup() {\r
+  if (typeof Module._lean_wasm_load_snapshot === 'function') {\r
+    let bytes = null;\r
+    try {\r
+      // A dead asset host must not hang the boot. Without a timeout this fetch waits indefinitely, \`ready\` is\r
+      // never posted, and the page dies at its own 120 s limit instead of falling back to a first run that\r
+      // imports \u2014 which is exactly what a stopped mirror looked like while I was chasing something else.\r
+      const response = await fetch(\`\${assetBase}/snapshots/init.snap\`, { signal: AbortSignal.timeout(60000) });\r
+      if (response.ok) bytes = new Uint8Array(await response.arrayBuffer());\r
+    } catch (error) {\r
+      post({ type: 'status', data: \`no Init snapshot fetchable here (\${(error && error.message) || error}); the first run will import\` });\r
+      bytes = null;\r
+    }\r
+    if (bytes) {\r
+      try {\r
+        Module.FS.writeFile(SNAPSHOT_PATH, bytes);\r
+        // The loader reads a dependency sidecar beside the snapshot. A self-contained snapshot's list is\r
+        // empty, which is why upstream ships only the snapshot itself and writes the sidecar in the worker.\r
+        Module.FS.writeFile(\`\${SNAPSHOT_PATH}.deps\`, new Uint8Array([0x5b, 0x5d]));\r
+        // The path must be a \`lean_object*\`, not a JavaScript string. The export's parameter is a Lean\r
+        // \`String\`, and a JS string coerces to 0 as an i32 \u2014 so the loader dereferences a bogus pointer and\r
+        // traps with "memory access out of bounds" *before* its first line runs. That is a wrong call\r
+        // dressed up as a wrong amount of memory, and it cost a 2 GiB rebuild to rule the memory out.\r
+        // \`mkLeanString\` is the same marshalling the compile path above uses.\r
+        const trace = [];\r
+        const outerPrintErr = Module.printErr;\r
+        Module.printErr = (line) => {\r
+          if (typeof line === 'string' && line.includes('wasmLoadSnapshot')) trace.push(line);\r
+          if (typeof outerPrintErr === 'function') outerPrintErr(line);\r
+        };\r
+        try {\r
+          Module._lean_wasm_load_snapshot(mkLeanString(SNAPSHOT_PATH));\r
+        } finally {\r
+          Module.printErr = outerPrintErr;\r
+        }\r
+        // The loader prints \`cached env for [\u2026]\` on success and \`failed: \u2026\` on refusal, but that trace does\r
+        // not reach \`printErr\` on every path \u2014 so report what is known rather than assert a verdict. A missing\r
+        // trace is not a failure: the first run's time is what settles it, and on this build it is ~0.3 s when\r
+        // the cache is seeded against ~75 s when it is not.\r
+        const megabytes = (bytes.length / 1048576).toFixed(1);\r
+        const refused = trace.find((line) => line.includes('failed'));\r
+        post({\r
+          type: 'status',\r
+          data: trace.some((line) => line.includes('cached env for'))\r
+            ? \`the loader seeded the environment cache from the Init snapshot (\${megabytes} MB) \u2014 the first run skips the import\`\r
+            : refused\r
+              ? \`the Init snapshot was refused (\${refused}) \u2014 the first run imports instead\`\r
+              : \`Init snapshot handed to the loader (\${megabytes} MB); the first run's time shows whether the cache was seeded\`,\r
+        });\r
+      } catch (error) {\r
+        post({\r
+          type: 'status',\r
+          data: \`could not install the Init snapshot (\${(error && error.message) || error}); the first run will import\`,\r
+        });\r
+      }\r
+    }\r
+  }\r
+  moduleReady = true;\r
+  post({ type: 'ready' });\r
+}\r
+\r
+async function startLeanModule() {\r
+  // A shared memory is only this worker's job when the artifact declares one. A single-threaded build\r
+  // declares an unshared memory, which needs no SharedArrayBuffer and therefore no cross-origin\r
+  // isolation \u2014 and there is nothing to construct here either, because that memory can grow and\r
+  // Emscripten already knows the limits it was built with.\r
+  let picked = null;\r
+  if (artifactIsThreaded) {\r
+    picked = pickMemory();\r
+    if (!picked) {\r
+      post({\r
+        type: 'error',\r
+        data:\r
+          'The Lean artifact declares a shared WebAssembly memory, and this document has no ' +\r
+          'SharedArrayBuffer \u2014 which it would only have if it were cross-origin isolated. Serve the page ' +\r
+          'with \`Cross-Origin-Opener-Policy: same-origin\` and \`Cross-Origin-Embedder-Policy: require-corp\` ' +\r
+          '(or \`credentialless\`), or, for an embed that cannot set headers, \`Document-Isolation-Policy: ' +\r
+          'isolate-and-require-corp\` on the frame itself. A single-threaded Lean build would need none of ' +\r
+          'this. See FINDINGS.md \xA72 and \xA79.',\r
+      });\r
+      return;\r
+    }\r
+  }\r
+\r
+  self.Module = {\r
+    // Omitted entirely for an unshared artifact, so Emscripten allocates the memory it was built for\r
+    // rather than being handed limits guessed from outside.\r
+    ...(picked ? { wasmMemory: picked.memory, INITIAL_MEMORY: picked.bytes } : {}),\r
+    locateFile: (path) =>\r
+      path.endsWith('.wasm') && wasmBlobUrl ? wasmBlobUrl : \`\${assetBase}/\${path}\${assetQ}\`,\r
+    // Only a pthread build needs to say where its script is: it spawns sub-workers that have to load it\r
+    // same-origin. A single-threaded build has no sub-workers, and a build that does not list\r
+    // \`mainScriptUrlOrBlob\` in INCOMING_MODULE_JS_API would rather not be handed an unknown key.\r
+    ...(artifactIsThreaded ? { mainScriptUrlOrBlob: \`\${assetBase}/lean.js\${assetQ}\` } : {}),\r
+    // In bake mode the CLI owns startup \u2014 Emscripten runs \`main\` as soon as \`onRuntimeInitialized\`\r
+    // returns, so this worker must not also initialise the runtime itself, and must not wait for a \`ready\`.\r
+    ...(bake\r
+      ? { arguments: [\`--incr-header-save=\${bake.snapshotPath}\`, PROBE_PATH], noInitialRun: false }\r
+      : { noInitialRun: true }),\r
+    print: (text) => {\r
+      noteActivity();\r
+      if (isDebugLine(text)) return logDebug(text);\r
+      post({ type: 'stdout', data: text });\r
+    },\r
+    printErr: (text) => {\r
+      noteActivity();\r
+      if (isDebugLine(text)) return logDebug(text);\r
+      post({ type: 'stderr', data: text });\r
+    },\r
+    setStatus: (text) => {\r
+      if (text) post({ type: 'status', data: text });\r
+    },\r
+    noInitialRun: true,\r
+    preRun: [\r
+      function () {\r
+        const FS = Module.FS;\r
+        Module.ENV['LEAN_PATH'] = '/lib/lean';\r
+        for (const dir of ['/lib', '/lib/lean', '/workspace', '/bin']) {\r
+          try {\r
+            FS.mkdir(dir);\r
+          } catch {\r
+            /* exists */\r
+          }\r
+        }\r
+        let errors = 0;\r
+        for (const file of libraryFiles) {\r
+          try {\r
+            writeLibEntry(FS, file.name, file.data);\r
+          } catch {\r
+            errors += 1;\r
+          }\r
+        }\r
+        post({ type: 'library', stage: 'written', files: libraryFiles.length, errors });\r
+        libraryFiles = [];\r
+        try {\r
+          FS.chdir('/workspace');\r
+        } catch {\r
+          /* ignore */\r
+        }\r
+        // The bake needs a file to elaborate, and one that imports nothing: that is what makes it pay the\r
+        // default \`Init\` header import, which is exactly the cost the snapshot exists to skip.\r
+        if (bake) {\r
+          try {\r
+            FS.writeFile(PROBE_PATH, bake.probe ?? '#check 2+2');\r
+          } catch (error) {\r
+            post({ type: 'error', data: 'could not write the bake probe: ' + ((error && error.message) || error) });\r
+          }\r
+        }\r
+      },\r
+    ],\r
+    onRuntimeInitialized: function () {\r
+      // The CLI owns startup in bake mode. Returning from here is what lets Emscripten run \`main\`; doing\r
+      // this worker's own init first would initialise the runtime twice.\r
+      if (bake) return;\r
+      try {\r
+        Module._lean_initialize_runtime_module();\r
+        Module._lean_initialize();\r
+        Module._lean_io_mark_end_initialization();\r
+        if (Module._lean_init_task_manager) Module._lean_init_task_manager();\r
+        if (Module._lean_enable_initializer_execution) Module._lean_enable_initializer_execution();\r
+        const spRes = Module._lean_init_search_path();\r
+        if ((Module.getValue(spRes + 7, 'i8') & 0xff) !== 0) {\r
+          try {\r
+            Module._lean_io_result_show_error(spRes);\r
+          } catch {\r
+            /* ignore */\r
+          }\r
+          throw new Error('lean_init_search_path failed (see stderr)');\r
+        }\r
+        void finishStartup();\r
+      } catch (err) {\r
+        post({ type: 'error', data: 'Lean init failed: ' + ((err && err.message) || err) });\r
+      }\r
+    },\r
+    onExit: function (code) {\r
+      if (!bake) {\r
+        moduleReady = false;\r
+        post({ type: 'status', data: \`Lean exited (\${code})\` });\r
+        return;\r
+      }\r
+      // The CLI has run, so the snapshot is on the filesystem \u2014 or it is not, which is worth saying\r
+      // precisely rather than leaving the caller to time out.\r
+      try {\r
+        // Copied, not handed over: \`FS.readFile\` answers a view into the wasm heap, and posting that would\r
+        // either clone the whole heap or fail, since this artifact defines its memory.\r
+        const bytes = new Uint8Array(Module.FS.readFile(bake.snapshotPath));\r
+        post({ type: 'snapshot', bytes, code });\r
+      } catch (error) {\r
+        post({\r
+          type: 'error',\r
+          data: \`the bake exited (\${code}) without writing \${bake.snapshotPath}: \` + ((error && error.message) || error),\r
+        });\r
+      }\r
+    },\r
+    onAbort: function (what) {\r
+      moduleReady = false;\r
+      post({ type: 'error', data: 'Aborted: ' + (what || 'unknown') });\r
+    },\r
+  };\r
+\r
+  // Three separate steps, reported separately. Wrapping all of them in one \`catch\` that said "Failed to\r
+  // load lean.js" made a failure to fetch the 97 MB wasm look like a failure to fetch the 48 MB script \u2014\r
+  // both fetched from the same base, and the message named only one of them.\r
+  try {\r
+    // Fetch lean.js ourselves and hand it to the runtime as a **same-origin blob**.\r
+    //\r
+    // \`importScripts\` itself tolerates a cross-origin script, but this is a pthread\r
+    // build: the runtime spawns its thread pool with \`new Worker(mainScriptUrlOrBlob)\`,\r
+    // and a worker script must be same-origin. With a cross-origin asset base that\r
+    // throws during evaluation, and \`importScripts\` reports it only as\r
+    // "the script at \u2026 failed to load" \u2014 with every other asset fetching fine, which\r
+    // points at the wrong thing entirely. A blob URL is same-origin, and is what\r
+    // \`mainScriptUrlOrBlob\` exists for.\r
+    const response = await fetchOrThrow(\`\${assetBase}/lean.js\${assetQ}\`);\r
+    if (!response.ok) throw new Error(\`HTTP \${response.status} fetching lean.js\`);\r
+    const source = await response.text();\r
+    // Kept for the lifetime of the runtime: pthread sub-workers load it lazily.\r
+    mainScriptBlob = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));\r
+    if (artifactIsThreaded) Module.mainScriptUrlOrBlob = mainScriptBlob;\r
+  } catch (err) {\r
+    post({ type: 'error', data: 'Failed to load lean.js: ' + ((err && err.message) || err) });\r
+    return;\r
+  }\r
+\r
+  try {\r
+    // Emscripten and every pthread sub-worker instantiate from this same blob URL.\r
+    await loadWasmUrl();\r
+  } catch (err) {\r
+    post({ type: 'error', data: 'Failed to fetch the Lean runtime: ' + ((err && err.message) || err) });\r
+    return;\r
+  }\r
+\r
+  try {\r
+    // The blob is how lean.js is evaluated here at all \u2014 a threaded build additionally needs it to be\r
+    // same-origin for its sub-workers, which a bare \`importScripts\` of a CDN URL would not be.\r
+    importScripts(mainScriptBlob);\r
+  } catch (err) {\r
+    post({ type: 'error', data: 'Failed to evaluate lean.js: ' + ((err && err.message) || err) });\r
+  }\r
+}\r
+\r
+self.onmessage = async (event) => {\r
+  const msg = event.data || {};\r
+  if (msg.type === 'start') {\r
+    try {\r
+      libraryFiles = await loadLibrary();\r
+      await startLeanModule();\r
+    } catch (err) {\r
+      post({ type: 'error', data: 'Loading the Lean library failed: ' + ((err && err.message) || err) });\r
+    }\r
+  } else if (msg.type === 'compile') {\r
+    post({ type: 'result', id: msg.id, ...compileCode(msg.code, msg.path) });\r
+  } else if (msg.type === 'load_modules') {\r
+    const results = [];\r
+    for (const root of msg.roots || []) {\r
+      try {\r
+        results.push(await loadRoot(root));\r
+      } catch (err) {\r
+        results.push({ root, files: 0, bytes: 0, error: (err && err.message) || String(err) });\r
+      }\r
+    }\r
+    post({ type: 'modules_loaded', id: msg.id, roots: msg.roots || [], results });\r
+  } else if (msg.type === 'load_layer') {\r
+    try {\r
+      const result = await loadPackedLayer(msg);\r
+      post({ type: 'layer_loaded', id: msg.id, label: msg.label, ok: true, ...result });\r
+    } catch (err) {\r
+      post({ type: 'layer_loaded', id: msg.id, label: msg.label, ok: false, error: (err && err.message) || String(err) });\r
+    }\r
+  }\r
+};\r
+`;async function W({baseUrl:e,probe:r="#check 2+2",onProgress:t,timeoutMs:s=12e5}={}){let n=E(e),a={assetBase:n.assetBase,libBase:n.libBase,bake:{probe:r,snapshotPath:"/workspace/init.snap"}},i=new Worker(URL.createObjectURL(new Blob([`self.__LEAN_WASM_CONFIG__ = ${JSON.stringify(a)};
+${v}`],{type:"text/javascript"})));try{return await new Promise((d,h)=>{let f=setTimeout(()=>h(new Error(`the bake did not finish within ${Math.round(s/6e4)} minutes`)),s);i.onmessage=y=>{let u=y.data||{};if(u.type==="snapshot"){clearTimeout(f),d(new Uint8Array(u.bytes));return}if(u.type==="error"){clearTimeout(f),h(new Error(u.data));return}u.type==="status"&&u.data&&t?.(u.data),u.type==="library"&&u.stage==="manifest"?t?.(`core layer: ${u.modules} modules in ${u.packs} packs`):u.type==="library"&&u.stage==="pack"&&t?.(`core pack ${u.loaded}/${u.total}`)},i.onerror=y=>{clearTimeout(f),h(new Error(y.message||"the bake worker failed"))},i.postMessage({type:"start"})})}finally{i.terminate()}}var I=[0,97,115,109],pe=2,ye=5,be=0,we=1,ge=2,ke=3,xe=4,U=1,D=2,A=262144;function z(e,r){return{pos:r,byte(){return this.pos>=e.length?null:e[this.pos++]},u32(){let t=0,s=0;for(;;){if(this.pos>=e.length||s>28)return null;let n=e[this.pos++];if(t|=(n&127)<<s,s+=7,(n&128)===0)return t>>>0}},name(){let t=this.u32();if(t===null||this.pos+t>e.length)return null;let s="";for(let n=0;n<t;n++)s+=String.fromCharCode(e[this.pos+n]);return this.pos+=t,s},skip(t){return this.pos+t>e.length?null:(this.pos+=t,!0)}}}function _e(e,r){let t=e.u32();if(t===null)return null;for(let s=0;s<t;s++){let n=e.name(),a=e.name();if(n===null||a===null)return null;let i=e.byte();if(i===null)return null;if(i===ge){let d=e.u32();if(d===null)return null;let h=e.u32();if(h===null)return null;let f=null;return d&U&&(f=e.u32(),f===null)?null:{module:n,field:a,shared:(d&D)!==0,initial:h,maximum:f}}if(i===be){if(e.u32()===null)return null}else if(i===we){if(e.skip(1)===null)return null;let d=e.u32();if(d===null||e.u32()===null||d&U&&e.u32()===null)return null}else if(i===ke){if(e.skip(2)===null)return null}else if(i===xe){if(e.skip(1)===null||e.u32()===null)return null}else return null;if(e.pos>r)return null}return null}function Se(e){if(!e||e.length<8)return null;for(let t=0;t<I.length;t++)if(e[t]!==I[t])return null;let r=z(e,8);for(;r.pos<e.length;){let t=r.byte(),s=r.u32();if(t===null||s===null)return null;let n=r.pos+s;if(n>e.length)return null;if(t===pe)return _e(r,n);r.pos=n}return null}function $e(e){if(!e||e.length<8)return null;for(let t=0;t<I.length;t++)if(e[t]!==I[t])return null;let r=z(e,8);for(;r.pos<e.length;){let t=r.byte(),s=r.u32();if(t===null||s===null)return null;let n=r.pos+s;if(n>e.length)return null;if(t===ye){let a=r.u32();if(a===null||a===0)return null;let i=r.u32();if(i===null)return null;let d=r.u32();if(d===null)return null;let h=null;return i&U&&(h=r.u32(),h===null)?null:{shared:(i&D)!==0,initial:d,maximum:h}}r.pos=n}return null}function G(e){let r=Se(e);if(r)return{source:"import",...r};let t=$e(e);return t?{source:"defined",...t}:null}var H=A/4;function q(e,r){let t=e.reduce((a,i)=>a+i.length,0),s=new Uint8Array(Math.min(t,r)),n=0;for(let a of e){if(n>=s.length)break;let i=a.subarray(0,Math.min(a.length,s.length-n));s.set(i,n),n+=i.length}return s}async function Ee(e){if(!e.body)return new Uint8Array(await e.arrayBuffer()).subarray(0,A);let r=e.body.getReader(),t=[],s=0,n=H;try{for(;;){let{value:a,done:i}=await r.read();if(i||(t.push(a),s+=a.length,n=Y(t[0])?H:A,s>=n))break}}catch{}finally{r.cancel().catch(()=>{})}return q(t,n)}async function Me(e,r){let t=new Blob([e]).stream().pipeThrough(new DecompressionStream("gzip")).getReader(),s=[],n=0;try{for(;n<r;){let{value:a,done:i}=await t.read();if(i)break;s.push(a),n+=a.length}}catch{}finally{t.cancel().catch(()=>{})}return q(s,r)}function Y(e){return e.length>1&&e[0]===31&&e[1]===139}async function K(e){let r=String(e??"").replace(/\/+$/,""),t=[`${r}/lean.wasm.gz`,`${r}/lean.wasm`];for(let s of t){let n;try{n=await fetch(s)}catch{continue}if(n.status!==404&&n.ok)try{let a=await Ee(n),i=Y(a)?await Me(a,A):a,d=G(i);if(!d)continue;return{mode:d.shared?"shared":"unshared",memory:d,url:s,bytesRead:a.length}}catch{continue}}return null}function Le(e){return e.startsWith("[DEBUG:")||e.startsWith("mainModule? =")||e.startsWith("- /lib/lean/")||e.startsWith("wasm streaming compile failed:")||e==="falling back to ArrayBuffer instantiation"}function Ae(e){let r=e.data;return typeof r=="string"?r:r&&typeof r=="object"?r.msg??r.message??JSON.stringify(r):String(r??"")}function T(e,r){let t=[],s=[],n=0;for(let[a,i]of[["stdout",e],["stderr",r]])for(let d of(i??"").split(`
+`)){let h=d.trim();if(!h)continue;if(Le(h)){n+=1;continue}let f=null;if(h.startsWith("{"))try{f=JSON.parse(h)}catch{f=null}if(f&&typeof f=="object"&&f.severity){let y={severity:f.severity,text:Ae(f),pos:f.pos??null};(f.severity==="information"?t:s).push(y)}else{let y={severity:a==="stdout"?"output":"error",text:h,pos:null};(a==="stdout"?t:s).push(y)}}return{info:t,problems:s,noise:n}}function X(e){let r=/\(line \d+, col \d+\)|at line \d+, column \d+/;return e.map(({severity:t,text:s,pos:n})=>{let a=String(s).replace(/\u001b\[[0-9;]*m/g,""),i=n?.line!=null&&!r.test(a)?`  (line ${n.line}${n.column!=null?`, col ${n.column}`:""})`:"";return t==="output"?a:`${t}: ${a}${i}`})}var P=["Std","Lean","Batteries"];function M(e){return[{label:"Mathlib",manifestUrl:`${e.layerBase}/real-analysis-layer.json`,packBase:e.layerBase,roots:["Mathlib","Aesop","Qq","Plausible","ProofWidgets","ImportGraph","LeanSearchClient","Game"]}]}var J={Lake:"Lake is a build tool, and there is no build step here."};function Q(e){return e.replace(/\/-[\s\S]*?-\//g,"").replace(/--[^\n]*/g,"")}function N(e){let r=[];for(let t of Q(e).split(`
+`)){let s=/^\s*import\s+([A-Za-z0-9_'.]+)/.exec(t);if(!s)continue;let n=s[1].replace(/^'/,"").split(".")[0];n&&!r.includes(n)&&r.push(n)}return r}function V(e){return Q(e).split(`
+`).filter(r=>/^\s*import\s+\S/.test(r)).map(r=>r.trim()).join(`
+`)}function Z(e){let r=[];for(let t of e){let s=/unknown module prefix '([^']+)'/.exec(t.text);s&&!r.includes(s[1])&&r.push(s[1])}return r}function ee(e){return[...P,...M(e).flatMap(r=>r.roots)]}function Be(e,r){return P.includes(e)||M(r).some(t=>t.roots.includes(e))?"lean-wasm-fetch-assets":null}function re(e,r,t){let s=[],n=a=>{s.includes(a)||s.push(a)};for(let a of N(e))if(r.includes(a)){let i=Be(a,t);n(i?`${a} is not on the asset host. Mirror it with \`${i}\`.`:`${a} is not available here.`)}else J[a]&&n(J[a]);return s}function te(e){let r=[];for(let t of e){let s=/object file '[^']*' of module (\S+)/.exec(t.text);if(!s)continue;let n=`${s[1]} is not in the published Mathlib closure. Upstream ships only the 4,303 modules its Real Analysis course needs, so some of Mathlib is available here and some is not.`;r.includes(n)||r.push(n)}return r}var Re="/workspace/input.lean";function ve(e){return`self.__LEAN_WASM_CONFIG__ = ${JSON.stringify(e)};
+${v}`}function ne({assetBase:e,libBase:r,memory:t,onProgress:s,onStatus:n}){let a=null,i=null,d="",h="",f=1,y=[],u=c=>{c&&s?.(c)};function B(c){let o=c.data||{};switch(o.type){case"stdout":d+=o.data+`
 `;return;case"stderr":h+=o.data+`
-`;return;case"status":r?.(o.data);return;case"memory":u(o.failed?`shared memory: ${o.mb} MB refused, trying a smaller one`:`shared memory: ${o.mb} MB (max ${o.maximumPages} pages)`);return;case"library":o.stage==="manifest"?u(`core layer: ${o.modules} modules in ${o.packs} packs`):o.stage==="pack"?u(`core pack ${o.loaded}/${o.total}`):o.stage==="written"&&u(`${o.files} library files installed`);return;case"modules":o.stage==="progress"&&u(`loading ${o.root}: ${o.files}/${o.total} files`);return;case"layer":o.stage==="progress"&&u(`loading ${o.label}: pack ${o.pack}/${o.packs}`);return;default:break}for(let _ of[...y])_.match(o)&&(y.splice(y.indexOf(_),1),clearTimeout(_.timer),_.resolve(o));o.type==="error"&&L(new Error(o.data))}function L(c){for(let o of y.splice(0))clearTimeout(o.timer),o.reject(c)}function l(c,o,_){return new Promise((k,R)=>{let x={match:c,resolve:k,reject:R,timer:null};x.timer=setTimeout(()=>{let F=y.indexOf(x);F>=0&&y.splice(F,1),R(new Error(`${o} timed out after ${Math.round(_/1e3)}s`))},_),y.push(x)})}function f(c){if(!a)throw new Error("The Lean runtime is not running.");a.postMessage(c)}async function b(){a=new Worker(URL.createObjectURL(new Blob([ve({assetBase:e,libBase:t,memory:n})],{type:"text/javascript"}))),a.onmessage=B,a.onerror=c=>L(new Error(c.message||"Lean runtime error")),f({type:"start"}),await l(c=>c.type==="ready","Starting the Lean runtime",12e4)}async function w(c){let o=m++;return f({type:"load_modules",id:o,roots:c}),(await l(k=>k.type==="modules_loaded"&&k.id===o,`Loading ${c.join(", ")}`,3e5)).results??[]}async function g(c){let o=m++;return f({type:"load_layer",id:o,label:c.label,manifestUrl:c.manifestUrl,packBase:c.packBase}),await l(k=>k.type==="layer_loaded"&&k.label===c.label,`Loading ${c.label}`,6e5)}async function p(c){let o=m++;return d="",h="",f({type:"compile",id:o,code:c,path:Re}),{...await l(k=>k.type==="result"&&k.id===o,"Compiling",6e5),stdout:d,stderr:h}}function E(){L(new Error("The compiler was disposed.")),a?.terminate(),a=null,i&&(URL.revokeObjectURL(i),i=null)}return{start:b,loadModules:w,loadLayer:g,compile:p,dispose:E}}function Te(e){return`"${String(e).replace(/\\/g,"\\\\").replace(/"/g,'\\"').replace(/\n/g,"\\n").replace(/\r/g,"\\r").replace(/\t/g,"\\t").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g,"").replace(/\u2028|\u2029/g," ")}"`}var se=/syntax error at line \d+, column \d+/;function ae(e){let t=V(e);return`${t?t+`
+`;return;case"status":n?.(o.data);return;case"memory":u(o.failed?`shared memory: ${o.mb} MB refused, trying a smaller one`:`shared memory: ${o.mb} MB (max ${o.maximumPages} pages)`);return;case"library":o.stage==="manifest"?u(`core layer: ${o.modules} modules in ${o.packs} packs`):o.stage==="pack"?u(`core pack ${o.loaded}/${o.total}`):o.stage==="written"&&u(`${o.files} library files installed`);return;case"modules":o.stage==="progress"&&u(`loading ${o.root}: ${o.files}/${o.total} files`);return;case"layer":o.stage==="progress"&&u(`loading ${o.label}: pack ${o.pack}/${o.packs}`);return;default:break}for(let _ of[...y])_.match(o)&&(y.splice(y.indexOf(_),1),clearTimeout(_.timer),_.resolve(o));o.type==="error"&&L(new Error(o.data))}function L(c){for(let o of y.splice(0))clearTimeout(o.timer),o.reject(c)}function l(c,o,_){return new Promise((k,R)=>{let x={match:c,resolve:k,reject:R,timer:null};x.timer=setTimeout(()=>{let F=y.indexOf(x);F>=0&&y.splice(F,1),R(new Error(`${o} timed out after ${Math.round(_/1e3)}s`))},_),y.push(x)})}function m(c){if(!a)throw new Error("The Lean runtime is not running.");a.postMessage(c)}async function b(){a=new Worker(URL.createObjectURL(new Blob([ve({assetBase:e,libBase:r,memory:t})],{type:"text/javascript"}))),a.onmessage=B,a.onerror=c=>L(new Error(c.message||"Lean runtime error")),m({type:"start"}),await l(c=>c.type==="ready","Starting the Lean runtime",12e4)}async function w(c){let o=f++;return m({type:"load_modules",id:o,roots:c}),(await l(k=>k.type==="modules_loaded"&&k.id===o,`Loading ${c.join(", ")}`,3e5)).results??[]}async function g(c){let o=f++;return m({type:"load_layer",id:o,label:c.label,manifestUrl:c.manifestUrl,packBase:c.packBase}),await l(k=>k.type==="layer_loaded"&&k.label===c.label,`Loading ${c.label}`,6e5)}async function p(c){let o=f++;return d="",h="",m({type:"compile",id:o,code:c,path:Re}),{...await l(k=>k.type==="result"&&k.id===o,"Compiling",6e5),stdout:d,stderr:h}}function $(){L(new Error("The compiler was disposed.")),a?.terminate(),a=null,i&&(URL.revokeObjectURL(i),i=null)}return{start:b,loadModules:w,loadLayer:g,compile:p,dispose:$}}function Ie(e){return`"${String(e).replace(/\\/g,"\\\\").replace(/"/g,'\\"').replace(/\n/g,"\\n").replace(/\r/g,"\\r").replace(/\t/g,"\\t").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g,"").replace(/\u2028|\u2029/g," ")}"`}var se=/syntax error at line \d+, column \d+/;function ae(e){let r=V(e);return`${r?r+`
 `:""}import Lean
 open Lean
 
 run_cmd do
-  let src := ${Te(e)}
+  let src := ${Ie(e)}
   let ictx := Parser.mkInputContext src "<your code>"
   let (_, ps, msgs) \u2190 Parser.parseHeader ictx
   let pmctx : Parser.ParserModuleContext := { env := (\u2190 getEnv), options := (\u2190 getOptions) }
@@ -817,5 +832,5 @@ run_cmd do
     for m in errs do
       out := out ++ s!"syntax error at line {m.pos.line}, column {m.pos.column}\\n"
     throwError "{out}"
-`}var Ie=8,oe=["auto","full","off"];function Pe(){if(typeof Worker!="function"||typeof Blob!="function")throw new Error("@live-codes/lean-wasm runs in a browser: the Lean runtime is a Web Worker, and it is handed over as a blob so that it stays same-origin.")}function Oe(){try{return new WebAssembly.Memory({initial:1,maximum:2,shared:!0}),!0}catch{return!1}}function Ue(e){if(e?.mode==="shared"&&!Oe())throw new Error(`The Lean artifact at ${e.url} declares a shared WebAssembly memory, and this browser will not construct one here. Serve the page with \`Cross-Origin-Opener-Policy: same-origin\` and \`Cross-Origin-Embedder-Policy: require-corp\` (or \`credentialless\`); an embed that cannot set those headers can isolate its own frame with \`Document-Isolation-Policy: isolate-and-require-corp\` instead. A single-threaded Lean build would need none of this \u2014 see FINDINGS.md \xA72 and \xA79.`)}function Ne(e){if(!e)return"artifact: the memory import could not be read, so a shared memory is assumed";let{initial:t,maximum:n}=e.memory,s=`min ${t} pages, ${n===null?"no maximum":`max ${n} pages`}`;return e.mode==="unshared"?`artifact: unshared memory (${s}) \u2014 no cross-origin isolation needed`:`artifact: shared memory (${s}) \u2014 this needs SharedArrayBuffer`}async function ie(e={}){Pe();let t=$(e.baseUrl),n=e.syntaxCheck??"auto";if(!oe.includes(n))throw new Error(`syntaxCheck must be one of ${oe.join(", ")}, not ${n}`);let s=M(t),r=await K(t.assetBase),a={memory:r?.mode??"unknown",limits:r?.memory??null,url:r?.url??null};e.onArtifact?.(a),Ue(r),e.onProgress?.(Ne(r));let i=r?{mode:r.mode,...r.memory}:null,d=re({assetBase:t.assetBase,libBase:t.libBase,memory:i,onProgress:e.onProgress,onStatus:e.onStatus}),h=new Set,m=new Set;await d.start();function y(l,f){if(l.files>0){h.add(l.root),f.loaded.push(`${l.root} (${l.files} files${l.failed?`, ${l.failed} failed`:""})`);return}if(l.alreadyLoaded){h.add(l.root);return}f.notMirrored.includes(l.root)||f.notMirrored.push(l.root)}async function u(l,f){let b=l.filter(p=>!f.attempted.has(p));if(b.length===0)return!1;b.forEach(p=>f.attempted.add(p));let w=!1;for(let p of s){if(!b.some(c=>p.roots.includes(c))||f.layers.has(p.label))continue;f.layers.add(p.label);let E=await d.loadLayer(p);E.ok?(m.add(p.label),E.alreadyLoaded||(f.loaded.push(`${p.label} layer (${E.files} files)`),w=!0)):f.notMirrored.includes(p.label)||f.notMirrored.push(p.label)}let g=b.filter(p=>P.includes(p));if(g.length>0)for(let p of await d.loadModules(g))y(p,f),p.files>0&&(w=!0);return w}async function B(l,f){await u(N(l),f);let b=await d.compile(l);for(let w=0;w<Ie;w++){let{problems:g}=I(b.stdout,b.stderr);if(!await u(Z(g),f))break;b=await d.compile(l)}return b}async function L(l,f){let b=await B(ae(l),f),{problems:w}=I(b.stdout,b.stderr);return w.filter(g=>se.test(g.text))}return{language:"lean",assets:t,artifact:a,async run(l,f,b={}){if(typeof l!="string")throw new Error("run() needs the program source as its first argument.");let w=b.syntaxCheck??n,g={attempted:new Set,layers:new Set,loaded:[],notMirrored:[]},p=performance.now(),E=await B(l,g),{info:c,problems:o,noise:_}=I(E.stdout,E.stderr);if(w!=="off"&&l.trim()!==""&&!o.some(x=>x.severity==="error")){let x=h.has("Lean")||m.size>0;(w==="full"||x)&&o.push(...await L(l,g))}let k=o.some(x=>x.severity==="error")||E.success===!1,R=k?[...te(l,g.notMirrored,t),...ne(o)]:[];return{output:c.map(x=>x.text).join(`
-`),errors:[...X(o),...R.map(x=>`note: ${x}`)],exitCode:k?1:0,noise:_,libraries:g.loaded,compileMs:Math.round(performance.now()-p)}},dispose(){d.dispose()}}}var Fe=["lean"],Ce=["auto","full","off"];function je(e){return ee(e??$())}function We(e){return M(e??$())}return me(De);})();
+`}var Te=8,oe=["auto","full","off"];function Pe(){if(typeof Worker!="function"||typeof Blob!="function")throw new Error("@live-codes/lean-wasm runs in a browser: the Lean runtime is a Web Worker, and it is handed over as a blob so that it stays same-origin.")}function Oe(){try{return new WebAssembly.Memory({initial:1,maximum:2,shared:!0}),!0}catch{return!1}}function Ue(e){if(e?.mode==="shared"&&!Oe())throw new Error(`The Lean artifact at ${e.url} declares a shared WebAssembly memory, and this browser will not construct one here. Serve the page with \`Cross-Origin-Opener-Policy: same-origin\` and \`Cross-Origin-Embedder-Policy: require-corp\` (or \`credentialless\`); an embed that cannot set those headers can isolate its own frame with \`Document-Isolation-Policy: isolate-and-require-corp\` instead. A single-threaded Lean build would need none of this \u2014 see FINDINGS.md \xA72 and \xA79.`)}function Ne(e){if(!e)return"artifact: the memory import could not be read, so a shared memory is assumed";let{initial:r,maximum:t}=e.memory,s=`min ${r} pages, ${t===null?"no maximum":`max ${t} pages`}`;return e.mode==="unshared"?`artifact: unshared memory (${s}) \u2014 no cross-origin isolation needed`:`artifact: shared memory (${s}) \u2014 this needs SharedArrayBuffer`}async function ie(e={}){Pe();let r=E(e.baseUrl),t=e.syntaxCheck??"auto";if(!oe.includes(t))throw new Error(`syntaxCheck must be one of ${oe.join(", ")}, not ${t}`);let s=M(r),n=await K(r.assetBase),a={memory:n?.mode??"unknown",limits:n?.memory??null,url:n?.url??null};e.onArtifact?.(a),Ue(n),e.onProgress?.(Ne(n));let i=n?{mode:n.mode,...n.memory}:null,d=ne({assetBase:r.assetBase,libBase:r.libBase,memory:i,onProgress:e.onProgress,onStatus:e.onStatus}),h=new Set,f=new Set;await d.start();function y(l,m){if(l.files>0){h.add(l.root),m.loaded.push(`${l.root} (${l.files} files${l.failed?`, ${l.failed} failed`:""})`);return}if(l.alreadyLoaded){h.add(l.root);return}m.notMirrored.includes(l.root)||m.notMirrored.push(l.root)}async function u(l,m){let b=l.filter(p=>!m.attempted.has(p));if(b.length===0)return!1;b.forEach(p=>m.attempted.add(p));let w=!1;for(let p of s){if(!b.some(c=>p.roots.includes(c))||m.layers.has(p.label))continue;m.layers.add(p.label);let $=await d.loadLayer(p);$.ok?(f.add(p.label),$.alreadyLoaded||(m.loaded.push(`${p.label} layer (${$.files} files)`),w=!0)):m.notMirrored.includes(p.label)||m.notMirrored.push(p.label)}let g=b.filter(p=>P.includes(p));if(g.length>0)for(let p of await d.loadModules(g))y(p,m),p.files>0&&(w=!0);return w}async function B(l,m){await u(N(l),m);let b=await d.compile(l);for(let w=0;w<Te;w++){let{problems:g}=T(b.stdout,b.stderr);if(!await u(Z(g),m))break;b=await d.compile(l)}return b}async function L(l,m){let b=await B(ae(l),m),{problems:w}=T(b.stdout,b.stderr);return w.filter(g=>se.test(g.text))}return{language:"lean",assets:r,artifact:a,async run(l,m,b={}){if(typeof l!="string")throw new Error("run() needs the program source as its first argument.");let w=b.syntaxCheck??t,g={attempted:new Set,layers:new Set,loaded:[],notMirrored:[]},p=performance.now(),$=await B(l,g),{info:c,problems:o,noise:_}=T($.stdout,$.stderr);if(w!=="off"&&l.trim()!==""&&!o.some(x=>x.severity==="error")){let x=h.has("Lean")||f.size>0;(w==="full"||x)&&o.push(...await L(l,g))}let k=o.some(x=>x.severity==="error")||$.success===!1,R=k?[...re(l,g.notMirrored,r),...te(o)]:[];return{output:c.map(x=>x.text).join(`
+`),errors:[...X(o),...R.map(x=>`note: ${x}`)],exitCode:k?1:0,noise:_,libraries:g.loaded,compileMs:Math.round(performance.now()-p)}},dispose(){d.dispose()}}}var Fe=["lean"],Ce=["auto","full","off"];function je(e){return ee(e??E())}function We(e){return M(e??E())}return fe(De);})();
