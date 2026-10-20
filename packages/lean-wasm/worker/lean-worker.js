@@ -452,6 +452,12 @@ const loadedLayers = new Set();
 async function loadPackedLayer({ manifestUrl, packBase, label }) {
   if (loadedLayers.has(label)) return { files: 0, bytes: 0, alreadyLoaded: true };
 
+  // A baked snapshot for this layer's header, tried before the packs. The packs supply the oleans the header
+  // must *resolve*; the snapshot supplies the elaborated environment for those imports, which on a
+  // single-threaded build is the expensive part — Mathlib's closure is an order of magnitude past Std's 483
+  // modules. It falls through either way, because the packs are needed regardless.
+  await tryRootSnapshot(label);
+
   const manifest = await (await fetch(manifestUrl)).json();
   if (!manifest.packs || !Array.isArray(manifest.packs)) {
     throw new Error(`${label}: manifest has no packs`);

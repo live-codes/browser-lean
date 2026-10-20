@@ -66,6 +66,11 @@ for name in "${NAMES[@]}"; do
 #check 1' ;;
 	lean) bake lean 'import Lean
 #check 1' ;;
+	# The probe has to *be* the header a program will use: the cache key is read back out of the loaded
+	# environment, so `mathlib` covers the demo's program only if these are its two imports, in this order.
+	mathlib) bake mathlib 'import Mathlib.Data.Real.Basic
+import Mathlib.Tactic.Ring
+#check 1' ;;
 	*) echo "unknown snapshot name '${name}'" >&2; exit 2 ;;
 	esac
 done
