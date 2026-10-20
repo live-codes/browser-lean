@@ -67,6 +67,13 @@ for (const dir of ['home', 'root', 'tmp', path.join('var', 'tmp')]) {
 // `/lib/lean` as its sysroot instead of stat-ing a host path inside MEMFS.
 process.argv[1] = '/bin/lean';
 
+// The glue chdirs the virtual FS to `process.cwd()`, and on Windows that is always drive-rooted (`D:\`). Joined
+// into the NODEFS mount that becomes `<work>/D:\`, so every host-path lookup under it reads as missing — the
+// failure shows up as `fs.lstatSync("…\\bakeout/D:\\") failed: ENOENT`, which names a path no one wrote.
+// Presenting `/` as the cwd keeps the virtual tree POSIX-shaped, which is what the runtime expects and what
+// runs inside the container get for free (`/w`).
+process.cwd = () => '/';
+
 const memoryMb = process.env.BAKE_MEMORY_MB ? Number(process.env.BAKE_MEMORY_MB) : null;
 
 globalThis.Module = {
