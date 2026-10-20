@@ -191,7 +191,9 @@ async function loadWasmUrl() {
   if (wasmBlobUrl) return wasmBlobUrl;
 
   for (const candidate of [`${assetBase}/lean.wasm.gz`, `${assetBase}/lean.wasm`]) {
-    const response = await fetchOrThrow(candidate);
+    // A timeout for the same reason the snapshots have one: a host that accepts the connection and then says
+    // nothing hangs the boot with no message at all, which reads exactly like a very slow start.
+    const response = await fetch(candidate, { signal: AbortSignal.timeout(60000) });
     if (response.status === 404) continue;
     if (!response.ok) throw new Error(`${candidate}: HTTP ${response.status}`);
 
