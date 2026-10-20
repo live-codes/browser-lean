@@ -1,42 +1,17 @@
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 54c40ed..70da1c2 100644
+index 3cbea55a..3b408132 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -210,12 +210,31 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
-     # miscompile (`unreachable` inside readModuleDataPartsOfMod on first
-     # compile) was the extern world-token arity mismatch fixed in b6b649fe641.
-     # EMSCRIPTEN_SETTINGS holds only flags that change CODEGEN and therefore
--    # must reach every compile: -pthread (atomics/TLS) and the EH mode. Flags
-+    # must reach every compile: the EH mode. Flags
+@@ -211,7 +211,7 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+     # must reach every compile: -pthread (atomics/TLS) and the EH mode. Flags
      # that only shape the final JS/wasm output live in EMSCRIPTEN_LINK_SETTINGS
      # so that link-only experiments keep the ccache'd objects valid.
--    set(EMSCRIPTEN_SETTINGS "-fwasm-exceptions -pthread")
-+    #
-+    # wasm-build: `-pthread` removed deliberately. It is what puts atomics and TLS in every object
-+    # and what makes the linker demand a shared memory, and a shared memory is the entire reason a
-+    # page running this needs cross-origin isolation. See wasm-build/README.md.
+-    set(EMSCRIPTEN_SETTINGS "-sDISABLE_EXCEPTION_CATCHING=0 -pthread")
 +    set(EMSCRIPTEN_SETTINGS "-fwasm-exceptions")
      set(EMSCRIPTEN_LINK_SETTINGS "-sALLOW_MEMORY_GROWTH=1 -sINCOMING_MODULE_JS_API=print,printErr,setStatus,locateFile,mainScriptUrlOrBlob,INITIAL_MEMORY,wasmMemory,noInitialRun,preRun,onRuntimeInitialized,onAbort,onExit,arguments,ENV")
  
-+    # wasm-build: the initial wasm memory, as a knob, because it decides whether the `Init` import
-+    # ever has to *grow* the memory. An unshared memory that grows can be relocated and copied, and
-+    # the pthread build sidesteps the whole question by reserving its 2 GiB shared buffer up front
-+    # (see the linker flags below). 64 MiB is upstream's value; a larger one trades boot-time RSS for
-+    # a first compile that does not pay for growth.
-+    set(LEAN_WASM_INITIAL_MEMORY "67108864" CACHE STRING "initial wasm memory in bytes")
-+    set(LEAN_WASM_STACK_SIZE "16777216" CACHE STRING "wasm stack in bytes")
-+
-+    # wasm-build: instrument the sequential task manager, to answer whether the drain loop is where a
-+    # first compile's time goes. Off by default; see the `drain` comment in runtime/object.cpp.
-+    option(LEAN_WASM_DRAIN_PROFILE "profile the sequential task manager's drain loop" OFF)
-+    if(LEAN_WASM_DRAIN_PROFILE)
-+      string(APPEND LEAN_EXTRA_CXX_FLAGS " -D LEAN_WASM_DRAIN_PROFILE")
-+    endif()
-+
    # EMSCRIPTEN_DEBUG: Enable readable function names and assertions for debugging
-   # This makes the WASM larger and slower but shows actual function names in stack traces
-   # instead of mangled names like "invoke_III"
-@@ -674,7 +693,10 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
+@@ -672,7 +672,10 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin")
  endif()
  # Linux ignores undefined symbols in shared libraries by default
  
@@ -48,7 +23,7 @@ index 54c40ed..70da1c2 100644
    string(APPEND LEAN_EXTRA_LINKER_FLAGS " -pthread")
  endif()
  
-@@ -922,9 +944,11 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+@@ -920,9 +923,11 @@ if(CMAKE_SYSTEM_NAME MATCHES "Emscripten")
    # memory does NOT grow here (the browser's SharedArrayBuffer isn't resizable in
    # this config), so the worker reserves the real size up front; MAXIMUM_MEMORY=4GB
    # raises the wasm32 ceiling from 2GB so we can test whether the import fits.

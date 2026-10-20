@@ -21,7 +21,11 @@ case "$VARIANT" in
 esac
 FORK=https://github.com/cauli/lean4.git
 # cauli/lean4 @ reinstate-wasm, 2026-09-06 — the revision FINDINGS.md §9 quotes.
-PIN=dfe49531687435bcb38516a73a7c7ff55e3ef25e
+# The fork commit to build. Overridable so the same harness can build the commit *upstream's* assets were
+# built from, which is the only way those assets — core layer, per-file tree, Mathlib layer — become readable
+# here: an `.olean` is only readable by the compiler that wrote it. Point `LEAN_SRC` at a second clone when
+# doing that, so the cached build tree for the other commit survives.
+PIN="${LEAN_PIN:-dfe49531687435bcb38516a73a7c7ff55e3ef25e}"
 # The source tree and the cmake build dir live on a mounted volume, not in the container: a relink after
 # a code change is minutes, and re-cloning a 1 GB fork every run is not. `/cache` is bound by the run
 # command (`-v "$PWD/cache:/cache"`); without it everything is rebuilt from scratch each time.
