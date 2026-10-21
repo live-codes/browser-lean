@@ -1135,7 +1135,8 @@ Three traps, all measured rather than assumed:
 - **The fetch tool refuses every `.pack`** with "not a gzip pack" even though the download is gzip: the body
   reaches its check already decompressed, so the check sees pack contents. Verified by hand on one pack —
   6,109,959 bytes on the wire, magic `1f 8b`, 16,761,836 after gunzip, exactly the manifest's `bytes`.
-  `fetch-packs.mjs` fetches the core and Mathlib packs verbatim instead.
+  `fetch-packs.mjs` fetches the core and Mathlib packs verbatim instead. (Fixed later: `fetch-assets` now
+  keeps `.pack` gzip containers, including a body a CDN already decompressed; §9.15.)
 - **The lib index upstream is `lean-lib-files.json.gz`**, not the plain name, so a plain-name probe of that
   directory reads as a failure when the directory is fine.
 
@@ -1168,3 +1169,138 @@ and makes every path under it read as missing — the symptom being `lstatSync("
 And the bake library can be assembled entirely from host-visible files (`build-bake-lib.mjs`: Init unpacked from
 the core packs, Std/Lean gunzipped, Mathlib's closure unpacked from its 52 packs), which is what made a host bake
 possible at all.
+
+### 9.15 Build identity is checked, and the canonical mirror is measured end to end
+
+P0-1 and P0-2 of the handover, measured on a non-isolated page (`crossOriginIsolated: false`,
+`typeof SharedArrayBuffer === "undefined"`), page at `:8129` and assets at `:8131`
+(`wasm-build/out/mirror-upstream`).
+
+**The canonical artifact is Lean `dfe4953`, not `62b6a229`.** The binary says so itself:
+`Lean (version 4.33.0-pre, wasm32-unknown-emscripten, commit dfe49531687435bcb38516a73a7c7ff55e3ef25e,
+Release)`, and `wasm-build/out/variant-2/LEAN_COMMIT` carries the same hash. `out/pinned-test` is the only
+binary carrying `62b6a229` — it is upstream's *pthread* module. So the rebuild `build-upstream.sh`
+describes never landed in `variant-2`; what shipped is a mirror pairing a `dfe4953` artifact with
+`62b6a229` assets.
+
+**That pairing works, and the headers say why.** Every `.olean` in the two Init trees is byte-identical
+except the 40-byte githash field: `variant-2/olean` carries an empty hash, the 62b6a229 layer carries the
+hash. All 1,887 files were compared, no other byte differs, and both trees sum to 79,760,876 bytes. In
+this pair, then, the "only the compiler that wrote it" rule is about the format/version, not the commit.
+
+**P0-1 is implemented.** The worker fetches `lean-wasm/LEAN_COMMIT` and the `leanCommit` of each layer's
+manifest (or the hex run in `version`, for older manifests), and posts one status line per disagreeing
+pair. Against the canonical mirror the boot now says:
+
+```
+build mismatch: the Lean artifact is dfe495316874, but the core layer was built by 62b6a2291302.
+Object files and snapshots are per-build, so this layer may be refused or misread — rebuild the
+artifact at 62b6a2291302 (wasm-build/build-upstream.sh) or serve a layer built by dfe495316874.
+```
+
+It is a diagnostic, not a gate — the run proceeds, because a mismatch has to be seen rather than turned
+into another failure. `assemble-upstream-mirror.mjs` copies `LEAN_COMMIT` into the mirror and
+`fetch-assets.mjs` preserves it when re-mirroring.
+
+**The canonical mirror, first run after boot, all exit 0:**
+
+| program | first run |
+| --- | --- |
+| `#eval 2+2`, `#check Nat.add_comm` | **0.37 s** (boot 6.9 s) |
+| Std (`Std.Data.HashMap` fold) | **6.00 s** |
+| Lean (2,308 modules) | **137.01 s** (9.80 s with `lean.snap`) |
+| Mathlib (`Real.Basic` + `Tactic.Ring`, 3,075 modules) | **605.01 s** (184.66 s with `mathlib.snap`) |
+
+So P0-2's acceptance number holds on the shipped mirror — Std was 8.67 s on the old mirror, 6.0 s here —
+and the long imports are considerably shorter on this host than §9.14's container numbers.
+
+**The snapshot-size puzzle is the githash.** A host bake of `#check 2+2` against `bake-lib` (62b6a229)
+is **74,540,737 bytes**; the same host bake against `variant-2/olean` (dfe4953) is exactly
+**241,301,441 bytes** — the container's size, reproduced byte-for-byte. Node, `--stack-size=4000`, Docker
+and the OS make no difference; the two inputs differ only in the 40-byte githash per `.olean`, and that
+alone changes the saved environment 3.2×. The likely mechanism is hash-keyed sharing in the serializer;
+what is settled is that it is the tree.
+
+**The smaller snapshot is equivalent where it matters.** Served as `snapshots/init.snap` (71.1 MiB), it
+seeds the cache: boot **2.6 s** against 6.9 s for 230.1 MiB, first `#eval 2+2` **0.21 s**, and a
+`theorem … induction … simp/rw` proof plus a library `#eval` accepted in **0.95 s**. Std re-baked against
+the same tree is **114,671,773 bytes** (from 333,679,853) and its demo runs in **7.34 s**. Both shipped
+snapshots are now baked against the tree the mirror serves — the consistent pairing — and their total
+falls from 574,981,298 to 189,212,510 bytes.
+
+**Lean *can* be snapshotted against the served tree, and the syntax probe was hiding it.** The earlier
+failure was not intrinsic. A host bake of `import Lean` against `bake-lib` imported all 2,308 modules
+(`inside_drain_ms=275426`), elaborated the probe, and wrote **328,317,617 bytes** — where every bake
+against `variant-2/olean` died in the serializer. So the 40-byte githash is not just a size knob; the
+representation it selects is what the serializer can (or cannot) compact.
+
+The first browser run with that snapshot still took 105 s, and the reason was the syntax probe. It
+prepended `import Lean` to the program's own imports, so a program that already imports Lean produced a
+probe header of `import Lean\nimport Lean` — a different header from the snapshot's, which means a cache
+miss and a second full import. The same happened to Mathlib, whose probe became `Mathlib imports +
+import Lean`. The probe now carries the program's imports and asks for Lean only when they do not
+already provide it (`Lean` or `Mathlib`); the duplication is gone, and the probe's header matches the
+program's. Measured on the same non-isolated page, fresh session, successful program (so the probe
+runs):
+
+| Lean example, fresh session | before | now |
+| --- | --- | --- |
+| `import Lean` + `#eval`/`#check` | 137.01 s (no snapshot), 105 s (snapshot + duplicate probe) | **9.80 s** |
+
+The snapshot's own load is **1.2 s** (`return tag 0`), against 137 s to import. The first `runMs`
+includes fetching the 3,588-file Lean tree, the snapshot load, the compile and the syntax probe.
+
+**Mathlib saves too, and its first run drops from 605 s to 184.7 s.** The same bake against `bake-lib`
+imported 3,075 modules (`inside_drain_ms=741492`) and wrote **427,811,149 bytes**. In the browser the load
+costs **150.5 s by itself** — the deserialization is not linear in size: Lean's 313 MB loads in 1.2 s,
+Mathlib's 408 MB in 150 s — and the rest of the run (52 packs, 12,909 files, compile, syntax probe) is
+~34 s. So the snapshot removes most of the ~10-minute import but replaces it with a 2.5-minute
+deserialization. That is worth it for a local or embedded mirror; on a real host it is also a transfer
+decision, since all four snapshots gzip ~2.4× (**945,341,276 → 390,159,651 bytes**; Mathlib alone
+427,811,149 → 176,970,253). The mirror therefore ships `<name>.snap.gz` and the runtime prefers it, with
+the plain file as the fallback. A/B under the same conditions: Lean **13.89 s plain → 16.17 s gzipped**
+(the gunzip costs ~2 s), Mathlib **184.66 s plain → 169.10 s gzipped** (measured once; no cost).
+
+`lean.js` is the other large transfer and compresses far better: **45,998,059 → 2,357,665 bytes (20.4×)**,
+almost all of it a repetitive export table. The worker probes `lean.js.gz` first and falls back to the plain
+file; the mirror ships both, so the first boot moves 2.2 MB of glue instead of 45.8 MB. (Measured in the
+page: `lean.js: 2.2 MB gzipped (45.8 MB unpacked)`, and the Lean example still completes.)
+
+The wasm gets the same treatment: **102,256,022 → 17,526,690 bytes (5.8×)**. `loadWasmUrl()` already probed
+`lean.wasm.gz` first and decompressed it, so the mirror now ships both and a first boot moves ~19.7 MB of
+binaries rather than 148 MB. The worker also hands the artifact/core/layer commits to the compiler, so a
+failed import's fallback note names the build to mirror when the artifact and its assets differ; and a layer
+manifest is fetched before its snapshot, so a missing Mathlib layer fails in **0.26 s** rather than loading
+408 MB first (measured with a mirror that has no `lean-mathlib/`).
+
+The serializer wall that §9.11 and §9.14 recorded is therefore **tree-dependent, not absolute**: against
+`bake-lib` every one of Init, Std, Lean and Mathlib saves; against `variant-2/olean` only Init and Std do,
+and the input difference is the 40-byte `.olean` githash.
+
+The deployable unit is described by **`mirror.json`** (schema 1): artifact/core/Mathlib commits and
+versions, and a sha256 of every pack, snapshot, glue file and manifest, keyed by an id such as
+`lean-62b6a2291302-dfe495316874-d53cc995`. `wasm-build/verify-mirror.mjs` checks a deployed copy; the
+canonical unit verifies **67 files / 867.1 MiB**, and the artifact/assets commit difference is a note, not a
+failure. The writer and the verifier share `wasm-build/mirror-manifest.mjs`, so the schema cannot drift
+between them.
+
+### 9.16 Three embeds in one tab: 4.0 GB, all three compile
+
+P0-3 of the handover. The artifact declares a 2 GiB initial / 4 GiB maximum unshared memory, so the
+question is what N embeds on one page actually cost. Measured with `public/embeds-test.html?n=2|3`, which
+puts N same-origin copies of the demo in one document, presses Run in all of them together, and reads each
+embed's own `dataset`. Chrome's whole process tree was sampled once a second; numbers are working set.
+
+| embeds | baseline | peak | final | per-embed | boot (`initMs`) | compile (`runMs`) | all exit 0 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 2 | 1,755 MB | **3,515 MB** | 3,331 MB | ~0.79–0.88 GB | 7.3 s / 6.9 s | 1.8 s / 2.1 s | yes |
+| 3 | ~1,700 MB | **4,026 MB** | 3,384 MB | ~0.77 GB | 24.1 / 33.5 / 37.5 s | 2.2 / 1.8 / 2.0 s | yes |
+
+So the memory is roughly additive (~0.8 GB per embed, against a 2 GiB *virtual* reservation each) and fits
+three embeds comfortably on a 16 GB machine. The cost that grows is **boot wall time**: 2.6 s alone, 7 s
+with two, 24–37 s with three, because three 97 MB modules compile and three runtimes realize the same
+snapshot at once. A LiveCodes result page normally has one embed, where the solo number applies; if a page
+does host several, the 2 GiB initial reservation is not what fails first — CPU contention during boot is.
+
+The harness is committed at `public/embeds-test.html` (inert unless opened). Re-run with the two servers
+up: `http://localhost:8129/embeds-test.html?n=3`.

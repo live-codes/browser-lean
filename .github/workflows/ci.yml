@@ -1,0 +1,45 @@
+# Unit tests, syntax/format checks and generated-file drift.
+#
+# The browser suite (`packages/lean-wasm/test/page.html`) is deliberately not run here: it needs the
+# mirrored Lean assets (~1 GB) and a browser. Wiring it against a fixture host built by
+# `wasm-build/build-bake-lib.mjs` / `lean-wasm-fetch-assets` is P1-3 in HANDOVER.md; until then this
+# workflow covers everything that can run without a browser.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/lean-wasm/package-lock.json
+
+      - name: Install the package's build dependency
+        run: npm ci --prefix packages/lean-wasm
+
+      - name: Unit tests
+        run: npm test --prefix packages/lean-wasm
+
+      - name: Mirror manifest tests
+        run: npm run test:mirror
+
+      - name: Syntax and vendor checks
+        run: npm run check
+
+      # The IIFE build and its vendored copy are committed, so a source change that was not rebuilt
+      # would ship silently. Rebuilding is deterministic for the pinned esbuild version; `npm run check`
+      # after the rebuild also catches a vendored copy that no longer matches the new dist.
+      - name: Check the generated build is in sync
+        run: |
+          npm run build:iife --prefix packages/lean-wasm
+          npm run check
+          git diff --exit-code -- packages/lean-wasm/dist public/vendor

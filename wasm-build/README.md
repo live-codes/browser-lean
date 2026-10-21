@@ -15,6 +15,15 @@ no changes to consume what this builds.
 
 ![A proof accepted with no cross-origin isolation](single-threaded-run.png)
 
+> **Update — snapshots and the artifact's identity (`FINDINGS.md` §9.15).** The numbers below are the
+> historical measurements that led here; two things have changed since. First, the harness now bakes
+> environment snapshots, and with them the first run is **0.37 s** (Init), **9.8 s** (Lean) and **184.7 s**
+> (Mathlib) instead of the 54–109 s import. Bake against `wasm-build/out/bake-lib`, not the artifact's own
+> tree: the two `.olean` sets differ only in a 40-byte githash, and that difference is what lets Lean and
+> Mathlib save at all. Second, the canonical artifact is the fork's default **`dfe4953`**, while
+> `build-upstream.sh` builds **`62b6a229`** for upstream's assets; the mirror pairs the two and works, and
+> `lean-wasm/LEAN_COMMIT` now makes the mismatch visible at load.
+
 The run above is the whole point, in one screenshot: `crossOriginIsolated: false`, no
 `SharedArrayBuffer` anywhere, the pill reading **no SharedArrayBuffer · unshared memory**, and a proof the
 kernel accepted. The log tells the rest — the artifact declares an unshared memory, the 629-module core
@@ -363,6 +372,15 @@ pack-core-layer.mjs                     packs a build's library tree into the la
 single-threaded-run.png                 a proof accepted with no cross-origin isolation
 ```
 
-Pinned: `cauli/lean4` @ `reinstate-wasm` `dfe49531687435bcb38516a73a7c7ff55e3ef25e` (2026-09-06). The
-`.olean` files it produces are only compatible with this same build, which is the pairing `FINDINGS.md`
-§5 records — do not mix them with the pthread artifacts.
+Pinned: the fork's default is `cauli/lean4` @ `reinstate-wasm`
+`dfe49531687435bcb38516a73a7c7ff55e3ef25e` — that is the canonical artifact in `out/variant-2`.
+`build-upstream.sh` separately builds `62b6a2291302d4bbeace37642a066b7510d0145c`, the commit upstream's
+core layer, per-file tree and Mathlib layer were built from. The two library trees are byte-identical except
+the 40-byte githash in each `.olean`, and the mirror deliberately pairs the `dfe4953` artifact with the
+`62b6a229` assets; it is measured working end to end (§9.15). The pairing that must not be mixed is the
+*format*: an `.olean` from a different Lean version is unreadable, and the wasm must match the core layer it
+boots from.
+
+The bake scripts matter for a mirror: `build-bake-lib.mjs` assembles the per-file tree, `bake-snapshot.cjs`
+bakes one snapshot (`--stack-size=4000`, and `BAKE_LIB_ROOT=out/bake-lib`), `bake-mathlib.mjs` does the
+Mathlib header, and `assemble-upstream-mirror.mjs` composes the mirror and gzips each snapshot.

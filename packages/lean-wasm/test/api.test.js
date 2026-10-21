@@ -109,6 +109,22 @@ test('unavailableImportNotes points at the fetch command', () => {
 	assert.match(laked[0], /build tool/);
 });
 
+test('unavailableImportNotes says which build to mirror when artifact and assets differ', () => {
+	const assets = resolveAssets('https://cdn.example.com/lean/');
+	const artifact = 'a'.repeat(40);
+	const core = 'b'.repeat(40);
+	const mixed = unavailableImportNotes('import Mathlib.Data.Real.Basic', ['Mathlib'], assets, { artifact, core });
+	assert.match(mixed[0], /artifact is aaaaaaaaaaaa/);
+	assert.match(mixed[0], /libraries are bbbbbbbbbbbb/);
+	assert.match(mixed[0], /artifact's Lean/);
+
+	const matched = unavailableImportNotes('import Mathlib.Data.Real.Basic', ['Mathlib'], assets, {
+		artifact,
+		core: artifact
+	});
+	assert.doesNotMatch(matched[0], /artifact is/);
+});
+
 test('leanStringLiteral escapes what Lean’s own syntax needs', () => {
 	assert.equal(leanStringLiteral('a "b" \\ c'), '"a \\"b\\" \\\\ c"');
 	assert.equal(leanStringLiteral('line\nnext'), '"line\\nnext"');
@@ -126,6 +142,24 @@ test('syntaxProbeSource carries the program’s imports and embeds its source', 
 	assert.match(syntaxProbeSource('#eval 1'), /^import Lean\n/);
 });
 
+test('syntaxProbeSource does not duplicate an import that already provides Lean', () => {
+	// A duplicate changes the probe's header, which is the snapshot cache key — the Lean demo paid a
+	// second 105 s import before this was fixed.
+	const lean = syntaxProbeSource('import Lean\n#check Expr');
+	assert.equal((lean.match(/^import Lean$/gm) ?? []).length, 1);
+	assert.match(lean, /^import Lean\nopen Lean\n/);
+
+	// Mathlib imports Lean transitively, so adding it would make the probe's header differ from the
+	// program's and re-import the layer.
+	const mathlib = syntaxProbeSource('import Mathlib.Data.Real.Basic\nimport Mathlib.Tactic.Ring\n#check ℝ');
+	assert.equal((mathlib.match(/^import Lean$/gm) ?? []).length, 0);
+	assert.match(mathlib, /^import Mathlib\.Data\.Real\.Basic\nimport Mathlib\.Tactic\.Ring\nopen Lean\n/);
+
+	// Std alone does not bring the parser, so that probe still asks for Lean.
+	const std = syntaxProbeSource('import Std.Data.HashMap\n#eval 1');
+	assert.match(std, /^import Std\.Data\.HashMap\nimport Lean\n/);
+});
+
 test('the generated runtime worker is present and is the Lean host', () => {
 	assert.ok(RUNTIME_WORKER_SOURCE.length > 5000, 'expected the whole worker source');
 	assert.match(RUNTIME_WORKER_SOURCE, /lean_wasm_compile/);
@@ -133,4 +167,8 @@ test('the generated runtime worker is present and is the Lean host', () => {
 	// It must survive being embedded in a blob, so it cannot rely on a query string alone.
 	assert.match(RUNTIME_WORKER_SOURCE, /load_modules/);
 	assert.match(RUNTIME_WORKER_SOURCE, /load_layer/);
+	// Every asset in a mirror is built by one Lean commit, and a mismatch has to be reported rather than
+	// silently turning into a slow run or a header error from inside the kernel.
+	assert.match(RUNTIME_WORKER_SOURCE, /LEAN_COMMIT/);
+	assert.match(RUNTIME_WORKER_SOURCE, /build mismatch/);
 });

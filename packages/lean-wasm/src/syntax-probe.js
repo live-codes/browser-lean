@@ -9,9 +9,10 @@
 // file that fails to parse cannot be relied on to run anything appended to it. `Parser.parseCommand`
 // is a pure function, so the probe needs no elaborator state beyond the environment.
 //
-// The probe needs `import Lean`, which the caller must have loaded; see SYNTAX_CHECK in compiler.js.
+// The probe needs Lean's parser, which `Lean` — or a layer such as Mathlib that imports it — provides.
+// The caller only runs the probe once that library is loaded; see the `auto` mode in compiler.js.
 
-import { importLines } from './roots.js';
+import { importedRoots, importLines } from './roots.js';
 
 /** A Lean string literal for arbitrary source. JSON's own escaping is not Lean's, so do it by hand. */
 export function leanStringLiteral(source) {
@@ -39,7 +40,15 @@ export const SYNTAX_ERROR_MARKER = /syntax error at line \d+, column \d+/;
  */
 export function syntaxProbeSource(code) {
 	const imports = importLines(code);
-	return `${imports ? imports + '\n' : ''}import Lean
+	// The parser lives in `Lean`, but a program that already imports Lean — or Mathlib, which imports it
+	// transitively — does not need a second `import Lean` line. Getting this wrong is not cosmetic: the
+	// probe is a separate compile whose cache key is the header's import list, so a duplicated import
+	// (`import Lean` twice, or Mathlib + Lean) misses the very snapshot that removed the import, and a
+	// successful program pays the library import a second time. Measured: the Lean demo took 105 s with
+	// the duplicate and 6 s without it.
+	const providesLean = importedRoots(code).some((root) => root === 'Lean' || root === 'Mathlib');
+	const preamble = providesLean ? imports : `${imports}${imports ? '\n' : ''}import Lean`;
+	return `${preamble}
 open Lean
 
 run_cmd do

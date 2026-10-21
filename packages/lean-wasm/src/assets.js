@@ -79,6 +79,7 @@ export function requiredAssetPaths() {
 		`${DIRECTORY.wasm}/lean.wasm`,
 		`${DIRECTORY.wasm}/core-layer.json`,
 		`${DIRECTORY.wasm}/core-lib/artifacts-*.pack`,
+		`${DIRECTORY.wasm}/snapshots/*.snap.gz`,
 		`${DIRECTORY.lib}/lean-lib-files.json`,
 		`${DIRECTORY.lib}/**`,
 		`${DIRECTORY.mathlib}/real-analysis-layer.json`,

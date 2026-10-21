@@ -193,7 +193,7 @@ async function writeValidated(path, name, body, url) {
  * rather than gzipped twice. A source whose plain name secretly holds gzip is handled the same way,
  * since double compression would decompress to something Lean calls an invalid header.
  */
-async function fetchTo(url, destination, label, { compress: gzip = false } = {}) {
+async function fetchTo(url, destination, label, { compress: gzip = false, keepGzip = false } = {}) {
 	const target = gzip ? `${destination}.gz` : destination;
 
 	if (!force && existsSync(target)) {
@@ -216,7 +216,13 @@ async function fetchTo(url, destination, label, { compress: gzip = false } = {})
 
 	const isGzip = body[0] === 0x1f && body[1] === 0x8b;
 	let written = body;
-	if (gzip) {
+	if (keepGzip) {
+		// A `.pack` is a gzip container by definition, whatever `--no-compress` says. A host that honours
+		// `Content-Encoding: gzip` hands the body over already decompressed; re-gzip it so Lean sees the
+		// container it expects. (Decompressing it, as the old path did, made every valid pack fail its own
+		// gzip check — HANDOVER trap 6.)
+		written = isGzip ? body : gzipSync(body, { level: 9 });
+	} else if (gzip) {
 		written = isGzip ? body : gzipSync(body, { level: 9 });
 	} else if (isGzip) {
 		try {
@@ -301,7 +307,9 @@ async function fetchLayer({ manifestUrl, packBase, outRoot, packDir, manifestNam
 	let bytes = (await stat(manifestPath)).size;
 	let done = 0;
 	for (const pack of manifest.packs) {
-		const written = await fetchTo(`${packBase}/${pack.file}`, join(outRoot, packDir, pack.file), `${label}/${pack.file}`);
+		const written = await fetchTo(`${packBase}/${pack.file}`, join(outRoot, packDir, pack.file), `${label}/${pack.file}`, {
+			keepGzip: true
+		});
 		if (written != null) bytes += written;
 		done += 1;
 	}
@@ -394,6 +402,48 @@ try {
 			manifestName: 'core-layer.json',
 			label: 'lean-wasm'
 		});
+		// The artifact's build identity. A mirror this repo assembles carries one (`LEAN_COMMIT`, written by
+		// build.sh); upstream's deploy does not. Copy it when it is there, so the runtime can compare the
+		// binary with the layers and report a mixed mirror instead of letting it fail quietly later.
+		{
+			const identityPath = join(outRoot, 'LEAN_COMMIT');
+			const stored = existsSync(identityPath) ? await readFile(identityPath) : null;
+			const valid = (body) => /^[0-9a-f]{40}\s*$/i.test(body.toString('utf8'));
+			if (!(stored && valid(stored) && !force)) {
+				if (checkOnly) {
+					if (stored && !valid(stored)) problems.push('LEAN_COMMIT: not a 40-character commit hash');
+				} else {
+					const body = await fetchRetry(`${source.wasmBase}/LEAN_COMMIT`);
+					if (body && valid(body)) {
+						await writeFile(identityPath, body);
+						console.log(`lean-wasm: LEAN_COMMIT ${body.toString('utf8').trim().slice(0, 12)}`);
+					}
+				}
+			}
+		}
+		// Baked snapshots, when the source is a mirror that carries them. They are optional and per-binary;
+		// `assemble-upstream-mirror.mjs` produces them for this repo. A source with only `.snap.gz` works,
+		// as does a plain `.snap` — the same layout choice as the runtime's probe.
+		for (const name of ['init', 'std', 'lean', 'mathlib']) {
+			const suffix = compress ? '.gz' : '';
+			const target = join(outRoot, 'snapshots', `${name}.snap${suffix}`);
+			if (checkOnly) {
+				if (existsSync(target)) {
+					const verdict = inspect(target, await readFile(target));
+					if (!verdict.ok) problems.push(`lean-wasm/snapshots/${name}.snap${suffix}: ${verdict.reason}`);
+				}
+				continue;
+			}
+			let body = await fetchRetry(`${source.wasmBase}/snapshots/${name}.snap`);
+			if (!body) body = await fetchRetry(`${source.wasmBase}/snapshots/${name}.snap.gz`);
+			if (!body) continue;
+			const isGzip = body[0] === 0x1f && body[1] === 0x8b;
+			const stored = compress ? (isGzip ? body : gzipSync(body, { level: 6 })) : isGzip ? gunzipSync(body) : body;
+			if (await writeValidated(target, target, stored, `${source.wasmBase}/snapshots/${name}.snap`)) {
+				bytes += stored.length;
+				console.log(`lean-wasm: snapshots/${name}.snap${suffix} (${mb(stored.length)})`);
+			}
+		}
 		console.log(`lean-wasm: ${mb(bytes)}${compress ? ' (wasm gzipped)' : ''}\n`);
 		total.bytes += bytes;
 	}

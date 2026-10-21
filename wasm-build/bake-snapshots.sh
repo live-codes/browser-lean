@@ -1,24 +1,40 @@
 #!/usr/bin/env bash
 # Bake the snapshots a mirror ships: one per header that a demo program uses.
 #
+#   # once, on the host: build the tree the mirror serves
+#   node wasm-build/build-bake-lib.mjs
+#   # then, in the container (or on the host), bake against it
 #   docker run --rm --entrypoint bash -w /w -v lean-build-cache:/cache -v "$PWD/wasm-build:/w" \
 #     -v "$PWD/wasm-build/out:/out" -v "$PWD/wasm-build/out/bakeout:/bakeout" \
-#     -e BAKE_LIB_ROOT=/cache/src/build/wasm-2/stage1/lib/lean \
+#     -e BAKE_LIB_ROOT=/out/bake-lib \
 #     lean4-wasm-single-threaded /w/bake-snapshots.sh [artifact-dir] [names...]
+#
+# **Bake against `bake-lib`, not the artifact's own build tree.** The two `.olean` sets are identical except
+# for a 40-byte githash, and that difference changes the saved environment 3.2×: against the artifact's tree
+# Init/Std come out ~230/318 MB and Lean/Mathlib saves die in the serializer; against bake-lib they are
+# 74/115/328/428 MB and all four succeed (FINDINGS §9.15). `build-upstream.sh` therefore does not bake.
 #
 # A snapshot's cache key is the *header's import list*, read back out of the loaded environment, so it only
 # helps a program whose imports match it exactly. `init` — no imports — covers anything that imports
 # nothing. The others exist because on a single-threaded build the *import* is the expensive part of a first
 # run: measured on the Std demo, the per-file fetch is 5 s and loading those 483 modules is 104 s.
 #
-# Baking is off-line and one-off: each run performs one import and writes a file. Expect minutes, and note
-# that the snapshots are hundreds of MB — they trade bytes on the wire for the realization, which is worth it
-# here and would deserve re-measuring on a real host.
+# Baking is off-line and one-off: each run performs one import and writes a file. Expect minutes.
 set -euo pipefail
 
-ARTIFACT="${1:-/cache/src/build/wasm-2/stage1/bin}"
+ARTIFACT="${1:-/out/variant-2}"
 shift || true
 NODE=/cache/node24/bin/node
+BAKE_LIB_ROOT="${BAKE_LIB_ROOT:-/out/bake-lib}"
+if [ ! -d "$BAKE_LIB_ROOT" ]; then
+	echo "error: no bake library at ${BAKE_LIB_ROOT}" >&2
+	echo "Bake against the tree the mirror serves, not the artifact's own build tree:" >&2
+	echo "  node wasm-build/build-bake-lib.mjs          # on the host, into wasm-build/out/bake-lib" >&2
+	echo "The trees differ only in the .olean githash; the artifact tree makes the environment 3.2x" >&2
+	echo "larger and makes Lean/Mathlib saves die in the serializer (FINDINGS §9.15)." >&2
+	exit 1
+fi
+export BAKE_LIB_ROOT
 
 bake() { # <name> <probe>
 	local name="$1" probe="$2"

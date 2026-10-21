@@ -37,6 +37,8 @@ npm run assets          # mirror ~127 MB of Lean artifacts into public/lean-wasm
 npm run assets:libs     # optional: Std/Lean/Batteries for lazy imports (~377 MB)
 npm run assets:mathlib  # optional: the Mathlib layer (~316 MB compressed)
 npm start               # → http://localhost:8129/
+# or, once wasm-build/out/mirror-upstream is assembled, the single-threaded mirror:
+npm run start:canonical # → http://localhost:8129/?baseUrl=http://localhost:8131
 ```
 
 Pick an example (or type your own), press **Run** — or `Ctrl`/`Cmd` + `Enter` in the editor. Nothing
@@ -208,6 +210,25 @@ example (x : ℝ) : x + 0 = x := by ring
   ship full Mathlib: a complete environment snapshot was tested and rejected because compaction
   exceeded the practical wasm heap.
 
+### Snapshots: the first run, not the import
+
+The canonical mirror ships four `--incr-header-save` environment snapshots under `lean-wasm/snapshots/`,
+baked by the artifact against the library tree the mirror serves, and **gzipped** because they compress ~2.4×:
+
+| snapshot | raw | gzipped | first run |
+| --- | --- | --- | --- |
+| `init` (no imports) | 71.1 MB | 28.6 MB | 0.37 s |
+| `std` (`Std.Data.HashMap`) | 109.4 MB | 46.0 MB | 6.0 s |
+| `lean` (`import Lean`) | 313.1 MB | 128.8 MB | 9.8 s |
+| `mathlib` (`Real.Basic` + `Tactic.Ring`) | 408.0 MB | 168.8 MB | 184.7 s |
+
+The runtime probes `snapshots/<name>.snap.gz` first and falls back to `<name>.snap`, so a host may serve
+either layout. A snapshot's cache key is the header's import list, so one exists per header and no snapshot
+covers a program with different imports; a run without one simply pays the import (Lean 137 s, Mathlib
+605 s). Bake with `node --stack-size=4000 wasm-build/bake-snapshot.cjs …` against
+`wasm-build/out/bake-lib`, **not** the artifact's own tree — the difference is a 40-byte `.olean` githash and
+it is the difference between saving and dying in the serializer ([FINDINGS.md](FINDINGS.md) §9.15).
+
 Without the mirrors these imports fail with a note naming the command to run — `npm run assets:libs`
 for Std/Lean/Batteries, `npm run assets:mathlib` for Mathlib. See [FINDINGS.md](FINDINGS.md) §5.
 
@@ -233,8 +254,9 @@ for Std/Lean/Batteries, `npm run assets:mathlib` for Mathlib. See [FINDINGS.md](
 - **A stalled boot is reported, not hung on.** If the module instantiates but never finishes starting,
   the page fails after 60 s of silence with an explanation instead of sitting on "loading" forever.
 - **No way to interrupt** a non-terminating elaboration; recovery is a page reload (~2 s).
-- **~127 MiB of mirrored assets** (≈47 MB over the wire), fetched once.
-- **Chrome only, as tested.** Safari, Firefox and mobile were not exercised.
+- **The canonical mirror is large**: ~1.0 GiB static (1,027 MiB), of which 372 MB is the four gzipped
+  snapshots and 331 MB the compressed Mathlib layer. The demo's core-only mirror is ~127 MiB.
+- **Chrome is measured; Firefox works.** Safari and mobile have not been exercised.
 
 ## Closer to a LiveCodes language
 
@@ -251,13 +273,14 @@ was a Chrome-only one ([FINDINGS.md](FINDINGS.md) §2). That is no longer the bl
 - **The pthread build still needs isolation**, whatever Chrome 155 will do with a shared memory: measured,
   a non-isolated page stalls it (`Starting the Lean runtime timed out after 120s`), because Emscripten's glue
   gates threading on the `SharedArrayBuffer` *global*. So the single-threaded build is the only one that runs
-  headerless at all — and its ~100 s `Init` import is the cost that has to be paid or skipped
-  ([FINDINGS.md](FINDINGS.md) §9.7).
+  headerless at all. Its `Init` import is no longer a cost on the user's path: the mirror's snapshots take
+  the first run to 0.37 s ([FINDINGS.md](FINDINGS.md) §9.7, §9.15).
 
-What is left before a `lean` language is not a wall but work: host an artifact and the library trees it
-produces, exercise Firefox and Safari (never done, and the atomic-instruction question lives there), and
-choose between the two artifacts — the single-threaded one costs 54 s on its first compile, the pthread one
-still needs isolation on engines that insist on it.
+What is left before a `lean` language is not a wall but work: host the mirror (artifact, layers and
+snapshots as one versioned unit), exercise Safari and mobile (Chrome is measured and Firefox works, and the
+atomic-instruction question lives in the untested engines), and choose between the two artifacts. With the
+four snapshots the single-threaded one no longer pays 54 s on its first compile — Lean is 9.8 s and Mathlib
+184.7 s — while the pthread one still needs isolation on engines that insist on it.
 
 ## npm package
 
@@ -307,9 +330,12 @@ fails locally too.
 | --- | --- |
 | mirror the artifacts | `npm run assets` |
 | serve the page | `npm start` → http://localhost:8129/ |
+| serve the canonical single-threaded mirror | `npm run start:canonical` |
 | see the isolation failure | `npm run start:no-isolation` |
 | re-vendor the package build | `npm run sync:vendor` |
 | syntax-check and drift-check | `npm run check` |
+| verify a mirror against `mirror.json` | `npm run verify:mirror -- <dir>` |
+| run the browser suite against a mirror | `npm run test:browser` |
 
 The page exposes `document.documentElement.dataset` (`status`, `stage`, `runs`, `isolated`,
 `exitCode`, `initMs`, `runMs`) and its element ids as globals, so a headless probe can drive it
@@ -329,6 +355,17 @@ directories under **one base**:
 <base>/lean-lib/      per-file libraries (Std, Lean, Batteries)                377 MiB
 <base>/lean-mathlib/  the packed Mathlib layer                                 316 MiB
 ```
+
+The **canonical single-threaded mirror** (`wasm-build/out/mirror-upstream`) adds compressed layouts under
+`lean-wasm/`: `lean.js.gz` (**2.2 MB** from 45.8 MB, 20×), `lean.wasm.gz` (**16.7 MB** from 97.5 MB, 5.8×)
+and `snapshots/*.snap.gz` (372 MB for the four, from 902 MB raw). The runtime probes all of them first and
+falls back to the plain files, so a host may ship either.
+
+The directory is one deployable unit described by **`mirror.json`** (schema 1): the artifact/core/Mathlib
+commits and versions, and a sha256 of every pack, snapshot, glue file and manifest, under an id such as
+`lean-62b6a2291302-dfe495316874-d53cc995`. Check a deployed copy with
+`npm run verify:mirror -- <dir>`; a commit difference between the artifact and the assets is reported as a
+note, not a failure.
 
 That is exactly the layout of `public/`, so the default (`npm start`) is the same origin's root, and a
 single `?baseUrl=` moves all three at once:
@@ -388,11 +425,15 @@ with no cross-origin isolation and no `SharedArrayBuffer`** — `crossOriginIsol
 boot in 3.4 s ([FINDINGS.md](FINDINGS.md) §9.7). The page serves either artifact without configuration,
 because the runtime reads the requirement off the wasm before it boots.
 
-What is left is deployment rather than a wall: publishing ~127 MB per variant, re-mirroring the library
-trees the new build produces (its `Init` closure packs to the same 629 modules / 30.7 MB as the layer
-upstream ships), the 54-second first compile a single-threaded build pays for the `Init` import, and knowing
-whether Firefox and Safari accept a module with an unshared memory that may still carry atomic instructions
-— neither has been exercised.
+The canonical mirror (`wasm-build/out/mirror-upstream`) now ships four host-baked snapshots, gzipped, and
+the first-run numbers on a non-isolated page are: **Init 0.37 s, Std 6.0 s, Lean 9.8 s, Mathlib 184.7 s**
+(all exit 0; without the snapshots Lean is 137 s and Mathlib 605 s — [FINDINGS.md](FINDINGS.md) §9.15).
+The last two are the important change: Lean and Mathlib *were* un-snapshottable, but only when baked against
+the artifact's own build tree; against the served tree all four save. The 54-second first compile is gone.
+
+What is left is deployment rather than a wall: publishing the mirror (~1.0 GiB static, of which 372 MB is
+the gzipped snapshots), versioning artifact + layers + snapshots as one unit, and exercising Safari and
+mobile (Chrome is measured and Firefox works; neither of the other two has been tried).
 
 ## License
 

@@ -219,7 +219,16 @@ async function loadWasmUrl() {
  */
 async function loadLibrary() {
   const manifest = await (await fetch(`${assetBase}/core-layer.json`)).json();
-  post({ type: 'library', stage: 'manifest', modules: manifest.modules, packs: manifest.packs.length });
+  const build = await checkBuildIdentity('the core layer', manifest);
+  post({
+    type: 'library',
+    stage: 'manifest',
+    modules: manifest.modules,
+    packs: manifest.packs.length,
+    // Handed to the compiler so its "mirror it" note can say *which* build to mirror. The worker's own
+    // status line reports the mismatch; this is the same fact, at the point where it changes the advice.
+    build: build ? { artifact: build.artifact, core: build.core } : null
+  });
 
   const files = [];
   let done = 0;
@@ -240,6 +249,90 @@ async function loadLibrary() {
 
   post({ type: 'library', stage: 'done', files: files.length });
   return files;
+}
+
+// ---- Build identity -----------------------------------------------------
+//
+// Every asset in a mirror is built by one Lean commit, and nothing enforces it. A mismatch is silent:
+// an `.olean` written by another compiler may be refused deep in the kernel, a snapshot baked against
+// another binary is simply ignored, and either way the visible symptom is "slow" rather than "wrong".
+//
+// Three things name a build: the artifact (`lean-wasm/LEAN_COMMIT`, written by build.sh and copied by
+// assemble-upstream-mirror.mjs), the core layer's manifest, and a packed layer's manifest. Compare
+// them as they arrive and post one line per disagreeing pair. This is a diagnostic, not a gate: the
+// run still proceeds, because a mismatch has to be *seen* rather than turned into another failure.
+
+const reportedBuildMismatches = new Set();
+// `undefined` = not asked yet, `null` = not published (upstream's mirror has no such file).
+let artifactCommit;
+
+/** The commit a manifest names, as 40 lowercase hex characters, or null. */
+function commitOf(manifest) {
+  const direct = typeof manifest?.leanCommit === 'string' ? manifest.leanCommit.toLowerCase() : '';
+  if (/^[0-9a-f]{40}$/.test(direct)) return direct;
+  // Older manifests carry it only inside `version`: "lean-core-62b6a22913" or
+  // "lean-4.33.0-pre-62b6a229-real-analysis". The run is a prefix of the commit, not the whole hash.
+  const version = typeof manifest?.version === 'string' ? manifest.version : '';
+  const run = version.match(/[0-9a-f]{10,40}/i)?.[0];
+  return run ? run.toLowerCase() : null;
+}
+
+const shortCommit = (commit) => commit.slice(0, 12);
+
+async function getArtifactCommit() {
+  if (artifactCommit !== undefined) return artifactCommit;
+  artifactCommit = null;
+  try {
+    const response = await fetch(`${assetBase}/LEAN_COMMIT`);
+    if (!response.ok) return artifactCommit;
+    const text = (await response.text()).trim().toLowerCase();
+    if (/^[0-9a-f]{40}$/.test(text)) artifactCommit = text;
+  } catch {
+    // The identity is a diagnostic, never a requirement: an old mirror without this file still runs.
+  }
+  return artifactCommit;
+}
+
+let coreCommit = null;
+
+/**
+ * Compare the artifact, the core layer and a packed layer, and report each disagreeing pair once.
+ *
+ * `kind` is the human name of the thing `manifest` describes (`the core layer`, `Mathlib`). Only
+ * mismatches are posted, so a matched mirror stays quiet.
+ */
+async function checkBuildIdentity(kind, manifest) {
+  const layerCommit = commitOf(manifest);
+  if (!layerCommit) return null;
+  if (kind === 'the core layer') coreCommit = layerCommit;
+
+  const artifact = await getArtifactCommit();
+  const pairs = [];
+  if (artifact && artifact !== layerCommit) {
+    pairs.push([
+      `build mismatch: the Lean artifact is ${shortCommit(artifact)}, but ${kind} was built by ` +
+        `${shortCommit(layerCommit)}. Object files and snapshots are per-build, so this layer may be ` +
+        `refused or misread — rebuild the artifact at ${shortCommit(layerCommit)} ` +
+        `(wasm-build/build-upstream.sh) or serve a layer built by ${shortCommit(artifact)}.`,
+      `artifact:${artifact}:${layerCommit}`
+    ]);
+  }
+  if (kind !== 'the core layer' && coreCommit && coreCommit !== layerCommit) {
+    pairs.push([
+      `build mismatch: the core layer is ${shortCommit(coreCommit)}, but ${kind} is ` +
+        `${shortCommit(layerCommit)}. The two cannot be loaded in one session; mirror both from the ` +
+        `same Lean build.`,
+      `core:${coreCommit}:${layerCommit}`
+    ]);
+  }
+
+  for (const [message, key] of pairs) {
+    if (reportedBuildMismatches.has(key)) continue;
+    reportedBuildMismatches.add(key);
+    post({ type: 'status', data: message });
+  }
+
+  return { artifact, core: coreCommit, layer: kind === 'the core layer' ? null : layerCommit };
 }
 
 // ---- Optional libraries -------------------------------------------------
@@ -293,6 +386,39 @@ async function fetchIfPresent(url) {
  * the compiler.
  */
 /**
+ * Fetch a baked snapshot, preferring the gzipped layout.
+ *
+ * A snapshot is by far the largest thing a mirror serves (Mathlib's is 408 MB), and it is mostly
+ * repetitive environment data: gzip takes the four snapshots from 946 MB to 390 MB (2.4×). The wasm
+ * already arrives through the same `DecompressionStream` path, so this is one more probe and one more
+ * `gunzip`, not a new transport. A host that only has the plain layout keeps working; the `.gz` probe
+ * 404s and the fallback is the old file.
+ *
+ * The timeout is longer than the wasm's: 177 MB over a slow link is not a dead host.
+ */
+async function fetchSnapshot(name, label) {
+  const candidates = [
+    [`${assetBase}/snapshots/${name}.snap.gz`, 'gzip'],
+    [`${assetBase}/snapshots/${name}.snap`, 'plain']
+  ];
+  for (const [url, layout] of candidates) {
+    let response;
+    try {
+      response = await fetch(url, { signal: AbortSignal.timeout(180000) });
+    } catch {
+      continue;
+    }
+    if (response.status === 404) continue;
+    if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
+    post({ type: 'status', data: `fetching the ${label} snapshot (${layout})…` });
+    let bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
+    return { bytes, layout };
+  }
+  return null;
+}
+
+/**
  * Try a baked snapshot for this root before its per-file tree.
  *
  * On a single-threaded build the *import* dominates, not the bytes: measured on the Std demo, fetching its
@@ -304,15 +430,15 @@ async function fetchIfPresent(url) {
  * the tree — which stays the general path, because a snapshot only matches the header it was baked for.
  */
 async function tryRootSnapshot(root) {
+  const started = performance.now();
   const name = root.toLowerCase();
-  const url = `${assetBase}/snapshots/${name}.snap`;
   let bytes = null;
+  let layout = 'plain';
   try {
-    const response = await fetch(url);
-    if (response.ok) {
-      post({ type: 'status', data: `fetching the ${root} snapshot…` });
-      bytes = new Uint8Array(await response.arrayBuffer());
-    }
+    const found = await fetchSnapshot(name, root);
+    if (!found) return null;
+    bytes = found.bytes;
+    layout = found.layout;
   } catch {
     return null;
   }
@@ -329,14 +455,28 @@ async function tryRootSnapshot(root) {
   // from no snapshot at all: the page silently took the file tree, and a run that had measured 13 s came back
   // at 61 s with nothing to explain the difference. If a step fails, say which and why.
   let failure = null;
+  let resultTag = null;
+  const megabytes = (bytes.length / 1048576).toFixed(1);
   try {
     Module.FS.writeFile(path, bytes);
     Module.FS.writeFile(`${path}.deps`, new Uint8Array([0x5b, 0x5d]));
+    // Deserialization is synchronous and single-threaded, so this is the last chance to say anything before
+    // it runs. Mathlib's 408 MB environment takes ~150 s; without this line the page looks dead for that
+    // whole time, which is exactly what P2-1 of the handover is about.
+    post({
+      type: 'status',
+      data: `installing the ${root} snapshot (${megabytes} MB) — deserialization runs on one thread…`
+    });
     try {
       // The file tree is still fetched afterwards, and that is not a fallback: the program's header has to
       // *resolve* the module it imports, and a snapshot only supplies the elaborated environment for that
       // header. What the snapshot removes is the realization — the 104 s, not the 5 s.
-      Module._lean_wasm_load_snapshot(mkLeanString(path));
+      const result = Module._lean_wasm_load_snapshot(mkLeanString(path));
+      try {
+        resultTag = Module.getValue(result + 7, 'i8') & 0xff;
+      } catch {
+        resultTag = 'unreadable';
+      }
     } catch (error) {
       failure = `the loader threw: ${(error && error.message) || error}`;
     }
@@ -346,15 +486,17 @@ async function tryRootSnapshot(root) {
     Module.printErr = outerPrintErr;
   }
 
-  const megabytes = (bytes.length / 1048576).toFixed(1);
   const refused = trace.find((line) => line.includes('failed'));
+  const elapsed = ((performance.now() - started) / 1000).toFixed(1);
+  // The loader returns an IO result; its ctor tag sits at +7, the same layout the compile path reads.
+  const verdict = resultTag === 0 ? 'loader returned 0 (ok)' : `loader returned ${resultTag}`;
   post({
     type: 'status',
     data: failure
-      ? `could not install the ${root} snapshot (${megabytes} MB): ${failure} — the file tree follows`
+      ? `could not install the ${root} snapshot (${megabytes} MB after ${elapsed}s): ${failure} — the file tree follows`
       : refused
-        ? `the ${root} snapshot was refused (${refused}) — the file tree follows`
-        : `handed the ${root} snapshot to the loader (${megabytes} MB) — the file tree follows either way`
+        ? `the ${root} snapshot was refused (${refused}) after ${elapsed}s — the file tree follows`
+        : `handed the ${root} snapshot to the loader (${megabytes} MB${layout === 'gzip' ? ', gzip' : ''} in ${elapsed}s; ${verdict}${trace[0] ? `; ${trace[0].slice(0, 160)}` : ''}) — the file tree follows either way`
   });
   return null;
 }
@@ -452,16 +594,19 @@ const loadedLayers = new Set();
 async function loadPackedLayer({ manifestUrl, packBase, label }) {
   if (loadedLayers.has(label)) return { files: 0, bytes: 0, alreadyLoaded: true };
 
-  // A baked snapshot for this layer's header, tried before the packs. The packs supply the oleans the header
-  // must *resolve*; the snapshot supplies the elaborated environment for those imports, which on a
-  // single-threaded build is the expensive part — Mathlib's closure is an order of magnitude past Std's 483
-  // modules. It falls through either way, because the packs are needed regardless.
-  await tryRootSnapshot(label);
-
+  // The manifest first, and the snapshot only after it. The snapshot is the expensive part (Mathlib's is
+  // 408 MB and takes ~170 s to deserialize); if the layer is not published at all, loading it only to fail
+  // on the missing packs wastes that time. The packs are required regardless, because the program's header
+  // must resolve its imports.
   const manifest = await (await fetch(manifestUrl)).json();
   if (!manifest.packs || !Array.isArray(manifest.packs)) {
     throw new Error(`${label}: manifest has no packs`);
   }
+  const build = await checkBuildIdentity(label, manifest);
+
+  // A baked snapshot for this layer's header. It supplies the elaborated environment; the packs supply the
+  // oleans the header must resolve. It falls through either way, because the packs are needed regardless.
+  await tryRootSnapshot(label);
 
   let files = 0;
   let bytes = 0;
@@ -486,7 +631,14 @@ async function loadPackedLayer({ manifestUrl, packBase, label }) {
   }
 
   loadedLayers.add(label);
-  post({ type: 'layer', stage: 'loaded', label, files, bytes });
+  post({
+    type: 'layer',
+    stage: 'loaded',
+    label,
+    files,
+    bytes,
+    build: build ? { artifact: build.artifact, core: build.core, layer: build.layer } : null
+  });
   return { files, bytes };
 }
 
@@ -536,13 +688,18 @@ function compileCode(code, fileName) {
  */
 async function finishStartup() {
   if (typeof Module._lean_wasm_load_snapshot === 'function') {
+    const snapshotStarted = performance.now();
     let bytes = null;
+    let layout = 'plain';
     try {
       // A dead asset host must not hang the boot. Without a timeout this fetch waits indefinitely, `ready` is
       // never posted, and the page dies at its own 120 s limit instead of falling back to a first run that
       // imports — which is exactly what a stopped mirror looked like while I was chasing something else.
-      const response = await fetch(`${assetBase}/snapshots/init.snap`, { signal: AbortSignal.timeout(60000) });
-      if (response.ok) bytes = new Uint8Array(await response.arrayBuffer());
+      const found = await fetchSnapshot('init', 'Init');
+      if (found) {
+        bytes = found.bytes;
+        layout = found.layout;
+      }
     } catch (error) {
       post({ type: 'status', data: `no Init snapshot fetchable here (${(error && error.message) || error}); the first run will import` });
       bytes = null;
@@ -574,14 +731,15 @@ async function finishStartup() {
         // trace is not a failure: the first run's time is what settles it, and on this build it is ~0.3 s when
         // the cache is seeded against ~75 s when it is not.
         const megabytes = (bytes.length / 1048576).toFixed(1);
+        const elapsed = ((performance.now() - snapshotStarted) / 1000).toFixed(1);
         const refused = trace.find((line) => line.includes('failed'));
         post({
           type: 'status',
           data: trace.some((line) => line.includes('cached env for'))
-            ? `the loader seeded the environment cache from the Init snapshot (${megabytes} MB) — the first run skips the import`
+            ? `the loader seeded the environment cache from the Init snapshot (${megabytes} MB${layout === 'gzip' ? ', gzip' : ''} in ${elapsed}s) — the first run skips the import`
             : refused
               ? `the Init snapshot was refused (${refused}) — the first run imports instead`
-              : `Init snapshot handed to the loader (${megabytes} MB); the first run's time shows whether the cache was seeded`,
+              : `Init snapshot handed to the loader (${megabytes} MB${layout === 'gzip' ? ', gzip' : ''} in ${elapsed}s); the first run's time shows whether the cache was seeded`,
         });
       } catch (error) {
         post({
@@ -593,6 +751,30 @@ async function finishStartup() {
   }
   moduleReady = true;
   post({ type: 'ready' });
+}
+
+/**
+ * Fetch the JavaScript glue, preferring the gzipped layout.
+ *
+ * `lean.js` is 45.8 MB, almost all of it a repetitive export table, and gzip takes it to 2.4 MB (20.4×).
+ * It is fetched here rather than by `importScripts` so a compressed host stays one download; that also
+ * makes `.js.gz` a one-line addition rather than a host header. The plain file stays as the fallback.
+ */
+async function loadLeanScript() {
+  const candidates = [
+    [`${assetBase}/lean.js.gz`, 'gzip'],
+    [`${assetBase}/lean.js${assetQ}`, 'plain']
+  ];
+  for (const [url, layout] of candidates) {
+    const response = await fetchOrThrow(url);
+    if (response.status === 404) continue;
+    if (!response.ok) throw new Error(`HTTP ${response.status} fetching ${url}`);
+    let bytes = new Uint8Array(await response.arrayBuffer());
+    const transferBytes = bytes.length;
+    if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = await gunzip(bytes);
+    return { source: new TextDecoder().decode(bytes), layout, transferBytes, decodedBytes: bytes.length };
+  }
+  throw new Error(`No lean.js (or lean.js.gz) at ${assetBase}`);
 }
 
 async function startLeanModule() {
@@ -747,11 +929,15 @@ async function startLeanModule() {
     // "the script at … failed to load" — with every other asset fetching fine, which
     // points at the wrong thing entirely. A blob URL is same-origin, and is what
     // `mainScriptUrlOrBlob` exists for.
-    const response = await fetchOrThrow(`${assetBase}/lean.js${assetQ}`);
-    if (!response.ok) throw new Error(`HTTP ${response.status} fetching lean.js`);
-    const source = await response.text();
+    const script = await loadLeanScript();
+    post({
+      type: 'status',
+      data:
+        `lean.js: ${(script.transferBytes / 1048576).toFixed(1)} MB` +
+        (script.layout === 'gzip' ? ` gzipped (${(script.decodedBytes / 1048576).toFixed(1)} MB unpacked)` : '')
+    });
     // Kept for the lifetime of the runtime: pthread sub-workers load it lazily.
-    mainScriptBlob = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    mainScriptBlob = URL.createObjectURL(new Blob([script.source], { type: 'text/javascript' }));
     if (artifactIsThreaded) Module.mainScriptUrlOrBlob = mainScriptBlob;
   } catch (err) {
     post({ type: 'error', data: 'Failed to load lean.js: ' + ((err && err.message) || err) });

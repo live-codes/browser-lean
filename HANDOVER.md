@@ -17,28 +17,51 @@ Working, verified on a non-isolated page (`crossOriginIsolated: false`, `typeof 
 | --- | --- | --- |
 | nothing (`#check 2+2`) | **0.30–0.9 s** | was 75–79 s; Init snapshot |
 | `import Std.Data.HashMap` | **8.67 s** | was 127.56 s; Std snapshot + file tree |
-| `import Lean` | ~4.6 min | import only; **no snapshot possible** |
-| Mathlib (`Real.Basic` + `Tactic.Ring`) | works, **~11.1 min** first import | layer loads (52/52 packs); **no snapshot possible** |
+| `import Lean` | **9.8 s** | was 137 s; `lean.snap` + the syntax-probe fix |
+| Mathlib (`Real.Basic` + `Tactic.Ring`) | **184.7 s** | was 605 s; `mathlib.snap` (408 MB) + 52 packs |
 
 - Chrome and Firefox both confirmed. Safari and mobile have **never been tested**.
-- Lean and Mathlib cannot be snapshotted: the save dies in unbounded recursion inside Lean's compacted-region
-  serializer (`FINDINGS.md` §9.11, §9.14). Sixteen times the wasm stack changes nothing. That is an upstream Lean
-  bug, and it is why those two stay slow. Threads would fix it and are exactly what this project removed.
-- `HEAD` at handover: `3245e82`. Tree clean (apart from `.commandcode/taste/`, which is tool-managed).
+- **Re-measured on the canonical mirror (§9.15), non-isolated page, all exit 0:** Init **0.37 s**
+  (boot 6.9 s), Std **6.00 s**, Lean **137 s** without a snapshot and **9.80 s** with one, Mathlib **605 s**
+  without and **184.66 s** with one.
+- **Lean and Mathlib *can* be snapshotted against the served tree.** `lean.snap` is 313.1 MB and loads in
+  1.2 s; `mathlib.snap` is 408.0 MB and loads in 150.5 s. The save only dies when baked against the
+  artifact's own build tree. The syntax probe also duplicated `import Lean`, which missed the snapshot and
+  re-imported; both are fixed (§9.15).
+- **Correction, measured after this was written (§9.15): the canonical artifact is Lean `dfe4953`, not
+  `62b6a229`.** The binary reports it and so does `variant-2/LEAN_COMMIT`; `out/pinned-test` is the only
+  binary carrying `62b6a229`. The mirror anyway works because the two library trees differ only in the
+  40-byte githash in each `.olean`, and P0-1 now says the mismatch out loud instead of leaving it silent.
+- **The serializer wall is tree-dependent, not absolute.** All four environments save against the served
+  (62b6a229) tree and only Init/Std save against the artifact's own tree, with only a 40-byte githash per
+  `.olean` differing (§9.15). The flags and the stack were never the limit.
+- **Three embeds in one tab all compile.** Peak Chrome working set 4.0 GB (~0.8 GB each); boot grows from
+  2.6 s alone to 24–37 s under three-way contention. The 2 GiB virtual reservation does not fail first
+  (§9.16).
+- `HEAD` when the P0 pass started: `b5f1fd4`. The P0 work above is **uncommitted** in the working tree
+  (the mirror itself is generated and gitignored).
 
 ## 2. Canonical artifacts — and the obsolete one
 
 | what | where | size |
 | --- | --- | --- |
-| **Artifact** (single-threaded, Lean `62b6a229`) | `wasm-build/out/variant-2/` — `lean.js` 45.8 MB, `lean.wasm` 97.5 MB | 143 MB |
-| **Canonical mirror** | `wasm-build/out/mirror-upstream/` | 1.18 GB, 5,664 files |
+| **Artifact** (single-threaded, Lean `dfe4953`) | `wasm-build/out/variant-2/` — `lean.js` 45.8 MB, `lean.wasm` 97.5 MB | 143 MB |
+| **Canonical mirror** | `wasm-build/out/mirror-upstream/` | 1,027 MiB, 5,672 files |
 | **Obsolete mirror** | `wasm-build/out/mirror/` (the older `dfe4953` build) | 1.07 GB |
 
 The canonical mirror is: **upstream's** core layer (`core-layer.json` + `core-lib/*.pack`), per-file lib tree
 (`lean-lib/**`, 5,598 files, `.gz`), and Mathlib layer (`lean-mathlib/`: manifest + 52 packs) — plus **our**
-`lean.js`/`lean.wasm` and **our** snapshots (`init.snap` 230.1 MB, `std.snap` 318.2 MB). Every asset in it is
-built by Lean `62b6a229`; that is the whole reason it works, since an `.olean` is only readable by the compiler
-that wrote it.
+`lean.js`/`lean.wasm`, `LEAN_COMMIT`, and **our** snapshots, gzipped: `init.snap.gz` 28.6 MB,
+`std.snap.gz` 46.0 MB, `lean.snap.gz` 128.8 MB, `mathlib.snap.gz` 168.8 MB (372.1 MB total, against
+901.5 MB raw; all host-baked against the served tree; §9.15). The runtime probes `.snap.gz` first and falls
+back to a plain `.snap`. The layers are built by Lean `62b6a229`, the artifact by `dfe4953`; the two library
+trees differ only in the `.olean` githash, and the pairing is measured working end to end (§9.15). The
+artifact's own identity is what P0-1 compares against the manifests. The two large binaries also ship
+gzipped and are probed first: `lean.js.gz` 2.2 MB (from 45.8 MB) and `lean.wasm.gz` 16.7 MB (from 97.5 MB).
+
+The whole directory is one deployable unit described by **`mirror.json`** (schema 1): commits, versions,
+and a sha256 of every pack, snapshot, glue file and manifest, under an id like
+`lean-62b6a2291302-dfe495316874-d53cc995`. `npm run verify:mirror -- <dir>` checks a deployed copy.
 
 **The old mirror is obsolete**: `patches/0001-cmake-single-threaded.patch` was re-pointed at `62b6a229`, so the
 `dfe4953` build can no longer be reproduced from this repo (only its files survive). Delete `out/mirror` and fix
@@ -55,16 +78,19 @@ Docker volume `lean-build-cache` holds both build trees (`/cache/src` = dfe4953,
 Start-Process node -ArgumentList 'serve.js','8129','public','--no-isolation' -WorkingDirectory <repo>
 Start-Process node -ArgumentList 'serve.js','8131','wasm-build/out/mirror-upstream' -WorkingDirectory <repo>
 # then open http://localhost:8129/?baseUrl=http://localhost:8131
+# or, with the canonical mirror already assembled:  npm run start:canonical
 ```
 
 **Bake a snapshot** — on the host, no Docker (this is the fast path now):
 ```
 $env:BAKE_LIB_ROOT='<repo>\wasm-build\out\bake-lib'
-node wasm-build/bake-snapshot.cjs wasm-build/out/variant-2 wasm-build/out/bakeout <name> "<probe>"
-# or, for the demo's Mathlib header:  node wasm-build/bake-mathlib.mjs
+node --stack-size=4000 wasm-build/bake-snapshot.cjs wasm-build/out/variant-2 wasm-build/out/bakeout <name> "<probe>"
+# or:  node wasm-build/bake-mathlib.mjs
 ```
 `wasm-build/out/bake-lib` is built from the mirror by `node wasm-build/build-bake-lib.mjs` (20,395 files: Init
-unpacked from the core packs, Std/Lean gunzipped, Mathlib's closure unpacked from its 52 packs).
+unpacked from the core packs, Std/Lean gunzipped, Mathlib's closure unpacked from its 52 packs). **Bake against
+it, not `variant-2/olean`**: the two olean sets differ only in the 40-byte githash, and the artifact's own tree
+produces an environment 3.2× larger that the serializer cannot even finish for Lean (§9.15).
 
 **Rebuild the artifact** (Docker required — the daemon must be healthy):
 ```
@@ -72,17 +98,20 @@ docker run --rm --entrypoint bash -w /w -v lean-build-cache:/cache -v <repo>/was
   -v <repo>/wasm-build/patches:/patches -v <repo>/wasm-build/out:/out -v <repo>/wasm-build/out/bakeout:/bakeout \
   lean4-wasm-single-threaded /w/build-upstream.sh
 ```
-That builds `62b6a229` in `/cache/src-upstream`, then bakes `init` and `std` against it. **Any rebuild invalidates
-every snapshot** — they are per-binary.
+That builds `62b6a229` in `/cache/src-upstream`. **Any rebuild invalidates every snapshot** — they are
+per-binary — so bake them on the host after assembling, against `bake-lib` (below and §9.15).
 
-**Assemble a mirror from upstream's assets**: `node wasm-build/assemble-upstream-mirror.mjs`, then
-`node wasm-build/fetch-packs.mjs wasm-build/out/mirror-upstream` (the fetch tool refuses every valid `.pack` — see
-traps), and make sure **no `lean.wasm.gz`** is left beside our `lean.wasm`.
+**Assemble a mirror from upstream's assets**: `node wasm-build/assemble-upstream-mirror.mjs`. The fetch step
+now keeps `.pack` containers gzipped (trap 6) and carries the baked snapshots; `fetch-packs.mjs` remains if
+you want the packs fetched verbatim. The assembly replaces any upstream `lean.wasm.gz` with ours, so the
+pthread module cannot win the probe.
 
-**Checks that exist**: `npm run check` (script syntax + vendored bundle in sync), `npm test` in
-`packages/lean-wasm` (unit tests), `wasm-build/verify-memory.mjs` (artifact gate: shared vs unshared memory),
-`packages/lean-wasm/test/page.html` (the browser suite that reports ALL PASS — it currently points at its own
-asset host, not the shipped mirror).
+**Checks that exist**: `npm run check` (script syntax + generated-worker and vendored-bundle drift), `npm test`
+in `packages/lean-wasm` (unit tests), `npm run test:mirror` (the mirror manifest), `npm run test:browser`
+(the full browser suite against a mirror, via headless Chrome and CDP — no Playwright),
+`wasm-build/verify-memory.mjs` (artifact gate: shared vs unshared memory), `npm run verify:mirror` (a mirror
+against its `mirror.json`), `packages/lean-wasm/test/page.html` (the same suite by hand; it takes `?assets=`),
+and `public/embeds-test.html?n=2|3` (N embeds in one tab; needs both servers above running).
 
 ---
 
@@ -90,64 +119,84 @@ asset host, not the shipped mirror).
 
 ### P0 — resolve before integrating
 
-**P0-1. Make an artifact↔asset mismatch loud.** (why) Every asset is one build, and nothing enforces it; a
-mismatch is *silent* — the snapshot is refused and the run merely gets slow, or an olean fails deep in the kernel.
-(do) Both manifests carry the build: `core-layer.json` → `"version": "lean-core-62b6a22913"`, Mathlib's →
-`"version": "lean-4.33.0-pre-62b6a229-real-analysis"`. Compare the hex runs at load and post a status line when
-they differ. A sketch of this was written in §9.12 and reverted unverified; `lean-worker.js` already fetches both
-manifests. (verify) Point a page at the *old* mirror and expect a message naming both builds.
+**P0-1. Make an artifact↔asset mismatch loud.** ✅ **Done (§9.15).** `lean-worker.js` fetches
+`lean-wasm/LEAN_COMMIT` and compares it with the core and Mathlib manifests' `leanCommit`, posting one status
+line per disagreeing pair; `assemble-upstream-mirror.mjs` and `fetch-assets.mjs` carry the identity. Against
+the canonical mirror it names `dfe4953` against `62b6a229` at boot and the run proceeds. This is how the
+handover's own artifact-commit error surfaced.
 
-**P0-2. Regression-test the canonical mirror, and settle the snapshot-size puzzle.** (why) The 8.67 s Std number
-was measured on the *old* mirror; the shipped `init.snap`/`std.snap` (230/318 MB) have never been loaded against
-the shipped artifact. Worse, a host-baked Init-only snapshot came out **71.1 MB** where the container produced
-**230.1 MB** for the same header — unexplained, and if the shipped ones are wrong the failure mode is "just slow".
-(do) Run, against `mirror-upstream`: an import-free program, the Std program, the Lean program, Mathlib. Record
-`initMs`/`runMs`/log for each. Then re-bake Init on the host and compare sizes and behaviour. (verify) Std first
-run should be ≈8–9 s; anything near 127 s means the snapshot was refused.
+**P0-2. Regression-test the canonical mirror, and settle the snapshot-size puzzle.** ✅ **Done (§9.15).**
+Against `mirror-upstream`: Init 0.37 s, Std 6.00 s, Lean 137.01 s (9.80 s with `lean.snap`), Mathlib
+605.01 s (184.66 s with `mathlib.snap`), all exit 0 on a non-isolated page. The snapshot puzzle is the
+tree: a host bake against `bake-lib` is 74,540,737 bytes and against `variant-2/olean` exactly the
+container's 241,301,441; the two trees differ only in the 40-byte `.olean` githash. The smaller snapshots
+load and seed the cache (boot 2.6 s, first run 0.21 s), so Init/Std now ship 71.1 + 109.4 MB instead of
+230.1 + 318.2 MB. Lean (313.1 MB, 1.2 s to load) was still 105 s until the syntax probe stopped duplicating
+`import Lean`; Mathlib (408.0 MB, 150.5 s to load) saves too and its first run is 184.66 s.
 
-**P0-3. Memory with multiple embeds.** (why) The artifact defines a **2 GiB initial / 4 GiB max** memory and a
-256 MB stack, per page. LiveCodes may put several embeds on one page; this is the likeliest integration failure.
-(do) Load 2–3 embeds (or 3 iframes) and measure the tab's memory and whether any fails. If it must shrink, relink
-with `LEAN_INITIAL_MEMORY` smaller and **re-bake every snapshot**. (verify) All embeds reach `ready` and a compile.
+**P0-3. Memory with multiple embeds.** ✅ **Done (§9.16).** Two and three same-origin embeds in one tab
+each booted and compiled, all exit 0. Peak Chrome working set was **3,515 MB for two** and **4,026 MB for
+three** (~0.8 GB per embed, against the 2 GiB virtual reservation each). What degrades is boot: 2.6 s
+alone, ~7 s with two, 24–37 s with three. The harness is `public/embeds-test.html?n=3`.
 
 ### P1 — packaging
 
-**P1-1. Host the mirror.** ~1.18 GB static, CORS `*`, the layout above is fixed. Two specific decisions:
-`lean.js` is **45.8 MB uncompressed** and the loader fetches it plainly (gzip it, or shrink the build); and the
-snapshots are **548 MB** of the total — consider gzipping them (measure compressibility; the runtime would need a
-`DecompressionStream` path, which the wasm loader already has).
+**P1-1. Host the mirror.** ~1.0 GiB static (1,027 MiB; it was ~1.5 GiB with the snapshots raw), CORS `*`,
+the layout above is fixed. **Every large transfer is compressed and probed first**: snapshots (`.snap.gz`,
+372 MB for the four, from 902 MB raw), `lean.js.gz` (2.2 MB from 45.8 MB) and `lean.wasm.gz` (16.7 MB from
+97.5 MB). What remains is the host decision: Cloudflare Pages refuses anything over 25 MiB, so the wasm and
+the snapshots (`lean.snap.gz` 135 MB, `mathlib.snap.gz` 169 MB) need R2/B2/Bunny rather than Pages.
 
-**P1-2. Publish as one versioned unit.** Artifact + core + lib + Mathlib + snapshots must ship together; see
-P0-1. Add the licence notices for the redistributed oleans (Lean and Mathlib are Apache-2.0;
-`packages/lean-wasm/THIRD-PARTY-NOTICES.md` exists and needs to cover the assets, not just code).
+**P1-2. Publish as one versioned unit.** ✅ `mirror.json` (schema 1, written by
+`wasm-build/mirror-manifest.mjs`) records the artifact/core/Mathlib commits and versions, the id, and a
+sha256 of every pack, snapshot, glue file and the two manifests. `npm run verify:mirror` checks a deployed
+copy against it; the canonical unit is **`lean-62b6a2291302-dfe495316874-d53cc995`** and verifies 67 files,
+867.1 MiB. `THIRD-PARTY-NOTICES.md` covers the redistributed oleans and the fork. The artifact/assets
+commit difference is recorded as a **note**, not a failure — it is a property of this pairing.
 
-**P1-3. CI.** `npm test`, `npm run check`, and the browser test page run against a *fixture* host built by
-`build-bake-lib.mjs`/`fetch-assets.mjs`, so the suite stops depending on a hand-made mirror.
+**P1-3. CI.** ⚠ **Partly.** `.github/workflows/ci.yml` runs `npm test`, `npm run test:mirror`, `npm run check`,
+and a deterministic rebuild + drift check for the generated worker and IIFE build. `sync-worker.mjs --check`
+is now part of `npm run check`, and CRLF is normalized so a Linux rebuild matches a Windows one.
+`npm run test:browser` now runs the full suite against any mirror with headless Chrome and CDP — no
+Playwright, no hand-made asset host — and passes against the canonical one (ESM, IIFE in a worker, Std,
+syntax probe). Still open: running that suite **in CI**, which needs a cached/downloaded fixture mirror; the
+canonical one is ~1 GB and the upstream fixture pays a multi-minute Lean import.
 
 ### P2 — product quality
 
-**P2-1. Long imports are silent.** During Lean's ~4.6 min and Mathlib's ~11.1 min the page shows the layer
-loading and then nothing, because the import happens inside wasm. Post a status line naming the module count and
-why it is slow; otherwise it reads as broken.
+**P2-1. Long imports are silent.** ✅ Mostly superseded (§9.15). On a host with the four snapshots the long
+imports are gone — Lean 9.8 s, Mathlib 184.7 s — and the one remaining silent stretch, Mathlib's 150 s
+deserialization, now posts a line before the synchronous load starts. Without a snapshot the old note
+applies: the import happens inside wasm and the page says only that it is running.
 
-**P2-2. Fix the Mathlib note.** `src/roots.js` advises "mirror it with `lean-wasm-fetch-assets`", which cannot
-help against an artifact built by a different Lean. Correct for the package's usual host, wrong here — see §9.12
-for the shape of the fix (compare builds before advising).
+**P2-2. Fix the Mathlib note.** ✅ The worker now hands the artifact/core/layer commits to the compiler
+(`library` and `layer` messages carry `build`), and `unavailableImportNotes` uses them: when the artifact
+and asset commits differ, the "mirror it with `lean-wasm-fetch-assets`" note adds *which* build to mirror
+and says a fetch from any other build will not do. Tested in `api.test.js`, and in a real mirror without
+`lean-mathlib/`: the note names both commits, and the run fails in **0.26 s** instead of 171 s because the
+layer manifest is now fetched before the 408 MB snapshot is loaded.
 
-**P2-3. Refresh the docs.** `README.md` and `wasm-build/README.md` predate the switch to `62b6a229`; they should
-state the canonical pin, that the patch targets only that commit, and the mirror layout.
+**P2-3. Refresh the docs.** ✅ `README.md` and `wasm-build/README.md` now state the canonical pins (the
+fork's default `dfe4953`, upstream-assets `62b6a229`), the mirror layout, the gzipped snapshots and the new
+first-run numbers; the historical sections are marked as such rather than silently rewritten. `FINDINGS.md`
+§9.15–9.16 carry the measurements.
 
 ### P3 — deferred
 
-**P3-1. The serializer bug.** Reproduce minimally (a `--incr-header-save` of `import Lean`, ~4.6 min, then
-`Maximum call stack size exceeded` / `memory access out of bounds` in `wasm-function[83475]` ↔ `[5197]`) and
-report upstream. Until then Lean and Mathlib stay slow; a working save would make both snapshot-able and take
-them to seconds.
+**P3-1. The serializer bug — the wall was the tree.** The save dies with unbounded recursion when baked
+against the artifact's own build tree, but the *same* saves succeed against the 62b6a229 tree: Lean
+(2,308 modules, 328.3 MB), Mathlib (3,075 modules, 427.8 MB), and Init/Std as before. The input
+difference is the 40-byte `.olean` githash. The remaining question is the mechanism (hash-keyed
+sharing/compaction), not a stack or a flag, and worth reporting upstream. The ceiling is now the
+*deserializer*: Mathlib's 408 MB snapshot takes 150.5 s to load, against 741.5 s to import.
 
-**P3-2. Safari and mobile.** Untested. Firefox works, which is encouraging; 14,390 `0xFE` bytes remain in the code
-section, consistent with atomics being gone but not proof.
+**P3-2. Safari and mobile.** ⚠ **Not testable here.** No Safari on Windows and Firefox is not installed on this
+host, so this needs a machine with those engines. Firefox has been reported working; 14,390 `0xFE` bytes
+remain in the code section, consistent with atomics being gone but not proof.
 
-**P3-3. Shrink `lean.js`.** 45.8 MB is the largest single transfer after the wasm.
+**P3-3. Shrink `lean.js`.** ✅ **Transport done.** Gzip takes 45.8 MB to **2.2 MB (20.4×)** — almost all
+of it a repetitive export table — and the worker probes `lean.js.gz` first, falling back to the plain file.
+Shrinking the build itself is still optional; the transfer is no longer the problem.
 
 ---
 
@@ -162,10 +211,13 @@ section, consistent with atomics being gone but not proof.
    loaded env, so a probe must *be* the program's imports. Any relink invalidates every snapshot. `§9.10`, `§9.11`.
 4. **`lean-lib` layout**: index at `<base>/lean-lib-files.json[.gz]`, modules at `<base>/lean-lib/<path>`. Enforce
    one layout: a stale `.gz` index wins the probe and silently makes every module 404. `§9.9`, `§9.13`.
-5. **Never leave `lean.wasm.gz` beside our `lean.wasm`** — the worker prefers `.gz`, so it fetches upstream's
-   pthread module and dies with `LinkError: Import #128 "env" "memory": memory import must be a WebAssembly.Memory`.
-6. **`lean-wasm-fetch-assets` refuses every valid `.pack`** ("not a gzip pack") because the body reaches its check
-   already decompressed. Use `wasm-build/fetch-packs.mjs`.
+5. **A `lean.wasm.gz` must be ours, not upstream's.** The worker prefers `.gz`, so an upstream pthread module
+   left beside our `lean.wasm` wins the probe and dies with `LinkError: Import #128 "env" "memory": memory
+   import must be a WebAssembly.Memory`. The assembly writes our gzipped module over any upstream copy.
+6. **`.pack` files are gzip containers and must stay that way.** `lean-wasm-fetch-assets` used to decompress
+   them and then fail its own gzip check ("not a gzip pack"). Fixed (`keepGzip`): it writes the body as gzip,
+   and re-gzips it if a CDN already handed it over decompressed. `wasm-build/fetch-packs.mjs` remains as a
+   verbatim fallback.
 7. **Upstream's lib index is `lean-lib-files.json.gz`**, so probing the plain name reads as a failure when the
    directory is fine.
 8. **The host does 200-with-HTML for paths it lacks.** Never trust a status code — read the first bytes. `§9.13`.
@@ -185,14 +237,20 @@ section, consistent with atomics being gone but not proof.
 
 ## 6. Open questions
 
-- Why a host-baked Init snapshot was 71.1 MB where the container's was 230.1 MB, for the same header.
-- Whether the shipped `init.snap`/`std.snap` actually load against the shipped artifact (unmeasured).
+- **Mechanism**, not outcome, of the snapshot-size gap: the inputs differ only in the 40-byte `.olean` githash,
+  yet the saved environment is 3.2× smaller, and Mathlib's 408 MB snapshot deserializes in 150 s where Lean's
+  313 MB takes 1.2 s. Hash-keyed sharing/compaction in the serializer is the likely lever; worth reporting
+  upstream once the mechanism is pinned down.
 - Whether a smaller initial memory (e.g. 1 GiB) is viable for multiple embeds — and worth the re-bake.
-- Whether `lean.js` can be gzipped or built smaller.
+- Whether the `lean.js` *build* can be shrunk (the export table). Transport is solved: `.js.gz` is 2.2 MB.
+- Safari and mobile remain untested; no Safari exists on this Windows host and Firefox is not installed here,
+  so P3-2 needs a machine with those engines.
 
 ## 7. Where the detail lives
 
 `FINDINGS.md`: §2 the isolation premise (corrected), §5 the library packs, §9.4–9.7 the import-cost
 eliminations, §9.8 the snapshot loader call + `--threads=0`, §9.9 the per-build library and path rules,
 §9.10 per-header snapshots and the Std 8.67 s, §9.11 the Lean save's serializer wall, §9.12 Mathlib's
-compatibility routes, §9.13 the Mathlib fix and its three traps, §9.14 the 11.1 min number.
+compatibility routes, §9.13 the Mathlib fix and its three traps, §9.14 the 11.1 min number, §9.15 the
+build-identity check, the mirror regression, the four snapshots and the syntax-probe fix, §9.16 the
+multi-embed memory measurements.

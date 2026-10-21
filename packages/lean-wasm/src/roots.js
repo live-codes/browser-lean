@@ -85,18 +85,29 @@ function assetCommandFor(root, assets) {
 /**
  * Explain an unavailable import rather than leaving the compiler's bare "unknown module prefix",
  * which reads like a typo instead of a limit of this playground.
+ *
+ * `build` is what the worker has learned about the artifact and the layers. When their commits differ, the
+ * usual advice — fetch the layer — is not enough: an `.olean` from another Lean build may be unreadable, so
+ * the note says to fetch assets built by *this artifact's* Lean, not just any mirror (P2-2 in HANDOVER.md).
  */
-export function unavailableImportNotes(code, notMirrored, assets) {
+export function unavailableImportNotes(code, notMirrored, assets, build = null) {
 	const notes = [];
 	const add = (note) => {
 		if (!notes.includes(note)) notes.push(note);
 	};
+	const artifact = build?.artifact ?? null;
+	const core = build?.core ?? null;
+	const mixed =
+		artifact && core && artifact !== core
+			? ` This host's Lean artifact is ${artifact.slice(0, 12)} but its libraries are ${core.slice(0, 12)}, ` +
+				`so fetch assets built by the artifact's Lean — \`lean-wasm-fetch-assets\` from any other build will not do.`
+			: '';
 	for (const root of importedRoots(code)) {
 		if (notMirrored.includes(root)) {
 			const command = assetCommandFor(root, assets);
 			add(
 				command
-					? `${root} is not on the asset host. Mirror it with \`${command}\`.`
+					? `${root} is not on the asset host. Mirror it with \`${command}\`.${mixed}`
 					: `${root} is not available here.`
 			);
 		} else if (UNAVAILABLE_LIBRARIES[root]) {

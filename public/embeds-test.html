@@ -1,0 +1,91 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Lean embeds — memory / concurrency harness</title>
+<style>
+  body { margin: 0; font: 13px system-ui, sans-serif; }
+  #frames { display: flex; gap: 4px; height: 95vh; }
+  iframe { flex: 1; border: 1px solid #ccc; min-width: 0; }
+</style>
+<div id="frames"></div>
+<script>
+  // A throwaway harness: N copies of the demo page in one tab, each with its own worker and runtime.
+  // Everything is same-origin, so the parent can drive each embed through the globals `main.js` exposes.
+  const params = new URLSearchParams(location.search);
+  const count = Number(params.get('n') ?? '2');
+  const baseUrl = params.get('baseUrl') ?? 'http://localhost:8131';
+
+  const state = {
+    count,
+    ready: 0,
+    started: 0,
+    results: [],
+    done: false,
+    error: null
+  };
+  window.__embeds = state;
+
+  const frames = [];
+  const container = document.getElementById('frames');
+  for (let i = 0; i < count; i += 1) {
+    const frame = document.createElement('iframe');
+    frame.src = `/?baseUrl=${encodeURIComponent(baseUrl)}`;
+    container.appendChild(frame);
+    frames.push(frame);
+  }
+
+  const code = '#eval 2+2\n#check Nat.add_comm\n#eval (List.range 5).map (fun n => n * n)\n';
+
+  function embedWindow(i) {
+    try {
+      const w = frames[i].contentWindow;
+      if (w && w.document && w.document.readyState === 'complete' && w.editor && w.document.getElementById('run')) {
+        return w;
+      }
+    } catch (error) {
+      state.error = String(error);
+    }
+    return null;
+  }
+
+  // Wait for every frame's driver; the runs wait for `window.start()` so a probe can take a baseline first.
+  const waitReady = setInterval(() => {
+    const ready = frames.filter((_, i) => embedWindow(i)).length;
+    state.ready = ready;
+    if (ready === count) clearInterval(waitReady);
+  }, 100);
+
+  window.start = () => {
+    if (state.started) return 'already started';
+    state.started = performance.now();
+    for (let i = 0; i < count; i += 1) {
+      const w = embedWindow(i);
+      if (!w) return `embed ${i} is not ready`;
+      w.editor.value = code;
+      w.document.getElementById('run').click();
+    }
+    const poll = setInterval(() => {
+      for (let i = 0; i < count; i += 1) {
+        if (state.results[i]) continue;
+        const w = embedWindow(i);
+        if (!w) continue;
+        const ds = w.document.documentElement.dataset;
+        if (ds.status !== 'done' && ds.status !== 'error') continue;
+        state.results[i] = {
+          status: ds.status,
+          exitCode: ds.exitCode,
+          initMs: ds.initMs,
+          runMs: ds.runMs,
+          artifact: ds.artifact,
+          output: w.document.getElementById('output').textContent,
+          diagnostics: w.document.getElementById('diagnostics').textContent
+        };
+      }
+      if (state.results.filter(Boolean).length === count) {
+        clearInterval(poll);
+        state.elapsedMs = Math.round(performance.now() - state.started);
+        state.done = true;
+      }
+    }, 250);
+    return 'started';
+  };
+</script>

@@ -27,6 +27,15 @@ export function createRuntime({ assetBase, libBase, memory, onProgress, onStatus
 	let stderr = '';
 	let nextId = 1;
 	const waiters = [];
+	// Build identities the worker has seen, so the compiler can make its fallback notes build-aware.
+	const build = { artifact: null, core: null, layer: null };
+
+	function noteBuild(msg) {
+		if (!msg.build) return;
+		for (const key of ['artifact', 'core', 'layer']) {
+			if (msg.build[key]) build[key] = msg.build[key];
+		}
+	}
 
 	const emit = (message) => {
 		if (message) onProgress?.(message);
@@ -55,6 +64,7 @@ export function createRuntime({ assetBase, libBase, memory, onProgress, onStatus
 				);
 				return;
 			case 'library':
+				noteBuild(msg);
 				if (msg.stage === 'manifest') {
 					emit(`core layer: ${msg.modules} modules in ${msg.packs} packs`);
 				} else if (msg.stage === 'pack') {
@@ -67,6 +77,7 @@ export function createRuntime({ assetBase, libBase, memory, onProgress, onStatus
 				if (msg.stage === 'progress') emit(`loading ${msg.root}: ${msg.files}/${msg.total} files`);
 				return;
 			case 'layer':
+				noteBuild(msg);
 				if (msg.stage === 'progress') emit(`loading ${msg.label}: pack ${msg.pack}/${msg.packs}`);
 				return;
 			default:
@@ -157,5 +168,15 @@ export function createRuntime({ assetBase, libBase, memory, onProgress, onStatus
 		}
 	}
 
-	return { start, loadModules, loadLayer, compile, dispose };
+	return {
+		start,
+		loadModules,
+		loadLayer,
+		compile,
+		dispose,
+		/** What the worker has learned about the artifact and the layers, once each has been fetched. */
+		get build() {
+			return { ...build };
+		}
+	};
 }

@@ -8,16 +8,18 @@
 // program matters — the snapshot carries the elaborated environment that the import would produce.
 //
 // The library is `wasm-build/out/bake-lib`, assembled by `build-bake-lib.mjs`: Init unpacked from the core
-// layer, Std/Lean gunzipped from the per-file tree, and Mathlib's whole closure unpacked from its 52 packs —
-// every one of them built by the artifact's Lean commit, which is the only reason this can import at all.
+// layer, Std/Lean gunzipped from the per-file tree, and Mathlib's whole closure unpacked from its 52 packs.
+// Bake against *this* tree, not the artifact's own `variant-2/olean`: the two olean sets are identical except
+// for the 40-byte githash, and that difference changes the saved environment 3.2× and is what lets the
+// serializer finish at all (FINDINGS §9.15).
 //
 // Expect a long import: Mathlib's closure is an order of magnitude past Std's 483 modules, which took 104 s.
-// Whether the *save* succeeds is the open question — a Lean-sized save already overflows the serializer's
-// recursion (FINDINGS §9.11), and Mathlib's environment is larger still.
+// `--stack-size=4000` is for the save's JS recursion, not the wasm stack.
 import { spawn } from 'node:child_process';
 
 const probe = ['import Mathlib.Data.Real.Basic', 'import Mathlib.Tactic.Ring', '#check 1'].join('\n');
 const args = [
+	'--stack-size=4000',
 	'wasm-build/bake-snapshot.cjs',
 	'wasm-build/out/variant-2',
 	'wasm-build/out/bakeout',

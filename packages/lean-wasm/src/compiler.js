@@ -285,7 +285,7 @@ export async function createCompiler(options = {}) {
 
 			const notes = hasErrors
 				? [
-						...unavailableImportNotes(code, state.notMirrored, assets),
+						...unavailableImportNotes(code, state.notMirrored, assets, runtime.build),
 						...outsideClosureNotes(problems)
 					]
 				: [];

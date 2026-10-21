@@ -7,6 +7,7 @@
   "license": "MIT",
   "scripts": {
     "start": "node serve.js",
+    "start:canonical": "node scripts/serve-canonical.mjs",
     "start:no-isolation": "node serve.js 8129 public --no-isolation",
     "start:spa-fallback": "node serve.js 8129 public --spa-fallback",
     "assets": "node packages/lean-wasm/bin/fetch-assets.mjs public",
@@ -14,7 +15,10 @@
     "assets:libs": "node packages/lean-wasm/bin/fetch-assets.mjs public --only lib",
     "assets:mathlib": "node packages/lean-wasm/bin/fetch-assets.mjs public --only mathlib",
     "sync:vendor": "node scripts/vendor-package.mjs",
-    "check": "node --check serve.js && node --check public/main.js && node --check scripts/vendor-package.mjs && node --check packages/lean-wasm/bin/fetch-assets.mjs && node --check packages/lean-wasm/worker/lean-worker.js && node --check wasm-build/verify-memory.mjs && node scripts/vendor-package.mjs --check",
-    "verify:memory": "node wasm-build/verify-memory.mjs"
+    "check": "node --check serve.js && node --check public/main.js && node --check scripts/vendor-package.mjs && node --check scripts/browser-suite.mjs && node --check scripts/serve-canonical.mjs && node --check packages/lean-wasm/bin/fetch-assets.mjs && node --check packages/lean-wasm/worker/lean-worker.js && node --check wasm-build/verify-memory.mjs && node --check wasm-build/mirror-manifest.mjs && node --check wasm-build/verify-mirror.mjs && node --check wasm-build/assemble-upstream-mirror.mjs && node packages/lean-wasm/scripts/sync-worker.mjs --check && node scripts/vendor-package.mjs --check",
+    "verify:memory": "node wasm-build/verify-memory.mjs",
+    "verify:mirror": "node wasm-build/verify-mirror.mjs",
+    "test:mirror": "node --test wasm-build/mirror-manifest.test.mjs",
+    "test:browser": "node scripts/browser-suite.mjs"
   }
 }
