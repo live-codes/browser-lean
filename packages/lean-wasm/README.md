@@ -102,22 +102,28 @@ Miss the second and every asset downloads while the boot still fails with
 
 ## Requirements
 
-**The page must be cross-origin isolated.** `lean.wasm` imports a WebAssembly memory with
-`flags: 3` — `has-max | shared` — and a shared memory can only be constructed with a
-`SharedArrayBuffer`, which browsers expose only to a cross-origin isolated document. Serve with:
+**The artifact decides, and the runtime reads which shape it is off the wasm before booting.**
 
-```
-Cross-Origin-Opener-Policy: same-origin
-Cross-Origin-Embedder-Policy: require-corp     # or credentialless
-```
+- **Unshared** (`flags: 1`, `shared: false`) — a single-threaded build, Lean compiled without pthreads. It
+  needs **nothing**: no `SharedArrayBuffer`, no COOP/COEP. This is the shape to ship.
+- **Shared** (`flags: 3`, `has-max | shared`) — the upstream pthread build. A shared memory can only be
+  constructed with a `SharedArrayBuffer`, which browsers expose only to a cross-origin isolated document, so
+  the page must be served with:
 
-There is no shim. A stub `SharedArrayBuffer` is not enough here, unlike some other wasm runtimes:
-this one really does construct one for its pthread pool, so a fake satisfies the type check and then
-wedges the boot. `createCompiler()` throws with this explanation rather than failing obscurely.
+  ```
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp     # or credentialless
+  ```
 
-If you are embedding into a page whose headers you do not control, the only escape hatches are
-Chrome-only: the reverse origin trial for `SharedArrayBuffer`, or `Document-Isolation-Policy`. That is
-a deployment trade-off, not something this library can fix.
+  There is no shim for this one. A stub `SharedArrayBuffer` is not enough, unlike some other wasm runtimes:
+  this runtime really does construct one for its pthread pool, so a fake satisfies the type check and then
+  wedges the boot. `createCompiler()` throws with this explanation rather than failing obscurely.
+
+If you are embedding into a page whose headers you do not control and you must use the shared build, the
+escape hatches are Chrome-only: the reverse origin trial for `SharedArrayBuffer` (on a deprecation path), and
+`Document-Isolation-Policy`, which has shipped for desktop in Chrome 137 and — unlike COOP/COEP — applies per
+frame, so it needs nothing from the embedder. Neither is needed for the unshared build, which is the point of
+having one.
 
 **Browser only.** The runtime is a Web Worker handed over as a blob (a worker script URL must be
 same-origin, and a package consumer has nowhere to serve one from), and it uses `importScripts`. Node
