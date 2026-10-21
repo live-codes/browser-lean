@@ -44,38 +44,36 @@ npm run start:canonical # → http://localhost:8129/?baseUrl=http://localhost:81
 Pick an example (or type your own), press **Run** — or `Ctrl`/`Cmd` + `Enter` in the editor. Nothing
 is downloaded until the first Run.
 
-## Cross-origin isolation is required — by this artifact
+## No cross-origin isolation
 
-**The page must be served with `Cross-Origin-Opener-Policy: same-origin` and
-`Cross-Origin-Embedder-Policy: require-corp`.** `npm start` does that. Served without them, Run names
-the artifact and refuses:
+**The page needs no `Cross-Origin-Opener-Policy`, no `Cross-Origin-Embedder-Policy`, and no
+`SharedArrayBuffer`.** The canonical artifact is a *single-threaded* build: with no pthreads the linker never
+demands a shared memory, and the module **defines** an unshared one (`flags=1`, `shared=false`). That is what
+`npm run start:canonical` serves — page on 8129 without isolation headers, mirror on 8131 — and the demo accepts
+proofs on it, verified in Chrome and Firefox. See [FINDINGS.md](FINDINGS.md) §9.7 and §9.8 for the build and its
+measurements.
 
-```
+The requirement belongs to the *artifact*, not to the page, and the runtime reads which it is off the wasm
+rather than trusting a global: the first 64 KiB are enough to parse the memory section, whose limits flags
+decide everything (`flags 3` is `has-max | shared`). A *shared* artifact is therefore refused before the 16.5 MiB
+of wasm is fetched, and the page names it:
+
+```text
 The Lean artifact at …/lean.wasm.gz declares a shared WebAssembly memory, so it needs
 SharedArrayBuffer — which a document only has when it is cross-origin isolated. …
 ```
 
-and it does so before the boot: the memory import is read out of the first 64 KiB of the artifact, so the
-16.5 MiB of wasm is never fetched.
+**The upstream pthread artifact still needs isolation**, which is what the stricter `npm start` — COOP/COEP by
+default — is for. Chrome also offers two ways to skip the headers: a reverse origin trial for
+`SharedArrayBuffer`, which has been extended more than once and sits on a deprecation path, and
+`Document-Isolation-Policy`, which isolates a document for itself, applies *per frame*, and shipped in Chrome
+137 for desktop. Both are Chrome-only, and the point of the single-threaded build is that neither is needed.
+See [FINDINGS.md](FINDINGS.md) §2.
 
-That requirement is real, not a misdiagnosis — but it belongs to the artifact rather than to the page, and
-the runtime reads which it is off the wasm. This build's `lean.wasm` imports (or, in the single-threaded
-case, defines) a memory whose limits flags decide everything: `flags 3` is `has-max | shared`, and a shared
-memory is what isolation buys. **The unshared build is no longer hypothetical** —
-[`wasm-build/`](wasm-build/) produces it, and the demo accepts proofs on it in a document with no
-isolation at all ([FINDINGS.md](FINDINGS.md) §9.7).
-
-**Chrome has two escape hatches that skip the headers entirely**: a reverse origin trial for
-`SharedArrayBuffer` that has already been extended more than once and sits on a deprecation path, and
-`Document-Isolation-Policy`, which lets a document isolate itself regardless of the page around it —
-shipped in Chrome 137 for desktop, and unlike COOP/COEP it applies *per frame*, so the embedder does
-nothing either way. Both are Chrome-only, so Lean *could* ship in LiveCodes behind one of them, but the
-durable answer is a single-threaded build. See [FINDINGS.md](FINDINGS.md) §2 and §9.
-
-To see the failure for yourself:
+To see a proof checked with no headers at all:
 
 ```bash
-npm run start:no-isolation   # same page, no COOP/COEP
+npm run start:no-isolation   # same page, no COOP/COEP — and it still compiles
 ```
 
 ## What you get
@@ -120,10 +118,10 @@ artifact kind that is the point of all this:
 
 | served as | `SharedArrayBuffer` | behaviour |
 | --- | --- | --- |
-| with COOP/COEP (`npm start`) | present, isolated | boots; the runs above |
-| without headers (`npm run start:no-isolation`) | absent | refuses, naming the artifact and both remedies — before the boot, so the 16.5 MiB artifact is never fetched |
-| simulated origin trial (global present, document not isolated) | present, not isolated | attempts to boot, and reports a stalled boot rather than hanging |
-| an **unshared** artifact, no headers at all | absent | boots past the memory gate with no isolation needed — checked against a synthetic artifact, since the real single-threaded build does not exist yet ([FINDINGS.md](FINDINGS.md) §9) |
+| **the canonical build, no headers** (`npm run start:canonical`) | absent | boots and checks proofs — the configuration this repo exists for |
+| the canonical build, with COOP/COEP (`npm start`) | present, isolated | boots; the headers change nothing for it |
+| the **shared** (pthread) build, no headers | absent | refuses, naming the artifact and both remedies — before the boot, so the 16.5 MiB artifact is never fetched |
+| the **shared** build, simulated origin trial (global present, document not isolated) | present, not isolated | attempts to boot, and reports a stalled boot rather than hanging |
 
 ## Assets
 
@@ -246,11 +244,11 @@ for Std/Lean/Batteries, `npm run assets:mathlib` for Mathlib. See [FINDINGS.md](
   other libraries. It is fetched only when something imports it.
 - **The optional libraries need their own mirror.** Without `npm run assets:libs` or
   `npm run assets:mathlib`, the corresponding imports fail with a note naming the command to run.
-- **Cross-origin isolation is mandatory for the artifact this repo mirrors**, with no fallback — a stub
-  `SharedArrayBuffer` does not help here (unlike the trick `browser-cobol` documented), because this
-  runtime really constructs one for its pthread pool, so a fake passes the type check and then wedges the
-  boot. The *runtime* no longer assumes it, though: it reads the requirement off the wasm before booting,
-  so a build declaring an unshared memory needs no isolation at all ([FINDINGS.md](FINDINGS.md) §9).
+- **Isolation belongs to the artifact, not to the page.** The canonical build declares an unshared memory and
+  needs none; the upstream pthread build does, and a stub `SharedArrayBuffer` does not help it — unlike the
+  trick `browser-cobol` documented — because that runtime really constructs one for its pthread pool, so a fake
+  passes the type check and then wedges the boot. The runtime reads the requirement off the wasm before booting
+  either way ([FINDINGS.md](FINDINGS.md) §9).
 - **A stalled boot is reported, not hung on.** If the module instantiates but never finishes starting,
   the page fails after 60 s of silence with an explanation instead of sitting on "loading" forever.
 - **No way to interrupt** a non-terminating elaboration; recovery is a page reload (~2 s).
